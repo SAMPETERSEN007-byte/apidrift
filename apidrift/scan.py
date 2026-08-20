@@ -341,9 +341,10 @@ def to_markdown(result: ScanResult) -> str:
     for impact in result.impacts:
         by_file.setdefault(impact.file, []).append(impact)
 
+    count = len(result.breaking)
     lines.append(
-        f"## {len(result.breaking)} breaking change"
-        f"{'' if len(result.breaking) == 1 else 's'} land on "
+        f"## {count} breaking change{'' if count == 1 else 's'} "
+        f"{'lands' if count == 1 else 'land'} on "
         f"{len(by_file)} file{'' if len(by_file) == 1 else 's'}"
     )
     lines.append("")
