@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Iterable, List, Sequence
 
-from .diff import Finding
+from .diff import ABSENCE_KINDS, FIELD_KINDS, Finding
 from .vendors import Vendor
 
 _PLACEHOLDER = re.compile(r"\{[^}]+\}")
@@ -100,17 +100,9 @@ def build_signatures(finding: Finding, vendor: Vendor) -> List[str]:
     sigs.extend(_sdk_names(finding, vendor))
 
     # Param/field-level findings: the identifier itself is the strongest signal.
-    field_kinds = (
-        "param_removed", "param_now_required", "param_type_changed",
-        "param_added_required", "param_deprecated",
-        "request_enum_value_removed", "response_enum_value_removed",
-        "response_enum_value_added",
-        "request_field_removed", "response_field_removed",
-        "request_field_type_changed", "response_field_type_changed",
-        "request_field_now_required", "request_field_added_required",
-        "response_field_now_nullable",
-    )
-    if finding.kind in field_kinds and finding.subject:
+    # Both directions want the identifier: a presence check greps for it, and
+    # an absence check greps for it to prove the caller does NOT supply it.
+    if finding.kind in (FIELD_KINDS | ABSENCE_KINDS) and finding.subject:
         leaf = finding.subject.split(".")[-1].replace("[]", "")
         if leaf and not leaf.startswith("<"):
             sigs += [f'"{leaf}"', f"'{leaf}'", f"{leaf}="]

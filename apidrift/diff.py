@@ -7,6 +7,35 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from .loader import TRUNCATED, Field, Operation, Param, Spec
 
+# How each kind must be searched for and verified. Defined here, where kinds
+# are created, and imported everywhere else: three modules previously kept
+# private copies of these lists and none of them learned about `schema_*`.
+ENDPOINT_KINDS = frozenset({
+    "endpoint_removed", "endpoint_moved", "spec_removed",
+    "response_status_removed", "security_requirement_added",
+    "server_url_changed", "schema_removed", "endpoint_deprecated",
+})
+
+# The break is the ABSENCE of the field, so the caller is found by the endpoint
+# and convicted by not mentioning it.
+ABSENCE_KINDS = frozenset({
+    "request_field_added_required", "request_field_now_required",
+    "param_added_required", "param_now_required", "request_body_now_required",
+    "schema_field_added_required", "schema_field_now_required",
+})
+
+# The break is the PRESENCE of a field the caller reads or sends.
+FIELD_KINDS = frozenset({
+    "response_field_removed", "request_field_removed", "schema_field_removed",
+    "response_field_type_changed", "request_field_type_changed",
+    "schema_field_type_changed",
+    "param_removed", "param_type_changed", "param_deprecated",
+    "response_enum_value_added", "response_enum_value_removed",
+    "request_enum_value_removed",
+    "schema_enum_value_added", "schema_enum_value_removed",
+    "schema_field_now_nullable", "response_field_now_nullable",
+})
+
 BREAKING = "breaking"
 POTENTIALLY_BREAKING = "potentially_breaking"
 ADDITIVE = "additive"

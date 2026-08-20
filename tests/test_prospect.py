@@ -76,3 +76,33 @@ class TestQueryConstruction(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestKindCoverage(unittest.TestCase):
+    """Every kind the engine emits must be classified by exactly one rule.
+
+    Three modules previously kept private copies of these lists, and none of
+    them was updated when the schema-level kinds were introduced, so every
+    `schema_*` finding silently fell through to a default.
+    """
+
+    def test_every_emitted_kind_is_classified(self):
+        import json
+        from pathlib import Path
+        from apidrift.diff import ABSENCE_KINDS, ENDPOINT_KINDS, FIELD_KINDS
+
+        findings_path = Path(__file__).resolve().parent.parent / "out" / "findings.json"
+        if not findings_path.exists():
+            self.skipTest("no findings.json; run the CLI first")
+        emitted = {f["kind"] for entry in json.load(open(findings_path))
+                   for f in entry["findings"]}
+        known = ENDPOINT_KINDS | ABSENCE_KINDS | FIELD_KINDS
+        unclassified = emitted - known
+        self.assertEqual(unclassified, set(),
+                         f"kinds with no search or verify rule: {sorted(unclassified)}")
+
+    def test_the_classes_do_not_overlap(self):
+        from apidrift.diff import ABSENCE_KINDS, ENDPOINT_KINDS, FIELD_KINDS
+        self.assertEqual(ENDPOINT_KINDS & ABSENCE_KINDS, set())
+        self.assertEqual(ENDPOINT_KINDS & FIELD_KINDS, set())
+        self.assertEqual(ABSENCE_KINDS & FIELD_KINDS, set())

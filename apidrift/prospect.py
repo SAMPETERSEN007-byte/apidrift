@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
-from .diff import Finding
+from .diff import ABSENCE_KINDS, ENDPOINT_KINDS, Finding
 from .vendors import Vendor
 
 # GitHub code search allows 10 requests/minute for an authenticated user.
@@ -74,9 +74,7 @@ def _gh_code_search(query: str, per_page: int = 20) -> Dict:
     return json.loads(proc.stdout.decode("utf-8", "replace"))
 
 
-_ENDPOINT_KINDS = ("endpoint_removed", "endpoint_moved", "spec_removed",
-                   "response_status_removed", "security_requirement_added",
-                   "server_url_changed")
+_ENDPOINT_KINDS = ENDPOINT_KINDS
 
 # Tokens too common to discriminate anything on their own.
 _WEAK_TOKENS = frozenset({
@@ -131,9 +129,8 @@ def build_query(finding: Finding, vendor: Vendor, language: str = "") -> str:
     leaf = _leaf(finding)
     # A newly-required field is verified by its ABSENCE, so searching for it
     # would return precisely the callers who are already fine.
-    from .verify import _ABSENCE_KINDS
     field_usable = (finding.kind not in _ENDPOINT_KINDS
-                    and finding.kind not in _ABSENCE_KINDS
+                    and finding.kind not in ABSENCE_KINDS
                     and len(leaf) >= 3 and leaf.lower() not in _WEAK_TOKENS)
 
     if field_usable:

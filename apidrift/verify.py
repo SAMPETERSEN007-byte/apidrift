@@ -25,7 +25,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .diff import Finding
+from .diff import ABSENCE_KINDS, ENDPOINT_KINDS, FIELD_KINDS, Finding
 from .signatures import build_signatures
 from .vendors import Vendor
 
@@ -42,23 +42,10 @@ VERDICT_RANK = {CONFIRMED: 0, LIKELY: 1, NO_VENDOR: 2, NO_SITE: 3,
 PY_EXT = (".py",)
 LEXICAL_EXT = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rb", ".php", ".java")
 
-# Field-level changes verify by finding the symbol. Endpoint-level changes
-# verify by finding the path. Anything else is not yet verifiable.
-_FIELD_KINDS = (
-    "response_field_removed", "request_field_removed",
-    "response_field_type_changed", "request_field_type_changed",
-    "param_removed", "param_type_changed", "param_deprecated",
-    "response_enum_value_added", "response_enum_value_removed",
-    "request_enum_value_removed",
-)
-_ABSENCE_KINDS = (
-    "request_field_added_required", "request_field_now_required",
-    "param_added_required", "param_now_required", "request_body_now_required",
-)
-_ENDPOINT_KINDS = (
-    "endpoint_removed", "endpoint_moved", "spec_removed",
-    "response_status_removed", "security_requirement_added",
-)
+# Kind classification lives in diff.py, where kinds are created.
+_FIELD_KINDS = FIELD_KINDS
+_ABSENCE_KINDS = ABSENCE_KINDS
+_ENDPOINT_KINDS = ENDPOINT_KINDS
 
 
 @dataclass
