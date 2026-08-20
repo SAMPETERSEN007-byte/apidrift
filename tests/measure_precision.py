@@ -178,12 +178,30 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
         op_new = find_operation(new, finding["op_key"])
         if op_old is None or op_new is None:
             return UNDECIDABLE, "operation not found on one side"
-        names = lambda op: {k for req in (op.get("security") or [])
-                            if isinstance(req, dict) for k in req}
-        gained = names(op_new) - names(op_old)
-        if gained:
-            return CONFIRMED, f"gained {sorted(gained)}"
-        return REFUTED, f"old={sorted(names(op_old))} new={sorted(names(op_new))}"
+
+        def alternatives(op):
+            return [frozenset(req) for req in (op.get("security") or [])
+                    if isinstance(req, dict)]
+
+        # Security is a list of ALTERNATIVES. Comparing flattened scheme names
+        # confirmed a finding that was wrong: Twilio added `access_token_bearer`
+        # ALONGSIDE `accountSid_authToken`, so every existing caller kept
+        # working. This checker shared the engine's mistake and so agreed with
+        # it, which is the failure a separate checker exists to prevent.
+        before, after = alternatives(op_old), alternatives(op_new)
+        if not before:
+            if after:
+                return CONFIRMED, "auth now required where there was none"
+            return REFUTED, "no security on either side"
+        stranded = [alt for alt in before
+                    if not any(candidate <= alt for candidate in after)]
+        if stranded:
+            return CONFIRMED, ("callers using "
+                               + " OR ".join("+".join(sorted(a)) for a in stranded)
+                               + " can no longer authenticate")
+        return REFUTED, (f"every old alternative still satisfiable: "
+                         f"{[sorted(a) for a in before]} -> "
+                         f"{[sorted(a) for a in after]}")
 
     def _body_schema(doc, op_key, where):
         op = find_operation(doc, op_key)

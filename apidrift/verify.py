@@ -58,6 +58,33 @@ VERDICT_RANK = {CONFIRMED: 0, LIKELY: 1, NO_DEPENDENCE: 2, NO_VENDOR: 3,
                 ERROR: 8}
 
 
+# A third-party library carries its own licence header. Combined with sitting
+# in a directory named for the vendor's package, that is a checked-in copy of
+# somebody else's code -- two audited leads were full discord.py dumps at
+# `discord/http.py` and `generic_modules/discord/http.py`, neither of which any
+# path rule caught because there was no venv marker or underscore module.
+_LICENCE_MARKERS = (
+    "the mit license", "copyright (c)", "copyright ©", "apache license",
+    "licensed under the", "spdx-license-identifier",
+)
+
+
+def looks_vendored_library(source: str, file_path: str, vendor: Vendor) -> str:
+    from .classify import VENDOR_PACKAGE_DIR
+
+    package = VENDOR_PACKAGE_DIR.get(vendor.key)
+    if not package:
+        return ""
+    parts = file_path.replace("\\", "/").split("/")
+    if package not in [segment.lower() for segment in parts[:-1]]:
+        return ""
+    head = "\n".join(source.splitlines()[:40]).lower()
+    for marker in _LICENCE_MARKERS:
+        if marker in head:
+            return marker
+    return ""
+
+
 def looks_generated(source: str) -> str:
     """The marker found in the file's header, or empty."""
     head = "\n".join(source.splitlines()[:12]).lower()
@@ -470,6 +497,13 @@ def verify_source(
         return (NOT_AUTHOR_CODE,
                 f"header says `{marker}` — generated code is repaired by "
                 f"regenerating, not by its authors", "", [])
+
+    licence = looks_vendored_library(source, file_path, vendor)
+    if licence:
+        return (NOT_AUTHOR_CODE,
+                f"`{file_path}` carries a `{licence}` header inside a "
+                f"`{vendor.key}` package directory — a checked-in copy of the "
+                f"library, not code the repo author wrote", "", [])
 
     if not file_path.endswith(PY_EXT):
         extension = file_path.rsplit(".", 1)[-1] if "." in file_path else "?"

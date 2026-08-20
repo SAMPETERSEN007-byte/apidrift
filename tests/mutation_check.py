@@ -400,6 +400,20 @@ MUTATIONS = [
         ["test_a_trailing_slash_marks_an_incomplete_path"],
     ),
     (
+        "security flattened back into a set of scheme names",
+        "apidrift/diff.py",
+        "    stranded = [alt for alt in old\n                if not any(candidate <= alt for candidate in new)]",
+        "    stranded = list(old) if (set().union(*new) - set().union(*old)) else []",
+        ["test_adding_an_alternative_scheme_breaks_nobody"],
+    ),
+    (
+        "verify: vendored library copies no longer detected",
+        "apidrift/verify.py",
+        "    licence = looks_vendored_library(source, file_path, vendor)\n    if licence:",
+        "    licence = looks_vendored_library(source, file_path, vendor)\n    if False:",
+        ["test_a_library_dump_is_not_author_code"],
+    ),
+    (
         "signature builder drops the field name",
         "apidrift/signatures.py",
         "        if leaf and not leaf.startswith(\"<\"):",

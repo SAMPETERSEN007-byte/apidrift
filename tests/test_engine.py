@@ -148,9 +148,42 @@ class TestBreakingDetection(unittest.TestCase):
         body["required"] = ["amount", "note"]
         self.assertIn("request_field_now_required", kinds(run(self.old, self.new)))
 
-    def test_security_requirement_added(self):
+    def test_security_requirement_added_where_there_was_none(self):
         self.new["paths"]["/charges"]["get"]["security"] = [{"bearer": []}]
         self.assertIn("security_requirement_added", kinds(run(self.old, self.new)))
+
+    def test_adding_an_alternative_scheme_breaks_nobody(self):
+        """OpenAPI security is a list of ALTERNATIVES: [{A},{B}] means A or B.
+
+        Twilio added `access_token_bearer` alongside `accountSid_authToken` on
+        nine operations. Every existing caller kept working, and flattening the
+        list scored all nine as breaking.
+        """
+        self.old["components"]["securitySchemes"]["basic"] = {"type": "http"}
+        self.new["components"]["securitySchemes"]["basic"] = {"type": "http"}
+        self.old["paths"]["/charges"]["get"]["security"] = [{"basic": []}]
+        self.new["paths"]["/charges"]["get"]["security"] = [{"basic": []},
+                                                            {"bearer": []}]
+        self.assertNotIn("security_requirement_added",
+                         {f.kind for f in run(self.old, self.new).findings})
+
+    def test_adding_a_scheme_to_every_alternative_is_breaking(self):
+        self.old["components"]["securitySchemes"]["basic"] = {"type": "http"}
+        self.new["components"]["securitySchemes"]["basic"] = {"type": "http"}
+        self.old["paths"]["/charges"]["get"]["security"] = [{"basic": []}]
+        self.new["paths"]["/charges"]["get"]["security"] = [{"basic": [],
+                                                             "bearer": []}]
+        self.assertIn("security_requirement_added",
+                      kinds(run(self.old, self.new)))
+
+    def test_removing_an_alternative_is_breaking(self):
+        self.old["components"]["securitySchemes"]["basic"] = {"type": "http"}
+        self.new["components"]["securitySchemes"]["basic"] = {"type": "http"}
+        self.old["paths"]["/charges"]["get"]["security"] = [{"basic": []},
+                                                            {"bearer": []}]
+        self.new["paths"]["/charges"]["get"]["security"] = [{"basic": []}]
+        self.assertIn("security_requirement_added",
+                      kinds(run(self.old, self.new)))
 
     def test_success_response_removed(self):
         # No success status remains, so callers have nothing to fall back to.

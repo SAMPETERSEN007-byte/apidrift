@@ -412,3 +412,37 @@ class TestIncompletePathLiterals(unittest.TestCase):
         from apidrift.dependence import paths_match
         self.assertTrue(
             paths_match("/v2/Services", "https://verify.twilio.com/v2/Services"))
+
+
+class TestVendoredLibraryCopies(unittest.TestCase):
+    """A checked-in copy of the library carries the library's own licence."""
+
+    DISCORD_PY = ('# The MIT License (MIT)\n'
+                  '# Copyright (c) 2015-present Rapptz\n'
+                  'import discord\n'
+                  'def delete_template(self, gid, code):\n'
+                  '    return self.request(Route("DELETE", '
+                  '"/guilds/{guild_id}/templates/{code}"))\n')
+
+    def test_a_library_dump_is_not_author_code(self):
+        f = finding(kind="schema_removed", subject="IconEmojiResponse",
+                    path="/guilds/{guild_id}/templates/{code}", method="delete")
+        for path in ("discord/http.py", "generic_modules/discord/http.py"):
+            with self.subTest(path=path):
+                verdict, reason, _, _ = verify_source(
+                    self.DISCORD_PY, path, f, get("discord"))
+                self.assertEqual(verdict, NOT_AUTHOR_CODE)
+                self.assertIn("copy of the library", reason)
+
+    def test_the_authors_own_file_in_a_vendor_named_dir_is_kept(self):
+        from apidrift.verify import looks_vendored_library
+        self.assertEqual(
+            looks_vendored_library("const x = 1;\n",
+                                   ".claude/skills/stripe/query.mjs",
+                                   get("stripe")), "")
+
+    def test_a_licence_outside_a_vendor_directory_is_not_vendoring(self):
+        from apidrift.verify import looks_vendored_library
+        self.assertEqual(
+            looks_vendored_library("# Copyright (c) 2024 acme\n",
+                                   "app/services/billing.py", get("stripe")), "")

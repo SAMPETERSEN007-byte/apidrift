@@ -394,14 +394,23 @@ def _collect_params(
     return out
 
 
-def _security_names(node: Any) -> Tuple[str, ...]:
+def _security_names(node: Any) -> Tuple[frozenset, ...]:
+    """Security as OpenAPI defines it: a list of ALTERNATIVES.
+
+    Each entry is one way to authenticate, and the keys within an entry must
+    all be satisfied together. So `[{A}, {B}]` means "A or B", and flattening
+    it to `{A, B}` loses the distinction between adding an alternative (which
+    breaks nobody) and adding a requirement (which breaks everybody). Twilio
+    added `access_token_bearer` alongside `accountSid_authToken` on nine
+    operations, and the flattened form scored all nine as breaking.
+    """
     if not isinstance(node, list):
         return ()
-    names: List[str] = []
-    for req in node:
-        if isinstance(req, dict):
-            names.extend(sorted(req.keys()))
-    return tuple(sorted(set(names)))
+    alternatives: List[frozenset] = []
+    for requirement in node:
+        if isinstance(requirement, dict):
+            alternatives.append(frozenset(str(k) for k in requirement))
+    return tuple(alternatives)
 
 
 def load_spec(raw: bytes, filename: str) -> Spec:

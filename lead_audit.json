@@ -15,14 +15,32 @@
       "sampled": 10,
       "refuted": 9,
       "sendable": false,
-      "note": "Re-audit after gating all six. Same refutation rate. The gates changed WHY leads die, not HOW OFTEN. Root cause named: verification proves co-location (this file mentions this vendor and this path) and never proves dependence on the changed element. Ten of twenty leads were one cluster where the call sites matched correctly and the change still could not affect them, because removing a 204 while the 200 remains narrows the API rather than breaking it. That was fixed at the findings level. The structural gap remains."
+      "note": "Re-audit after gating all six. Same rate. The gates changed WHY leads die, not HOW OFTEN. Root cause named: verification proved co-location and never dependence. Ten of twenty leads were one cluster where the call sites matched correctly and the change still could not affect them, because removing a 204 while the 200 remains narrows the API rather than breaking it. Fixed at the findings level."
+    },
+    {
+      "date": "2026-08-20",
+      "run": "wf_52be91f5-94e",
+      "sampled": 10,
+      "refuted": 10,
+      "sendable": false,
+      "note": "Third audit, after the verifier was rebuilt around a dependence proof (call reaching the operation by method and full path template; or a read of the changed field traced back to a vendor call). The proof chains were judged accurate in every case -- the paths, methods and operations were right. The leads are still wrong, for a reason the rebuild did not address: operation reachability was accepted as sufficient for a whole-schema removal, so a caller who reaches the operation but never reads the removed schema's fields is reported as affected. Seven of ten fell that way. This audit also found a FINDINGS defect no previous round had named, described below."
     }
   ],
+  "findings_defect_found_and_fixed": {
+    "what": "OpenAPI security is a list of ALTERNATIVES: [{A}, {B}] means A or B. Both the engine and the independent precision checker flattened it to a set of scheme names, so adding an alternative scored as breaking.",
+    "evidence": "Twilio DELETE /v2/Services/{Sid} went from [{accountSid_authToken}] to [{accountSid_authToken}, {access_token_bearer}]. Every existing caller kept working. Nine operations were scored breaking.",
+    "why_it_survived": "The checker shared the engine's mistake, so it agreed with it. That is precisely the failure a separate checker exists to prevent, and it means the earlier 86/86 claim was wrong for the security class.",
+    "status": "Fixed in both, independently. A change is breaking only when some old alternative can no longer be satisfied. Re-measured: 84 breaking findings, 84/84 confirmed, zero undecidable."
+  },
   "standing": {
-    "lead_precision": "1/10",
+    "lead_precision": "0/10",
     "sendable": false,
-    "blocker": "A lead must demonstrate that the code depends on the changed element, in the correct direction, on the correct operation, and that the change direction actually breaks that usage. The verifier establishes co-location only.",
-    "findings_precision": "86/86, zero undecidable",
+    "blocker": "Operation reachability is accepted as proof for a whole-schema removal. A caller who reaches the operation but never reads any field of the removed schema is not affected, and seven of ten audited leads were exactly that. The fix is to resolve the removed schema to its leaf field names in the OLD spec and require a read of one of them, rejecting calls whose response is discarded.",
+    "findings_precision": "84/84, zero undecidable, after correcting the security defect above",
+    "also_open": [
+      "operation_reached() stops at the first affected operation with a hit, in list order, so an alphabetically earlier DELETE whose response is discarded wins over a GET whose response is deserialized. Rank by whether the response is consumed.",
+      "A lead's breaks_on names the finding's representative operation while its proof names the operation the file actually calls, with nothing stating the two are related. This misled three auditors who had the repo, the spec and the source in front of them."
+    ],
     "note": "The findings engine is verified. The lead pipeline is not. Do not send outreach built on leads until an audit clears."
   }
 }

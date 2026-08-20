@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .loader import TRUNCATED, Field, Operation, Param, Spec
 
@@ -415,6 +415,37 @@ def _diff_fields(
     return out
 
 
+def _render_security(alternatives: Sequence[frozenset]) -> str:
+    if not alternatives:
+        return "<none>"
+    return " OR ".join("+".join(sorted(alt)) or "<empty>" for alt in alternatives)
+
+
+def _security_tightened(
+    old: Sequence[frozenset], new: Sequence[frozenset],
+) -> Tuple[bool, str]:
+    """Did the contract get harder to satisfy?
+
+    A caller who satisfied some old alternative is still fine if any NEW
+    alternative is a subset of what they already provide. Adding a further
+    alternative therefore breaks nobody; adding a scheme to every existing
+    alternative, or deleting an alternative, breaks the callers who relied on
+    it.
+    """
+    if not old:
+        return (bool(new), "operation now requires auth where it required none"
+                if new else "")
+    if not new:
+        return False, ""
+    stranded = [alt for alt in old
+                if not any(candidate <= alt for candidate in new)]
+    if not stranded:
+        return False, ""
+    lost = " OR ".join("+".join(sorted(alt)) for alt in stranded)
+    return True, (f"callers authenticating with `{lost}` can no longer "
+                  f"satisfy this operation")
+
+
 def _diff_operation(old: Operation, new: Operation) -> List[Finding]:
     out: List[Finding] = []
     out.extend(_diff_params(old, new))
@@ -464,14 +495,13 @@ def _diff_operation(old: Operation, new: Operation) -> List[Finding]:
         # body, which has no named schema for the other pass to find.
         out.extend(_diff_fields(old_resp, new_resp, new, "response", status))
 
-    if set(new.security) - set(old.security):
+    tightened, why = _security_tightened(old.security, new.security)
+    if tightened:
         out.append(_mk(
-            new, "security_requirement_added", BREAKING,
-            "operation now requires additional auth: "
-            + ", ".join(sorted(set(new.security) - set(old.security))),
+            new, "security_requirement_added", BREAKING, why,
             subject="<security>",
-            old=",".join(old.security) or "<none>",
-            new=",".join(new.security) or "<none>",
+            old=_render_security(old.security),
+            new=_render_security(new.security),
         ))
 
     if not old.deprecated and new.deprecated:
