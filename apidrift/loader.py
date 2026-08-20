@@ -44,6 +44,12 @@ class Field:
     # inline definition cannot be compared against a named one describing the
     # same thing, and extracting a schema reads as a type change.
     shape: Optional[Tuple[str, ...]] = None
+    # The vendor's own sentence about what this field is for. Never compared:
+    # a reworded description is an edit to prose, not to the API. It exists so
+    # a SUGGESTION can say what the thing does instead of only naming it --
+    # `PaymentInitiationPaymentCreateRequest.user_id` is a string; "the ID of
+    # the user to associate with the payment" is advice.
+    description: str = ""
 
     def signature(self) -> str:
         parts = [self.type]
@@ -623,6 +629,11 @@ def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
                 node = prop if target else (resolved if isinstance(resolved, dict) else {})
                 inline_props = (node.get("properties")
                                 if isinstance(node, dict) else None)
+                blurb = ""
+                for source in (prop, node):
+                    if isinstance(source, dict) and source.get("description"):
+                        blurb = str(source["description"])
+                        break
                 fields[str(prop_name)] = Field(
                     type=(f"->{target}" if target else _type_of(node)),
                     required=str(prop_name) in required,
@@ -631,6 +642,7 @@ def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
                           if isinstance(node, dict) and not target else None),
                     shape=(tuple(sorted(inline_props))
                            if isinstance(inline_props, dict) else None),
+                    description=" ".join(blurb.split())[:400],
                 )
 
         views[str(name)] = SchemaView(

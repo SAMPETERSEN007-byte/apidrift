@@ -111,6 +111,7 @@ class Impact:
     text: str = ""
     evidence: str = ""
     spec_window: str = ""
+    blurb: str = ""
 
     def as_dict(self) -> Dict[str, object]:
         return {
@@ -121,7 +122,7 @@ class Impact:
             "old": self.old, "new": self.new,
             "operation": self.operation, "chain": self.chain,
             "text": self.text, "evidence": self.evidence,
-            "spec_window": self.spec_window,
+            "spec_window": self.spec_window, "blurb": self.blurb,
         }
 
 
@@ -431,7 +432,7 @@ def scan_repo(
                         new=addition.new, operation=operation or addition.new,
                         chain=list(proof.chain),
                         text=proof.text.strip()[:120], evidence="",
-                        spec_window=window,
+                        spec_window=window, blurb=addition.blurb,
                     ))
                     break     # one place per addition is enough to act on
         if progress:
@@ -573,10 +574,13 @@ def _opportunity_markdown(result: ScanResult) -> List[str]:
                f"adopt", "",
            "_Nothing below is broken. These are things the vendor added in "
            "the same window, on resources this repo already calls._", "",
-           "| Vendor | What is new | Where you already call it |",
-           "|---|---|---|"]
+           "| Vendor | What is new | What it does | Where you already call it |",
+           "|---|---|---|---|"]
     for o in result.opportunities:
+        says = (o.blurb[:120].replace("|", "\\|") + "…"
+                if len(o.blurb) > 120 else o.blurb.replace("|", "\\|"))
         out.append(f"| {o.vendor_name} | {o.label}: `{o.subject}` "
+                   f"| {says or '_no description in the spec_'} "
                    f"| `{o.file}:{o.line}` |")
     if result.opportunities_dropped:
         out += ["", f"_{result.opportunities_dropped} further additions ranked "
@@ -611,8 +615,10 @@ def _opportunity_lines(result: ScanResult) -> List[str]:
                f"{'' if len(result.opportunities) == 1 else 's'} this vendor "
                f"added that you are positioned to use:"]
     for o in result.opportunities:
-        out.append(f"  {o.file}:{o.line}: {o.vendor_name} {o.label} — "
-                   f"{o.subject}")
+        out.append(f"  {o.vendor_name} {o.label} — {o.subject}")
+        if o.blurb:
+            out.append(f"      {o.blurb[:150]}")
+        out.append(f"      you already call this at {o.file}:{o.line}")
     if result.opportunities_dropped:
         out.append(f"  … and {result.opportunities_dropped} more, ranked "
                    f"lower (mostly new response fields, which arrive whether "

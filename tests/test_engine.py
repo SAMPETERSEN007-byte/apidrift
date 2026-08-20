@@ -864,3 +864,56 @@ class TestPositionalParameters(unittest.TestCase):
         found = {f.kind for f in result.findings}
         self.assertIn("param_removed", found)
         self.assertIn("param_added_required", found)
+
+
+class TestProseIsNotAPI(unittest.TestCase):
+    """A reworded description is an edit to prose, not to the API.
+
+    `Field` now carries the vendor's own sentence so a SUGGESTION can say what
+    a new field is for instead of only naming it. `Field` is a frozen
+    dataclass, so `==` compares that sentence too — and the moment anything
+    compares two Fields directly, every vendor copy-edit becomes a finding.
+    Nothing does today. This test is what keeps it that way.
+    """
+
+    def test_rewording_a_description_changes_nothing(self):
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        old["components"]["schemas"]["Card"]["properties"]["iin"][
+            "description"] = "The issuer identification number."
+        new["components"]["schemas"]["Card"]["properties"]["iin"][
+            "description"] = "Issuer Identification Number (first 8 digits)."
+        result = run(old, new)
+        self.assertEqual([f.kind for f in result.findings], [],
+                         "a copy-edit is not an API change")
+        self.assertEqual([a.kind for a in result.additions], [])
+
+    def test_the_shape_projection_never_carries_prose(self):
+        """The invariant, tested where it lives.
+
+        Going through the diff cannot test this: a description-only edit never
+        enters a comparison branch at all, so every mutation stays green. The
+        protection is that `_field_shape` projects a field down to what a
+        consumer can observe, and prose is not observable.
+        """
+        from apidrift.diff import _field_shape
+        from apidrift.loader import Field
+        empty = spec(copy.deepcopy(BASE))
+        a = Field(type="string", required=False, nullable=False,
+                  description="The issuer identification number.")
+        b = Field(type="string", required=False, nullable=False,
+                  description="Issuer Identification Number (first 8 digits).")
+        self.assertNotEqual(a, b, "the Fields really do differ")
+        self.assertEqual(_field_shape(a, empty), _field_shape(b, empty),
+                         "but what a consumer sees is identical")
+
+    def test_the_description_is_still_carried_for_suggestions(self):
+        """The control: the sentence must actually survive to the addition."""
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        new["components"]["schemas"]["Card"]["properties"]["network"] = {
+            "type": "string",
+            "description": "The card network that will process the payment.",
+        }
+        added = [a for a in run(old, new).additions
+                 if a.subject == "Card.network"]
+        self.assertTrue(added, "a new optional field is an addition")
+        self.assertIn("card network", added[0].blurb.lower())

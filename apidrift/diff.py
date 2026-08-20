@@ -116,6 +116,9 @@ class Finding:
     # The resource an addition belongs to, used to judge whether a
     # repo already working with it would care.
     resource: str = ""
+    # The vendor's own sentence about the added field. Only ever populated for
+    # additions: a suggestion has to say what the thing is FOR.
+    blurb: str = ""
     root_cause: str = ""
 
     def as_dict(self) -> Dict[str, object]:
@@ -644,6 +647,7 @@ def _diff_additions(old: Spec, new: Spec) -> List[Finding]:
             subject=op.path, old="<absent>", new=key,
         )
         finding.root_cause = op.path
+        finding.blurb = op.summary
         finding.resource = _resource_of(op.path)
         # Sibling operations on the same resource are what a repo already
         # calling this resource would be found by.
@@ -679,6 +683,7 @@ def _diff_additions(old: Spec, new: Spec) -> List[Finding]:
                 old="<absent>", new=after.fields[field_name].signature(),
             )
             finding.root_cause = f"{name}.{field_name}"
+            finding.blurb = after.fields[field_name].description
             finding.in_request = bool(in_request)
             finding.in_response = bool(in_response)
             finding.resource = _resource_of(carrier.path)

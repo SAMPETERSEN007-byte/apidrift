@@ -18,6 +18,20 @@ PY_BIN = str(ROOT / ".venv" / "bin" / "python")
 
 MUTATIONS = [
     (
+        "the shape projection carries prose, so a copy-edit becomes a finding",
+        "apidrift/diff.py",
+        '    return ("scalar", field.type)',
+        '    return ("scalar", field.type, field.description)',
+        ["test_the_shape_projection_never_carries_prose"],
+    ),
+    (
+        "the vendor's sentence dropped, leaving a suggestion that only names a field",
+        "apidrift/diff.py",
+        "            finding.blurb = after.fields[field_name].description",
+        '            finding.blurb = ""',
+        ["test_the_description_is_still_carried_for_suggestions"],
+    ),
+    (
         "an unmeasured language reported as clean again",
         "apidrift/scan.py",
         "        if result.unmeasured:\n            head = (f\"apidrift: no impact found in Python \"",
