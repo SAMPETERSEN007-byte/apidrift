@@ -36,6 +36,46 @@ FIELD_KINDS = frozenset({
     "schema_field_now_nullable", "response_field_now_nullable",
 })
 
+# Human labels for the report. The kind is the stable identifier; this is what
+# a reader who does not work on this tool should see.
+KIND_LABEL = {
+    "schema_removed": "schema deleted",
+    "schema_field_removed": "field removed from a schema",
+    "schema_field_type_changed": "field changed type",
+    "schema_field_now_required": "field became required",
+    "schema_field_added_required": "new required field",
+    "schema_enum_value_removed": "enum value removed",
+    "schema_enum_value_added": "enum value added",
+    "schema_field_now_nullable": "field became nullable",
+    "endpoint_removed": "endpoint removed",
+    "endpoint_moved": "endpoint moved",
+    "endpoint_deprecated": "endpoint deprecated",
+    "spec_removed": "spec file deleted",
+    "response_status_removed": "success response removed",
+    "response_field_removed": "field removed from a response",
+    "request_field_removed": "field removed from a request",
+    "response_field_type_changed": "response field changed type",
+    "request_field_type_changed": "request field changed type",
+    "request_field_added_required": "new required request field",
+    "request_field_now_required": "request field became required",
+    "response_enum_value_added": "enum value added to a response",
+    "response_enum_value_removed": "enum value removed from a response",
+    "request_enum_value_removed": "enum value removed from a request",
+    "security_requirement_added": "new auth requirement",
+    "param_removed": "parameter removed",
+    "param_added_required": "new required parameter",
+    "param_now_required": "parameter became required",
+    "param_type_changed": "parameter changed type",
+    "param_deprecated": "parameter deprecated",
+    "server_url_changed": "base URL changed",
+    "request_body_now_required": "request body became required",
+}
+
+
+def label_for(kind: str) -> str:
+    return KIND_LABEL.get(kind, kind.replace("_", " "))
+
+
 BREAKING = "breaking"
 POTENTIALLY_BREAKING = "potentially_breaking"
 ADDITIVE = "additive"

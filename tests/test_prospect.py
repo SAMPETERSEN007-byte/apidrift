@@ -194,3 +194,18 @@ class TestEveryPrintedCommandIsValid(unittest.TestCase):
                 re.compile(pattern)                    # raises on bad escaping
                 self.assertNotIn("#/components", pattern,
                                  "a JSON pointer is not a call site")
+
+
+class TestLabels(unittest.TestCase):
+    def test_every_emitted_kind_has_a_human_label(self):
+        import json
+        from pathlib import Path
+        from apidrift.diff import KIND_LABEL
+
+        findings_path = Path(__file__).resolve().parent.parent / "out" / "findings.json"
+        if not findings_path.exists():
+            self.skipTest("no findings.json; run the CLI first")
+        emitted = {f["kind"] for entry in json.load(open(findings_path))
+                   for f in entry["findings"]}
+        missing = emitted - set(KIND_LABEL)
+        self.assertEqual(missing, set(), f"kinds with no reader-facing label: {sorted(missing)}")

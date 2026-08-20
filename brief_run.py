@@ -16,6 +16,7 @@ import datetime as _dt
 
 from apidrift.classify import (ECOSYSTEM, INTEGRATOR, VENDORED, dedupe_by_repo,
                                partition)
+from apidrift.diff import label_for
 from apidrift.vendors import get
 
 ROOT = Path(__file__).resolve().parent
@@ -29,7 +30,7 @@ def kind_table(findings: List[dict]) -> str:
             counts[f["kind"]] = counts.get(f["kind"], 0) + 1
     rows = sorted(counts.items(), key=lambda kv: -kv[1])
     lines = ["| Change type | Count |", "|---|---:|"]
-    lines += [f"| `{k}` | {v} |" for k, v in rows]
+    lines += [f"| {label_for(k)} | {v} |" for k, v in rows]
     return "\n".join(lines)
 
 

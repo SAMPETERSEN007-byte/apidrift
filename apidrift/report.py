@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 from typing import Dict, List
 
-from .diff import ADDITIVE, BREAKING, POTENTIALLY_BREAKING, DiffResult
+from .diff import (ADDITIVE, BREAKING, POTENTIALLY_BREAKING, DiffResult,
+                   label_for)
 from .vendors import Vendor
 
 MAX_DETAIL_ROWS = 12
@@ -47,11 +48,11 @@ def to_markdown(results: List[DiffResult], vendors: Dict[str, Vendor], window_da
     lines.append("|---|---|---:|---:|---:|---:|---|")
     for res in results:
         top = _kind_histogram(res, BREAKING) or _kind_histogram(res, POTENTIALLY_BREAKING)
-        top_kind = next(iter(top), "—")
+        top_kind = label_for(next(iter(top), "—"))
         lines.append(
             f"| **{vendors[res.vendor].name}** | {res.old_date} → {res.new_date} "
             f"| {res.new_op_count} | {len(res.breaking)} | "
-            f"{len(res.potentially_breaking)} | {res.raw_finding_count}→{len(res.findings)} | `{top_kind}` |"
+            f"{len(res.potentially_breaking)} | {res.raw_finding_count}→{len(res.findings)} | {top_kind} |"
         )
     total_breaking = sum(len(r.breaking) for r in results)
     lines.append(f"\n**{total_breaking} breaking changes** across "
@@ -68,8 +69,9 @@ def to_markdown(results: List[DiffResult], vendors: Dict[str, Vendor], window_da
         )
         hist = _kind_histogram(res, BREAKING)
         if hist:
-            lines.append("Breaking-change kinds: " +
-                         ", ".join(f"`{k}` ×{v}" for k, v in hist.items()) + "\n")
+            lines.append("Breaking changes: " +
+                         ", ".join(f"{label_for(k)} ×{v}" for k, v in hist.items())
+                         + "\n")
         else:
             lines.append("_No breaking changes detected in this window._\n")
 
@@ -80,7 +82,8 @@ def to_markdown(results: List[DiffResult], vendors: Dict[str, Vendor], window_da
             ops = near or reach
             fanout = (f" · **{near} operations use it directly**" if near > 1
                       else (f" · **{reach} operations affected**" if reach > 1 else ""))
-            lines.append(f"### `{finding.kind}` — `{finding.root_cause or finding.subject}`{fanout}")
+            lines.append(f"### {label_for(finding.kind)} — "
+                         f"`{finding.root_cause or finding.subject}`{fanout}")
             if finding.path.startswith("#"):
                 # A schema finding with no concrete route: name the schema,
                 # not a JSON pointer dressed up as an endpoint.
