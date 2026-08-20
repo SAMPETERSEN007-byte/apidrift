@@ -217,7 +217,73 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
             return REFUTED, "property definition is identical"
         return UNDECIDABLE, f"no independent check for `{kind}`"
 
+    def _body_schema(doc, op_key, where):
+        op = find_operation(doc, op_key)
+        if not isinstance(op, dict):
+            return None
+        if where == "request":
+            node = op.get("requestBody") or {}
+        else:
+            responses = op.get("responses") or {}
+            node = responses.get("200") or responses.get("201") or {}
+            if not node:
+                for status, body in responses.items():
+                    if str(status).startswith("2"):
+                        node = body
+                        break
+        if "$ref" in (node or {}):
+            node = schemas_of(doc).get(str(node["$ref"]).rsplit("/", 1)[-1]) or {}
+        content = (node or {}).get("content") or {}
+        for mime in ("application/json", "application/x-www-form-urlencoded"):
+            if mime in content:
+                return (content[mime] or {}).get("schema")
+        for body in content.values():
+            return (body or {}).get("schema")
+        return (node or {}).get("schema")
+
+    if kind in ("request_field_added_required", "request_field_now_required",
+                "param_added_required", "param_now_required"):
+        # Operation-level: the body is inline, so walk it directly.
+        leaf = root.split(".")[-1].replace("[]", "")
+        old_schema = _body_schema(old, finding["op_key"], "request")
+        new_schema = _body_schema(new, finding["op_key"], "request")
+        if new_schema is None:
+            return UNDECIDABLE, "no request body found on the new side"
+
+        def required_of(schema, doc, path_parts):
+            if not path_parts:
+                node = schema
+            else:
+                found, node = walk_properties(schema, path_parts[:-1], doc)
+                if not found:
+                    return None
+            if isinstance(node, dict) and "$ref" in node:
+                node = schemas_of(doc).get(str(node["$ref"]).rsplit("/", 1)[-1]) or {}
+            return set((node or {}).get("required") or [])
+
+        parts = [p for p in root.replace("[]", ".[].").split(".") if p]
+        new_req = required_of(new_schema, new, parts)
+        old_req = required_of(old_schema, old, parts) if old_schema is not None else set()
+        if new_req is None:
+            return UNDECIDABLE, "could not resolve the parent object"
+        if leaf in new_req and leaf not in (old_req or set()):
+            return CONFIRMED, f"`{leaf}` newly required in the request body"
+        return REFUTED, (f"`{leaf}` required old={leaf in (old_req or set())} "
+                         f"new={leaf in new_req}")
+
     if kind in ("response_field_removed", "request_field_removed"):
+        where = "response" if kind.startswith("response") else "request"
+        old_schema = _body_schema(old, finding["op_key"], where)
+        new_schema = _body_schema(new, finding["op_key"], where)
+        if old_schema is not None and new_schema is not None:
+            parts = [p for p in root.replace("[]", ".[].").split(".") if p]
+            in_old, _ = walk_properties(old_schema, parts, old)
+            in_new, _ = walk_properties(new_schema, parts, new)
+            if in_old and not in_new:
+                return CONFIRMED, f"`{root}` present at old, absent at new"
+            if in_old or in_new:
+                return REFUTED, f"`{root}` old={in_old} new={in_new}"
+        # Fall through to the schema-rooted check below.
         resolved = resolve_root(old, root)
         if resolved is None:
             return UNDECIDABLE, f"root `{root}` is not a named schema"
