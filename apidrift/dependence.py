@@ -122,6 +122,13 @@ def paths_match(template: str, candidate: str) -> bool:
     got = _segments(candidate)
     if not want or not got:
         return False
+    if candidate.rstrip().endswith("/"):
+        # A literal ending in a slash is a prefix the caller concatenates onto,
+        # so the path it really requests is longer than what is written here.
+        # `"https://verify.twilio.com/v2/Services/"` was matching the shorter
+        # `POST /v2/Services` while the code actually posts to
+        # `/v2/Services/{sid}/Verifications`.
+        return False
     if len(got) < len(want):
         # Trimming the template to fit a shorter literal was far too generous:
         # a FastAPI router prefix of `/communications` "matched"

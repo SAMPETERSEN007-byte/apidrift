@@ -399,3 +399,16 @@ class TestProofNamesTheMatchedOperation(unittest.TestCase):
                       "the proof must state the operation actually called")
         self.assertNotIn("DELETE /v2/Services/{Sid}", chain,
                          "and not the representative operation")
+
+
+class TestIncompletePathLiterals(unittest.TestCase):
+    def test_a_trailing_slash_marks_an_incomplete_path(self):
+        from apidrift.dependence import paths_match
+        self.assertFalse(
+            paths_match("/v2/Services", "https://verify.twilio.com/v2/Services/"),
+            "the caller concatenates onto this prefix, so the real path is longer")
+
+    def test_a_complete_path_still_matches(self):
+        from apidrift.dependence import paths_match
+        self.assertTrue(
+            paths_match("/v2/Services", "https://verify.twilio.com/v2/Services"))

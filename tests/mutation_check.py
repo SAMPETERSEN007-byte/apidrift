@@ -393,6 +393,13 @@ MUTATIONS = [
          "test_a_deleted_schema_is_proven_by_reaching_its_operation"],
     ),
     (
+        "dependence: a concatenation prefix accepted as a complete path",
+        "apidrift/dependence.py",
+        "    if candidate.rstrip().endswith(\"/\"):",
+        "    if False:",
+        ["test_a_trailing_slash_marks_an_incomplete_path"],
+    ),
+    (
         "signature builder drops the field name",
         "apidrift/signatures.py",
         "        if leaf and not leaf.startswith(\"<\"):",
