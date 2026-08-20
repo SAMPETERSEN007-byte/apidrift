@@ -301,8 +301,8 @@ MUTATIONS = [
     (
         "pseudo-paths searched as if they were URLs",
         "apidrift/prospect.py",
-        "        return \"\" if finding.path.startswith(\"#\") else finding.path",
-        "        return finding.path",
+        "    if not path or path == \"/\" or path.startswith(\"#\"):\n        return \"\"",
+        "    if not path or path == \"/\":\n        return \"\"",
         ["test_pseudo_path_is_never_searched_as_a_url"],
     ),
     (
