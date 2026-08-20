@@ -351,6 +351,21 @@ MUTATIONS = [
         ["test_a_field_change_needs_the_vendor_in_the_file"],
     ),
     (
+        "dependence: routes the repo SERVES counted as calls it makes",
+        "apidrift/dependence.py",
+        "        if _is_route_registration(node):\n            continue",
+        "        if False:\n            continue",
+        ["test_a_served_route_is_not_a_call_to_the_vendor"],
+    ),
+    (
+        "dependence: identifier filter removed (paths read as field names)",
+        "apidrift/dependence.py",
+        "    if not leaf or leaf.startswith(\"<\") or leaf.startswith(\"/\"):\n        return \"\"\n    if not leaf[0].isalpha():\n        return \"\"\n    if not leaf.replace(\"_\", \"\").replace(\"-\", \"\").isalnum():\n        return \"\"",
+        "    if not leaf:\n        return \"\"",
+        ["test_an_endpoint_subject_is_not_read_as_a_field_name",
+         "test_the_same_path_with_the_right_method_is_a_match"],
+    ),
+    (
         "signature builder drops the field name",
         "apidrift/signatures.py",
         "        if leaf and not leaf.startswith(\"<\"):",

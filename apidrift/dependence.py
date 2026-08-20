@@ -119,8 +119,12 @@ def paths_match(template: str, candidate: str) -> bool:
     if not want or not got:
         return False
     if len(got) < len(want):
-        # The literal may omit a version prefix carried in the base URL.
-        want = want[len(want) - len(got):]
+        # Trimming the template to fit a shorter literal was far too generous:
+        # a FastAPI router prefix of `/communications` "matched"
+        # `/v2/Conversations/{sid}/Communications` because only the final
+        # segment survived the trim. A caller writing part of a path is a lead
+        # we lose; a caller of something else entirely is a lead we invent.
+        return False
     tail = got[len(got) - len(want):]
     if len(tail) != len(want):
         return False
@@ -301,6 +305,26 @@ def find_sdk_calls(tree: ast.AST, idioms: Sequence[str],
     return proofs
 
 
+# Registering a route means this code SERVES that path. It is the opposite of
+# calling the vendor, and `@app.get("/communications")` was being read as a
+# Twilio call.
+_ROUTE_REGISTRARS = frozenset({
+    "route", "add_route", "add_api_route", "include_router", "APIRouter",
+    "add_url_rule", "websocket", "middleware", "mount",
+})
+
+
+def _is_route_registration(node: ast.Call) -> bool:
+    chain = _attr_chain(node.func)
+    leaf = chain.rsplit(".", 1)[-1] if chain else ""
+    if leaf in _ROUTE_REGISTRARS:
+        return True
+    root = _root_name(node.func)
+    if root in ("app", "router", "api", "blueprint", "bp") and leaf in HTTP_VERBS:
+        return True
+    return any(keyword.arg == "prefix" for keyword in node.keywords)
+
+
 def find_operation_calls(tree: ast.AST, method: str, path: str,
                          lines: Sequence[str]) -> List[Proof]:
     """Calls that name BOTH the method and a path matching the template.
@@ -313,6 +337,8 @@ def find_operation_calls(tree: ast.AST, method: str, path: str,
     proofs: List[Proof] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
+            continue
+        if _is_route_registration(node):
             continue
         candidates = [literal_of(child) for child in ast.walk(node)]
         matched_path = next(
@@ -459,9 +485,22 @@ def find_missing_required(tree: ast.AST, field_name: str, method: str,
 # ---------------------------------------------------------------------------
 
 def _leaf_of(finding: Finding) -> str:
+    """The field or schema the change names, or empty if it names none.
+
+    An endpoint-level change carries a path as its subject, and a path is not
+    a name a caller writes as an identifier. Treating `/guilds/{id}/bulk-ban`
+    as a field name sent every endpoint change down the field-read route,
+    where it could never be proven.
+    """
     subject = finding.root_cause or finding.subject
     leaf = subject.split(".")[-1].replace("[]", "").strip("<>")
-    return "" if leaf.startswith("<") else leaf
+    if not leaf or leaf.startswith("<") or leaf.startswith("/"):
+        return ""
+    if not leaf[0].isalpha():
+        return ""
+    if not leaf.replace("_", "").replace("-", "").isalnum():
+        return ""
+    return leaf
 
 
 def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], str]:
@@ -554,9 +593,7 @@ def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], s
         return [], (f"reads `{leaf}` but never calls an operation that "
                     f"carries it")
 
-    if finding.kind in ENDPOINT_KINDS:
-        calls = operation_reached()
-        if calls:
-            return calls, ""
-
+    # No fallback to "calls an operation that carries it". When the change
+    # names a schema or field, code that never names it cannot be shown to
+    # depend on it, however many of the vendor's endpoints it calls.
     return [], f"`{leaf}` is never read or sent in this file"

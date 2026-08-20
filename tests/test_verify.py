@@ -267,3 +267,42 @@ class TestProvenanceAtLeadTime(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestPathAnchoring(unittest.TestCase):
+    """A caller of something else is worse than a caller we miss."""
+
+    def test_a_router_prefix_is_not_a_call_to_the_vendor(self):
+        source = ('import twilio\n'
+                  'router = APIRouter(prefix="/communications", tags=["x"])\n')
+        f = finding(kind="endpoint_removed",
+                    subject="/v2/Conversations/{sid}/Communications",
+                    path="/v2/Conversations/{sid}/Communications", method="get")
+        self.assertEqual(verdict_of(source, f, get("twilio")), NO_DEPENDENCE)
+
+    def test_a_served_route_is_not_a_call_to_the_vendor(self):
+        source = ('import twilio\n'
+                  '@app.get("/v2/Conversations/{sid}/Communications")\n'
+                  'def handler(sid):\n    return []\n')
+        f = finding(kind="endpoint_removed",
+                    subject="/v2/Conversations/{sid}/Communications",
+                    path="/v2/Conversations/{sid}/Communications", method="get")
+        self.assertEqual(verdict_of(source, f, get("twilio")), NO_DEPENDENCE)
+
+    def test_a_partial_path_does_not_match_a_longer_template(self):
+        from apidrift.dependence import paths_match
+        self.assertFalse(
+            paths_match("/v2/Conversations/{sid}/Communications", "/communications"))
+
+    def test_a_base_url_carried_in_a_variable_still_matches(self):
+        from apidrift.dependence import paths_match
+        self.assertTrue(
+            paths_match("/v1/Stores/{s}/Profiles/{p}/Events",
+                        "{}/v1/Stores/{}/Profiles/{}/Events"))
+
+    def test_an_endpoint_subject_is_not_read_as_a_field_name(self):
+        from apidrift.dependence import _leaf_of
+        f = finding(kind="endpoint_removed", subject="/guilds/{g}/bulk-ban",
+                    path="/guilds/{g}/bulk-ban")
+        self.assertEqual(_leaf_of(f), "")
+        self.assertEqual(_leaf_of(finding(subject="Card.iin")), "iin")
