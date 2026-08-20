@@ -14,7 +14,7 @@
 #
 # Layer 5 exists because a green gate on layers 1-4 was compatible with a lead
 # list where nine of ten sampled entries were refuted. Nothing measured leads,
-# so nothing reported them. It reads out/lead_audit.json, which only an actual
+# so nothing reported them. It reads lead_audit.json, which only an actual
 # audit may update.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -43,10 +43,10 @@ else
 fi
 
 step "5/5 lead standing (from the last adversarial audit)"
-if [ -f out/lead_audit.json ]; then
+if [ -f lead_audit.json ]; then
   $PY - <<'PY'
 import json, sys
-data = json.load(open("out/lead_audit.json"))
+data = json.load(open("lead_audit.json"))
 standing = data["standing"]
 audits = data["audits"]
 print(f"  audits run           : {len(audits)}")

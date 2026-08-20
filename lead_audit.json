@@ -1,0 +1,28 @@
+{
+  "_comment": "Standing record of adversarial lead audits. gate.sh reads this so a green gate cannot coexist with an unsendable lead list. Update it only by running the audit again, never by hand.",
+  "audits": [
+    {
+      "date": "2026-08-20",
+      "run": "wf_f50925b5-e15",
+      "sampled": 10,
+      "refuted": 9,
+      "sendable": false,
+      "note": "First audit. Six failure modes named: URL-prefix instead of operation; vendor-owned or generated SDK code; anchor on a declaration rather than a call; changed field absent from the repo; vendored dependency trees; line numbers from a different revision. All six gated."
+    },
+    {
+      "date": "2026-08-20",
+      "run": "wf_3129a218-8a4",
+      "sampled": 10,
+      "refuted": 9,
+      "sendable": false,
+      "note": "Re-audit after gating all six. Same refutation rate. The gates changed WHY leads die, not HOW OFTEN. Root cause named: verification proves co-location (this file mentions this vendor and this path) and never proves dependence on the changed element. Ten of twenty leads were one cluster where the call sites matched correctly and the change still could not affect them, because removing a 204 while the 200 remains narrows the API rather than breaking it. That was fixed at the findings level. The structural gap remains."
+    }
+  ],
+  "standing": {
+    "lead_precision": "1/10",
+    "sendable": false,
+    "blocker": "A lead must demonstrate that the code depends on the changed element, in the correct direction, on the correct operation, and that the change direction actually breaks that usage. The verifier establishes co-location only.",
+    "findings_precision": "86/86, zero undecidable",
+    "note": "The findings engine is verified. The lead pipeline is not. Do not send outreach built on leads until an audit clears."
+  }
+}
