@@ -18,6 +18,42 @@ PY_BIN = str(ROOT / ".venv" / "bin" / "python")
 
 MUTATIONS = [
     (
+        "a send no longer requires the vendor to be receiving it",
+        "apidrift/dependence.py",
+        "        if not link:\n            continue\n\n        anchors:",
+        '        if not link:\n            link = "any call at all"\n\n        anchors:',
+        ["test_a_keyword_on_the_repos_own_constructor_is_not_a_send"],
+    ),
+    (
+        "a body dict held in a variable is no longer followed",
+        "apidrift/dependence.py",
+        "    if isinstance(node, ast.Name):\n        origin = assignments.get(node.id)\n        return _dict_carrying(origin, field_name, assignments, depth + 1) \\\n            if origin is not None else None",
+        "    if isinstance(node, ast.Name):\n        return None",
+        ["test_a_body_dict_built_in_a_variable_is_still_a_send"],
+    ),
+    (
+        "direction ignored: a read proves a request-side change again",
+        "apidrift/dependence.py",
+        "    read_proves, send_proves = directions(finding)",
+        "    read_proves, send_proves = True, True",
+        ["test_a_read_does_not_prove_a_request_side_change",
+         "test_a_send_does_not_prove_a_response_side_change"],
+    ),
+    (
+        "a request-side kind mis-read as bidirectional",
+        "apidrift/dependence.py",
+        '    if kind.startswith("request_") or kind.startswith("param_"):\n        return False, True',
+        '    if kind.startswith("request_") or kind.startswith("param_"):\n        return True, True',
+        ["test_a_read_does_not_prove_a_request_side_change"],
+    ),
+    (
+        "a response-only schema accepts a send as proof",
+        "apidrift/dependence.py",
+        "        if finding.in_response and not finding.in_request:\n            return True, False",
+        "        if finding.in_response and not finding.in_request:\n            return True, True",
+        ["test_a_send_does_not_prove_a_response_side_change"],
+    ),
+    (
         "a renamed path parameter reported as removed again",
         "apidrift/diff.py",
         "            if _is_positional(p_old):\n                continue",
@@ -69,15 +105,16 @@ MUTATIONS = [
     (
         "a request-side field send no longer proves dependence",
         "apidrift/dependence.py",
-        '    if finding.in_request or "request" in finding.kind:\n        calls = operation_reached()',
-        '    if "request" in finding.kind:\n        calls = operation_reached()',
-        ["test_a_sent_field_on_a_request_schema_is_proven"],
+        "    if send_proves:\n        calls = operation_reached()",
+        "    if False:\n        calls = operation_reached()",
+        ["test_a_sent_field_on_a_request_schema_is_proven",
+         "test_a_send_does_prove_a_request_side_change"],
     ),
     (
         "a keyword argument cited at the line the call opens on",
         "apidrift/dependence.py",
-        '                    line = getattr(keyword, "lineno", None) or getattr(\n                        keyword.value, "lineno", line)',
-        "                    line = line",
+        '                line = getattr(keyword, "lineno", None) \\\n                    or getattr(keyword.value, "lineno", node.lineno)',
+        "                line = node.lineno",
         ["test_a_send_is_cited_at_the_line_the_field_is_on"],
     ),
     (
@@ -406,8 +443,8 @@ MUTATIONS = [
     (
         "dependence: already-migrated callers counted as leads",
         "apidrift/dependence.py",
-        "        supplied = find_field_sends(tree, leaf, vendor, method, \"\", lines)\n        if supplied:",
-        "        supplied = find_field_sends(tree, leaf, vendor, method, \"\", lines)\n        if False:",
+        "        supplied = find_field_sends(tree, leaf, vendor, assignments, idioms, lines)\n        if supplied:",
+        "        supplied = find_field_sends(tree, leaf, vendor, assignments, idioms, lines)\n        if False:",
         ["test_a_caller_that_already_supplies_the_field_is_not_a_lead"],
     ),
     (

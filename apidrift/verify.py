@@ -98,8 +98,6 @@ def looks_generated(source: str) -> str:
 # how a caller SENDS a field; it is not how they READ one. `{"prompt_cache_key":
 # None}` in a defaults table is not a read of a response field, and three of ten
 # sampled leads were exactly that.
-_READ_SITE_KINDS = frozenset({"attribute", "subscript", "dict_get", "property"})
-_WRITE_SITE_KINDS = frozenset({"dict_key", "kwarg", "object_key", "assignment"})
 
 PY_EXT = (".py",)
 LEXICAL_EXT = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rb", ".php", ".java")
@@ -338,24 +336,6 @@ def endpoint_call_sites(
                                   if index < len(raw) else ""))
     sites.sort(key=lambda s: s.line)
     return sites, parsed
-
-
-def _sites_matching_direction(sites: List[Site], finding: Finding) -> List[Site]:
-    """Keep only sites whose form matches how the field is actually used.
-
-    A response field is READ: attribute access, subscript, `.get()`. A request
-    field is SENT: a dict key or a keyword argument. Counting a dict key as a
-    read turned a defaults table and two generated type maps into "call sites".
-    """
-    kind = finding.kind
-    if "request" in kind or kind in ("schema_field_added_required",
-                                     "schema_field_now_required"):
-        allowed = _WRITE_SITE_KINDS | _READ_SITE_KINDS
-    elif "response" in kind or kind.startswith("schema_"):
-        allowed = _READ_SITE_KINDS
-    else:
-        return sites
-    return [s for s in sites if s.kind in allowed]
 
 
 def find_vendor_evidence(source: str, vendor: Vendor) -> str:

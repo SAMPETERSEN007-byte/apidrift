@@ -463,6 +463,61 @@ class TestASentFieldIsAlsoDependence(unittest.TestCase):
             verdict_of(source, self._finding(), get("openai")), NO_DEPENDENCE)
 
 
+class TestDirection(unittest.TestCase):
+    """The same name on the way out and on the way back are two fields.
+
+    `verify._sites_matching_direction` encoded roughly this rule and was called
+    by nothing after the dependence rewrite, so direction read as handled while
+    prove() ignored it. Found live in a scan of phasehq/console, whose
+    `subscription.get("cancel_at")` — a READ off a response — was reported as
+    broken by Stripe retyping `cancel_at` in the subscription-create REQUEST
+    body. That is the first failure mode the first adversarial audit named.
+    """
+
+    READER = ('import stripe\n'
+              'def show(sid):\n'
+              '    subscription = stripe.Subscription.retrieve(sid)\n'
+              '    return subscription.get("cancel_at")\n')
+
+    SENDER = ('import stripe\n'
+              'def cancel(sid, when):\n'
+              '    return stripe.Subscription.modify(sid, cancel_at=when)\n')
+
+    def _request_change(self):
+        return finding(kind="request_field_type_changed", subject="cancel_at",
+                       path="/v1/subscriptions", method="post",
+                       ops=["POST /v1/subscriptions"],
+                       sigs=["stripe.subscriptions.", "stripe.Subscription."])
+
+    def _response_change(self):
+        f = finding(kind="schema_field_removed", subject="Subscription.cancel_at",
+                    path="/v1/subscriptions", method="post",
+                    ops=["POST /v1/subscriptions"],
+                    sigs=["stripe.subscriptions.", "stripe.Subscription."])
+        f.in_response = True
+        return f
+
+    def test_a_read_does_not_prove_a_request_side_change(self):
+        verdict, reason, _, _ = verify_source(
+            self.READER, "app.py", self._request_change(), STRIPE)
+        self.assertEqual(verdict, NO_DEPENDENCE)
+        self.assertIn("the change is to what callers SEND", reason)
+
+    def test_a_send_does_prove_a_request_side_change(self):
+        self.assertEqual(
+            verdict_of(self.SENDER, self._request_change(), STRIPE), CONFIRMED)
+
+    def test_a_send_does_not_prove_a_response_side_change(self):
+        verdict, reason, _, _ = verify_source(
+            self.SENDER, "app.py", self._response_change(), STRIPE)
+        self.assertEqual(verdict, NO_DEPENDENCE)
+        self.assertIn("the change is to what callers RECEIVE", reason)
+
+    def test_a_read_does_prove_a_response_side_change(self):
+        self.assertEqual(
+            verdict_of(self.READER, self._response_change(), STRIPE), CONFIRMED)
+
+
 class TestPathsAreNotSelfIdentifying(unittest.TestCase):
     """`/v2/conversations` is Twilio's, and also plenty of other people's."""
 
@@ -548,3 +603,62 @@ class TestVendoredLibraryCopies(unittest.TestCase):
         self.assertEqual(
             looks_vendored_library("# Copyright (c) 2024 acme\n",
                                    "app/services/billing.py", get("stripe")), "")
+
+
+class TestASendNeedsAVendorReceiver(unittest.TestCase):
+    """A keyword argument only SENDS something if the vendor receives it.
+
+    phasehq/console builds its own GraphQL type with
+    `StripeSubscriptionDetails(cancel_at=...)`. Matching any call at all read
+    that as a Stripe request body, and Stripe retyping `cancel_at` in
+    subscription-create was reported as breaking it. The proximity heuristic
+    this replaced was inert precisely when it was needed: it only applied once
+    a path literal had been found, so an SDK caller -- who writes no path --
+    was never filtered.
+    """
+
+    OWN_CONSTRUCTOR = ('import stripe\n'
+                       'def show(sid):\n'
+                       '    sub = stripe.Subscription.retrieve(sid)\n'
+                       '    return Details(\n'
+                       '        cancel_at=str(sub.get("cancel_at")),\n'
+                       '    )\n')
+
+    VENDOR_CALL = ('import stripe\n'
+                   'def cancel(sid, when):\n'
+                   '    return stripe.Subscription.modify(\n'
+                   '        sid,\n'
+                   '        cancel_at=when,\n'
+                   '    )\n')
+
+    BODY_DICT = ('import requests\n'
+                 'def cancel(sid, when):\n'
+                 '    body = {"cancel_at": when}\n'
+                 '    return requests.post(\n'
+                 '        "https://api.stripe.com/v1/subscriptions",\n'
+                 '        json=body,\n'
+                 '    )\n')
+
+    def _finding(self):
+        return finding(kind="request_field_type_changed", subject="cancel_at",
+                       path="/v1/subscriptions", method="post",
+                       ops=["POST /v1/subscriptions"],
+                       sigs=["stripe.Subscription.", "stripe.subscriptions."])
+
+    def test_a_keyword_on_the_repos_own_constructor_is_not_a_send(self):
+        self.assertEqual(
+            verdict_of(self.OWN_CONSTRUCTOR, self._finding(), STRIPE),
+            NO_DEPENDENCE)
+
+    def test_a_keyword_on_a_vendor_call_is_a_send(self):
+        verdict, _, _, sites = verify_source(
+            self.VENDOR_CALL, "app.py", self._finding(), STRIPE)
+        self.assertEqual(verdict, CONFIRMED)
+        self.assertEqual(sites[0].line, 5)
+
+    def test_a_body_dict_built_in_a_variable_is_still_a_send(self):
+        """`body = {...}` then `json=body` is the ordinary request shape."""
+        verdict, _, _, sites = verify_source(
+            self.BODY_DICT, "app.py", self._finding(), STRIPE)
+        self.assertEqual(verdict, CONFIRMED)
+        self.assertEqual(sites[0].line, 3)

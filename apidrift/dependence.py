@@ -451,46 +451,81 @@ def find_field_reads(tree: ast.AST, field_name: str, vendor: Vendor,
     return proofs
 
 
-def find_field_sends(tree: ast.AST, field_name: str, vendor: Vendor,
-                     method: str, path: str,
-                     lines: Sequence[str]) -> List[Proof]:
-    """Writes of `field_name` into a body or argument of a vendor request."""
-    proofs: List[Proof] = []
-    operation_lines = {
-        p.line for p in find_operation_calls(tree, method, path, lines)
-    } if path else set()
+def _dict_carrying(node: ast.AST, field_name: str,
+                   assignments: Dict[str, ast.AST],
+                   depth: int = 0) -> Optional[ast.AST]:
+    """The dict literal inside `node` that sets `field_name`, if any.
 
+    Follows a Name back to its assignment, because
+    `body = {"cancel_at": t}` then `stripe.Subscription.modify(sid, **body)`
+    is the ordinary way to build a request body.
+    """
+    if depth > 3 or node is None:
+        return None
+    if isinstance(node, ast.Name):
+        origin = assignments.get(node.id)
+        return _dict_carrying(origin, field_name, assignments, depth + 1) \
+            if origin is not None else None
+    if isinstance(node, ast.Dict):
+        for key, value in zip(node.keys, node.values):
+            if literal_of(key) == field_name:
+                return key
+            nested = _dict_carrying(value, field_name, assignments, depth + 1)
+            if nested is not None:
+                return nested
+    return None
+
+
+def find_field_sends(tree: ast.AST, field_name: str, vendor: Vendor,
+                     assignments: Dict[str, ast.AST],
+                     idioms: Sequence[str],
+                     lines: Sequence[str]) -> List[Proof]:
+    """Writes of `field_name` into the arguments of a VENDOR call.
+
+    A keyword argument only sends something if the thing receiving it is the
+    vendor. Matching any call at all read phasehq's own GraphQL constructor,
+    `StripeSubscriptionDetails(cancel_at=...)`, as a Stripe request body, and
+    Stripe retyping `cancel_at` in subscription-create was reported as
+    breaking it. The proximity heuristic this replaces was inert exactly when
+    it was needed: it only applied when a path literal had already been found,
+    so a caller using the SDK -- who writes no path -- was never filtered at
+    all.
+    """
+    wanted = [idiom.rstrip(".(") for idiom in (idioms or []) if len(idiom) > 6]
+    proofs: List[Proof] = []
     for node in ast.walk(tree):
-        line = getattr(node, "lineno", 0)
-        written = False
-        if isinstance(node, ast.Call):
-            for keyword in node.keywords:
-                if keyword.arg == field_name:
-                    written = True
-                    # A call spanning many lines opens well above its
-                    # arguments. Cite the line the field is actually on.
-                    line = getattr(keyword, "lineno", None) or getattr(
-                        keyword.value, "lineno", line)
-        elif isinstance(node, ast.Dict):
-            for key in node.keys:
-                if literal_of(key) == field_name:
-                    written = True
-                    line = getattr(key, "lineno", line)
-        elif isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Subscript) \
-                        and literal_of(target.slice) == field_name:
-                    written = True
-        if not written:
+        if not isinstance(node, ast.Call):
             continue
-        text = lines[line - 1].strip()[:160] if 0 < line <= len(lines) else ""
-        near = min((abs(line - other) for other in operation_lines), default=None)
-        if operation_lines and (near is None or near > 60):
-            continue      # written somewhere unrelated to the changed operation
-        chain = [f"sets `{field_name}`"]
-        if operation_lines:
-            chain.append(f"within {near} lines of a call to `{method.upper()} {path}`")
-        proofs.append(Proof(kind=FIELD_SENT, line=line, text=text, chain=chain))
+        link = call_reaches_vendor(node, vendor, assignments)
+        if not link:
+            chain = _attr_chain(node.func)
+            if chain and any(chain.startswith(idiom) for idiom in wanted):
+                link = f"`{chain}(...)` is the SDK form of this operation"
+        if not link:
+            continue
+
+        anchors: List[Tuple[int, str]] = []
+        for keyword in node.keywords:
+            if keyword.arg == field_name:
+                line = getattr(keyword, "lineno", None) \
+                    or getattr(keyword.value, "lineno", node.lineno)
+                anchors.append((line, f"passes `{field_name}=` to this call"))
+            else:
+                carrier = _dict_carrying(keyword.value, field_name, assignments)
+                if carrier is not None:
+                    anchors.append((getattr(carrier, "lineno", node.lineno),
+                                    f"sets `{field_name}` in the "
+                                    f"`{keyword.arg or '**'}` of this call"))
+        for arg in node.args:
+            carrier = _dict_carrying(arg, field_name, assignments)
+            if carrier is not None:
+                anchors.append((getattr(carrier, "lineno", node.lineno),
+                                f"sets `{field_name}` in the body of this call"))
+
+        for line, why in anchors:
+            text = lines[line - 1].strip()[:160] if 0 < line <= len(lines) else ""
+            proofs.append(Proof(kind=FIELD_SENT, line=line, text=text,
+                                chain=[why, link]))
     return proofs
 
 
@@ -535,6 +570,36 @@ def _is_distinctive(name: str) -> bool:
     if not name[0].isalpha():
         return False
     return name.replace("_", "").replace("-", "").isalnum()
+
+
+def directions(finding: Finding) -> Tuple[bool, bool]:
+    """(a read proves it, a send proves it) for this change.
+
+    Direction was not checked anywhere. `verify._sites_matching_direction`
+    existed, encoded roughly this rule, and was called by nothing after the
+    dependence rewrite -- so it read as handled while `prove()` accepted a
+    READ as evidence for a REQUEST-side change. That is the first failure mode
+    the first adversarial audit named ("the field was read off a response while
+    the change applied to a request body"), and it was still live: phasehq's
+    `subscription.get("cancel_at")` was reported as broken by Stripe retyping
+    `cancel_at` in the subscription-create REQUEST body.
+
+    A name is not a field. The same word on the way out and on the way back are
+    two different things, and only one of them changed.
+    """
+    kind = finding.kind
+    if kind.startswith("response_"):
+        return True, False
+    if kind.startswith("request_") or kind.startswith("param_"):
+        return False, True          # a parameter is sent, never received
+    if kind.startswith("schema_"):
+        # The spec knows which way a named schema travels; ask it rather than
+        # guessing from the spelling of the kind.
+        if finding.in_request and not finding.in_response:
+            return False, True
+        if finding.in_response and not finding.in_request:
+            return True, False
+    return True, True
 
 
 def _which_is(calls: Sequence["Proof"]) -> List[str]:
@@ -626,7 +691,7 @@ def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], s
         calls = operation_reached()
         if not calls:
             return [], f"no call reaching `{method.upper()} {path}`"
-        supplied = find_field_sends(tree, leaf, vendor, method, "", lines)
+        supplied = find_field_sends(tree, leaf, vendor, assignments, idioms, lines)
         if supplied:
             return [], f"already supplies `{leaf}` — migrated"
         return ([Proof(kind=FIELD_MISSING, line=c.line, text=c.text,
@@ -678,14 +743,17 @@ def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], s
     if not leaf:
         return [], "the change names nothing a caller could reference"
 
+    read_proves, send_proves = directions(finding)
+
     # Route 1: the read is traced to a vendor call.
-    traced = find_field_reads(tree, leaf, vendor, assignments, lines)
+    traced = find_field_reads(tree, leaf, vendor, assignments, lines) \
+        if read_proves else []
     if traced:
         return traced, ""
 
     # Route 2: the field is read somewhere, AND this file calls an operation
     # that carries the schema it was removed from.
-    uses = find_field_uses(tree, leaf, lines)
+    uses = find_field_uses(tree, leaf, lines) if read_proves else []
     if uses:
         calls = operation_reached()
         if calls:
@@ -703,10 +771,10 @@ def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], s
     # a guess about the schema's direction; the spec knows the answer, so ask
     # it instead. OpenAI removed `ResponseProperties.reasoning` and every
     # caller passing `reasoning=` was scored unaffected.
-    if finding.in_request or "request" in finding.kind:
+    if send_proves:
         calls = operation_reached()
         if calls:
-            sends = find_field_sends(tree, leaf, vendor, method, path, lines)
+            sends = find_field_sends(tree, leaf, vendor, assignments, idioms, lines)
             if sends:
                 anchor = calls[0].text[:60]
                 tail = _which_is(calls)
@@ -719,6 +787,14 @@ def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], s
     if uses:
         return [], (f"reads `{leaf}` but never calls an operation that "
                     f"carries it")
+
+    if not read_proves and find_field_uses(tree, leaf, lines):
+        return [], (f"reads `{leaf}` but the change is to what callers SEND; "
+                    f"the same name on the way back is a different field")
+    if not send_proves and find_field_sends(tree, leaf, vendor, assignments, idioms, lines):
+        return [], (f"sends `{leaf}` but the change is to what callers "
+                    f"RECEIVE; the same name on the way out is a different "
+                    f"field")
 
     # No fallback to "calls an operation that carries it". When the change
     # names a schema or field, code that never names it cannot be shown to
