@@ -191,3 +191,30 @@ class TestUnmeasuredIsNotClean(unittest.TestCase):
         text = to_text(result)
         self.assertIn("1 breaking change(s) land", text)
         self.assertIn("2 Go", text)
+
+
+class TestShortHistoryIsNotSafety(unittest.TestCase):
+    """A spec that did not exist at the start of the window hides everything.
+
+    OpenAI's repo held only a LICENSE 180 days ago; the spec landed 2026-05-13.
+    Asked for 180 days it reported ZERO breaking changes — while the same
+    vendor over 90 days reports sixteen. Nothing was wrong with the diff: there
+    was simply nothing behind the file to compare, and silence read as safety.
+    Third time this shape has appeared, after the unparsed languages and the
+    repo that called no vendor at all.
+    """
+
+    def test_a_quiet_result_over_unseen_history_is_not_called_clean(self):
+        result = ScanResult(root="/r", findings_considered=0,
+                            vendors_detected={"openai": 4},
+                            short_history={"openai": ["openapi.yaml"]})
+        text = to_text(result)
+        self.assertNotIn("apidrift: clean", text)
+        self.assertIn("SHORTER HISTORY THAN REQUESTED", text)
+        self.assertIn("unseen, not safe", text)
+
+    def test_full_history_with_no_impact_is_still_clean(self):
+        """The control. Over-warning makes the warning worthless."""
+        result = ScanResult(root="/r", findings_considered=64,
+                            vendors_detected={"openai": 4})
+        self.assertIn("apidrift: clean", to_text(result))

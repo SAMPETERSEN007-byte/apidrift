@@ -18,6 +18,20 @@ PY_BIN = str(ROOT / ".venv" / "bin" / "python")
 
 MUTATIONS = [
     (
+        "a spec with no history behind it goes back to reading as clean",
+        "apidrift/scan.py",
+        "        if result.unmeasured or result.short_history:",
+        "        if result.unmeasured:",
+        ["test_a_quiet_result_over_unseen_history_is_not_called_clean"],
+    ),
+    (
+        "specs with no predecessor stop being recorded at all",
+        "apidrift/cli.py",
+        "            result.specs_without_history.append(pair.path)",
+        "            pass",
+        ["test_a_spec_with_no_predecessor_is_recorded_as_unseen_history"],
+    ),
+    (
         "a brand-new spec file skipped as purely additive again",
         "apidrift/cli.py",
         "            result.additions.append(spec_added_finding(pair.path, added))",
@@ -48,8 +62,8 @@ MUTATIONS = [
     (
         "an unmeasured language reported as clean again",
         "apidrift/scan.py",
-        "        if result.unmeasured:\n            head = (f\"apidrift: no impact found in Python \"",
-        "        if False:\n            head = (f\"apidrift: no impact found in Python \"",
+        "        if result.unmeasured or result.short_history:",
+        "        if result.short_history:",
         ["test_the_word_clean_is_never_printed_over_an_unmeasured_language"],
     ),
     (

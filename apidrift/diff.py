@@ -157,6 +157,12 @@ class DiffResult:
     specs_matched: int = 0
     specs_changed: int = 0
     raw_finding_count: int = 0
+    # Spec files that did not exist at the start of the window. Nothing before
+    # them could be compared, so a "0 breaking changes" over the requested
+    # range is a claim about a period the tool could not see. OpenAI's repo
+    # held only a LICENSE 180 days ago and the spec landed 2026-05-13; the
+    # honest answer is "visible from 2026-05-13", not "clean since February".
+    specs_without_history: List[str] = field(default_factory=list)
     findings: List[Finding] = field(default_factory=list)
     # Additions kept apart from findings on purpose. "What can I now use?"
     # is not a weaker version of "what did you take away?" -- it has a
@@ -174,6 +180,11 @@ class DiffResult:
     @property
     def potentially_breaking(self) -> List[Finding]:
         return self.by_severity(POTENTIALLY_BREAKING)
+
+    @property
+    def history_is_short(self) -> bool:
+        """True when some spec has no version before the window opened."""
+        return bool(self.specs_without_history)
 
 
 

@@ -51,6 +51,12 @@ def analyse(vendor: Vendor, cache_dir: Path, since: str, fetch: bool) -> DiffRes
                 continue
             result.new_op_count += added.op_count
             result.additions.append(spec_added_finding(pair.path, added))
+            # A file with no predecessor is either a genuinely new API version
+            # (Adyen's `CheckoutService-v52`) or a spec that simply did not
+            # exist yet. Both mean the same thing to a caller: there is nothing
+            # behind it to diff, so no breakage can be reported for it and
+            # silence must not read as safety.
+            result.specs_without_history.append(pair.path)
             continue
         if pair.new is None:
             result.findings.append(_spec_removed_finding(pair))

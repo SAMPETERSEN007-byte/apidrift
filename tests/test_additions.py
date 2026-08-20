@@ -272,3 +272,11 @@ class TestNewSpecFileReachesThePipeline(unittest.TestCase):
         kinds = [a.kind for a in result.additions]
         self.assertIn("spec_added", kinds,
                       "a spec file with no predecessor must not be skipped")
+        self._result = result
+
+    def test_a_spec_with_no_predecessor_is_recorded_as_unseen_history(self):
+        """Emitting the opportunity is not enough — the SILENCE has to be
+        explained too, or "0 breaking changes" reads as a clean bill over a
+        period nothing could be compared in."""
+        self.test_a_new_api_version_reaches_the_pipeline()
+        self.assertIn("openapi/spec4.json", self._result.specs_without_history)

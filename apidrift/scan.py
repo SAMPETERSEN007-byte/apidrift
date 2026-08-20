@@ -147,6 +147,9 @@ class ScanResult:
     # {vendor_key: {language: file_count}} — files that call a vendor in a
     # language this tool cannot parse. Reported, never counted as clean.
     unmeasured: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    # {vendor_key: [spec paths]} with no version before the window opened.
+    # Nothing behind them could be compared.
+    short_history: Dict[str, List[str]] = field(default_factory=dict)
 
     @property
     def unmeasured_files(self) -> int:
@@ -174,6 +177,7 @@ class ScanResult:
             "opportunity_count": len(self.opportunities),
             "opportunities_dropped": self.opportunities_dropped,
             "unmeasured": self.unmeasured,
+            "short_history": self.short_history,
             "unmeasured_files": self.unmeasured_files,
             "impacts": [i.as_dict() for i in self.impacts],
             "opportunities": [o.as_dict() for o in self.opportunities],
@@ -376,6 +380,8 @@ def scan_repo(
             continue
 
         window = f"{diff.old_date} → {diff.new_date}"
+        if diff.specs_without_history:
+            result.short_history[key] = list(diff.specs_without_history)
         relevant = [f for f in diff.findings if f.severity == BREAKING]
         result.findings_considered += len(relevant)
         before = len(result.impacts)
@@ -591,6 +597,19 @@ def _opportunity_markdown(result: ScanResult) -> List[str]:
     return out
 
 
+def _short_history_lines(result: ScanResult) -> List[str]:
+    """Say when the tool could not see as far back as it was asked to."""
+    if not result.short_history:
+        return []
+    out = ["", "SHORTER HISTORY THAN REQUESTED — these specs did not exist at "
+               "the start of the window, so nothing before them was compared:"]
+    for key, paths in sorted(result.short_history.items()):
+        shown = ", ".join(paths[:3]) + ("…" if len(paths) > 3 else "")
+        out.append(f"  {get(key).name}: {shown}")
+    out.append("  A quiet result here means unseen, not safe.")
+    return out
+
+
 def _unmeasured_lines(result: ScanResult) -> List[str]:
     """Say what was not looked at. An all-clear that hides a blind spot is
     worse than no answer, because it is acted on."""
@@ -631,7 +650,7 @@ def to_text(result: ScanResult) -> str:
     """Terminal/CI output: one line per impact, in the file:line:message form
     every editor and log scraper already knows how to jump to."""
     if not result.impacts:
-        if result.unmeasured:
+        if result.unmeasured or result.short_history:
             head = (f"apidrift: no impact found in Python "
                     f"({result.findings_considered} breaking changes checked) "
                     f"— but this repo is NOT clean-checked, see below")
@@ -641,7 +660,8 @@ def to_text(result: ScanResult) -> str:
         else:
             head = (f"apidrift: clean — {result.findings_considered} breaking "
                     f"changes checked, none reach this repo")
-        return "\n".join([head] + _unmeasured_lines(result)
+        return "\n".join([head] + _short_history_lines(result)
+                          + _unmeasured_lines(result)
                           + _opportunity_lines(result)) + "\n"
     out = []
     for impact in result.impacts:
@@ -653,6 +673,7 @@ def to_text(result: ScanResult) -> str:
     out.append("")
     out.append(f"apidrift: {len(result.breaking)} breaking change(s) land on "
                f"this repository")
+    out.extend(_short_history_lines(result))
     out.extend(_unmeasured_lines(result))
     out.extend(_opportunity_lines(result))
     return "\n".join(out) + "\n"
