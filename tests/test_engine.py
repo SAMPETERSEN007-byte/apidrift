@@ -261,6 +261,28 @@ class TestRootCauseCollapse(unittest.TestCase):
         self.assertEqual(collapsed[0].severity, BREAKING,
                          "losing a response field breaks every consumer reading it")
 
+    def test_operation_count_is_distinct_operations_not_occurrences(self):
+        """853 "operations" in a 589-operation spec was an occurrence count."""
+        old = copy.deepcopy(BASE)
+        new = copy.deepcopy(BASE)
+        # Two union routes to Card inside the SAME operation, plus one in another.
+        for doc in (old, new):
+            doc["paths"]["/charges"]["get"]["responses"]["200"]["content"][
+                "application/json"]["schema"]["properties"]["fallback"] = {
+                    "anyOf": [{"$ref": "#/components/schemas/Card"},
+                              {"$ref": "#/components/schemas/Bank"}]}
+        del new["components"]["schemas"]["Card"]["properties"]["iin"]
+        raw = diff_specs("test", spec(old), spec(new), {})
+        collapsed = [f for f in collapse(raw.findings)
+                     if f.root_cause == "Card.iin"][0]
+        distinct = len({f.op_key for f in raw.findings
+                        if f.kind == "response_field_removed"})
+        self.assertGreater(collapsed.occurrences, collapsed.affected_op_count,
+                           "fixture must have more routes than operations")
+        self.assertEqual(collapsed.affected_op_count, distinct)
+        self.assertIn(f"{distinct} operations", collapsed.detail)
+        self.assertNotIn(f"{collapsed.occurrences} operations", collapsed.detail)
+
     def test_root_cause_key_is_route_independent(self):
         self.assertEqual(root_cause_key("error.source<Card>.iin"), "Card.iin")
         self.assertEqual(root_cause_key("a<X>.b<Card>.iin"), "Card.iin")

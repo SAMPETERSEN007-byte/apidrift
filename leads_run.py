@@ -83,8 +83,14 @@ def main() -> int:
                     leads.append(record)
         report[vendor.key] = vendor_leads
 
-    (ROOT / "out" / f"leads_{LANGUAGE}.json").write_text(json.dumps(report, indent=2),
-                                            encoding="utf-8")
+    # Merge rather than overwrite: a run scoped to a vendor filter must not
+    # delete the vendors it was not asked to look at.
+    out_path = ROOT / "out" / f"leads_{LANGUAGE}.json"
+    merged = {}
+    if out_path.exists():
+        merged = json.load(open(out_path))
+    merged.update(report)
+    out_path.write_text(json.dumps(merged, indent=2), encoding="utf-8")
 
     total = sum(verdict_counts.values())
     print("\n" + "=" * 78)

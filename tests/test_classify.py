@@ -8,7 +8,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from apidrift.classify import (CORPUS, ECOSYSTEM, INTEGRATOR, VENDOR_OWNED,
-                               classify, dedupe_by_repo, partition)
+                               VENDORED, classify, dedupe_by_repo,
+                               is_vendored_path, partition)
 
 
 class TestClassify(unittest.TestCase):
@@ -54,12 +55,53 @@ class TestClassify(unittest.TestCase):
         self.assertFalse(classify("x/top-pypi-sdists-2000", "stripe").is_outreach_target)
 
 
+class TestVendoredPaths(unittest.TestCase):
+    """A match inside site-packages is the vendor's own SDK, not a call site."""
+
+    VENDORED = (
+        "venv/Lib/site-packages/stripe/_payment_record.py",
+        "Backend/env/lib/python3.11/site-packages/stripe/x.py",
+        ".venv/lib/site-packages/stripe/y.py",
+        "lambda-layer/python/stripe/z.py",
+        "functions/_layers/stripe/python/stripe/a.py",
+        "layers/common/python/stripe/b.py",
+        "node_modules/openai/index.js",
+        "vendor/plaid/client.rb",
+    )
+    AUTHORED = (
+        "app/services/billing.py",
+        "src/twilio_verify.py",
+        "backend/plaid_field_index.py",
+    )
+
+    def test_vendored_paths_are_detected(self):
+        for path in self.VENDORED:
+            with self.subTest(path=path):
+                self.assertTrue(is_vendored_path(path))
+
+    def test_authored_paths_are_not_flagged(self):
+        for path in self.AUTHORED:
+            with self.subTest(path=path):
+                self.assertFalse(is_vendored_path(path))
+
+    def test_vendored_sdk_path_is_not_author_code(self):
+        result = classify("someone/app", "stripe",
+                          "venv/Lib/site-packages/stripe/_payment_record.py")
+        self.assertEqual(result.kind, VENDORED)
+        self.assertFalse(result.is_outreach_target)
+
+    def test_same_repo_with_authored_path_is_an_integrator(self):
+        result = classify("someone/app", "stripe", "app/services/billing.py")
+        self.assertEqual(result.kind, INTEGRATOR)
+        self.assertTrue(result.is_outreach_target)
+
+
 class TestPartitionAndDedupe(unittest.TestCase):
     LEADS = [
-        {"repo": "stripe/stripe-python", "sites": [{}]},
-        {"repo": "caesar4321/Confio", "sites": [{}]},
-        {"repo": "caesar4321/Confio", "sites": [{}, {}, {}]},
-        {"repo": "BerriAI/litellm", "sites": [{}]},
+        {"repo": "stripe/stripe-python", "file": "stripe/x.py", "sites": [{}]},
+        {"repo": "caesar4321/Confio", "file": "app/pay.py", "sites": [{}]},
+        {"repo": "caesar4321/Confio", "file": "app/pay.py", "sites": [{}, {}, {}]},
+        {"repo": "BerriAI/litellm", "file": "litellm/main.py", "sites": [{}]},
     ]
 
     def test_partition_buckets_every_lead(self):

@@ -12,7 +12,9 @@ from typing import Dict, List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from apidrift.classify import (ECOSYSTEM, INTEGRATOR, dedupe_by_repo,
+import datetime as _dt
+
+from apidrift.classify import (ECOSYSTEM, INTEGRATOR, VENDORED, dedupe_by_repo,
                                partition)
 from apidrift.vendors import get
 
@@ -57,13 +59,16 @@ def build(vendor_key: str, entry: dict, leads: List[dict], window: dict) -> str:
     integrators = rank(buckets[INTEGRATOR])
     ecosystem = rank(buckets[ECOSYSTEM])
     excluded = len(buckets["vendor_owned"]) + len(buckets["corpus"])
+    vendored = len(dedupe_by_repo(buckets[VENDORED]))
+    span = (_dt.date.fromisoformat(window["new_date"])
+            - _dt.date.fromisoformat(window["old_date"])).days
     swept = sorted({l.get("language", "python") for l in leads}) or ["python"]
     languages_swept = " and ".join(swept) if len(swept) < 3 else \
         ", ".join(swept[:-1]) + " and " + swept[-1]
 
     out: List[str] = []
     out.append(f"# {vendor.name} — breaking API changes, "
-               f"{window['old_date']} to {window['new_date']}\n")
+               f"{window['old_date']} to {window['new_date']} ({span} days)\n")
     out.append(
         f"Generated from `{vendor.repo}` at `{window['old_ref']}` → "
         f"`{window['new_ref']}` by diffing the published OpenAPI spec and "
@@ -85,8 +90,8 @@ def build(vendor_key: str, entry: dict, leads: List[dict], window: dict) -> str:
     top = sorted(breaking, key=lambda f: -f["occurrences"])[:6]
     out.append("### Highest fan-out changes\n")
     for f in top:
-        fan = (f" — reaches **{f['occurrences']} operations**"
-               if f["occurrences"] > 1 else "")
+        ops = f.get("affected_op_count") or 0
+        fan = (f" — reaches **{ops} operations**" if ops > 1 else "")
         out.append(f"- `{f['root_cause'] or f['subject']}`{fan}  \n  "
                    f"{f['detail'][:180]}")
     out.append("")
@@ -111,9 +116,16 @@ def build(vendor_key: str, entry: dict, leads: List[dict], window: dict) -> str:
             "built on them inherits the break.\n")
         out.append(lead_rows(ecosystem))
         out.append("")
+    notes = []
     if excluded:
-        out.append(f"_{excluded} further matches were discarded as your own "
-                   f"repositories or as dataset mirrors._\n")
+        notes.append(f"{excluded} as your own repositories or as dataset mirrors")
+    if vendored:
+        notes.append(
+            f"{vendored} where the match sat inside a vendored copy of an SDK "
+            f"(`site-packages/`, `node_modules/`, a Lambda layer), which is "
+            f"your own package in someone else's tree rather than their call site")
+    if notes:
+        out.append("_Discarded: " + "; ".join(notes) + "._\n")
 
     out.append("## Method and limits\n")
     out.append(

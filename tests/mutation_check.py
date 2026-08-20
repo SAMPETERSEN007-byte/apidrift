@@ -158,6 +158,20 @@ MUTATIONS = [
         ["test_dedupe_keeps_the_richest_row_per_repo"],
     ),
     (
+        "occurrence count reported as an operation count",
+        "apidrift/diff.py",
+        "        distinct_ops = {m.op_key for m in members}\n        rep.affected_op_count = len(distinct_ops)",
+        "        distinct_ops = set(range(len(members)))\n        rep.affected_op_count = len(distinct_ops)",
+        ["test_operation_count_is_distinct_operations_not_occurrences"],
+    ),
+    (
+        "classifier: vendored dependency paths counted as author code",
+        "apidrift/classify.py",
+        "    if file_path and is_vendored_path(file_path):",
+        "    if False:",
+        ["test_vendored_sdk_path_is_not_author_code"],
+    ),
+    (
         "signature builder drops the field name",
         "apidrift/signatures.py",
         "        if leaf and not leaf.startswith(\"<\"):",

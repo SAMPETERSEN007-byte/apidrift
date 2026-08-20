@@ -264,6 +264,13 @@ def flatten_schema(
     # A response/body that is a bare `$ref` still belongs to a named schema.
     # Seeding the prefix with that name lets one edit to a shared schema group
     # with the same edit reached through a union arm.
+    #
+    # Only at the ROOT. Stamping nested `$ref` names too was tried and reverted:
+    # it makes a schema *rename* at a stable field position (OpenAI moved
+    # `Response.service_tier` from `ServiceTier` to `ServiceTierResponses`) look
+    # like the field was deleted, because both names are real and so neither is
+    # blinded. That inflated Stripe from 290 breaking changes to 494. Better
+    # grouping is not worth inventing removals.
     if not prefix and isinstance(schema, dict) and isinstance(schema.get("$ref"), str):
         ref = schema["$ref"]
         if ref.startswith("#/components/schemas/") or ref.startswith("#/definitions/"):

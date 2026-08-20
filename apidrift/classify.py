@@ -20,9 +20,26 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 VENDOR_OWNED = "vendor_owned"
+VENDORED = "vendored"
 ECOSYSTEM = "ecosystem"
 INTEGRATOR = "integrator"
 CORPUS = "corpus"
+
+# Directory segments that mean "this file is a checked-in copy of somebody
+# else's package". A match inside one of these is the vendor's own SDK sitting
+# in a stranger's tree, not that stranger's call site.
+VENDORED_PATH_SEGMENTS = (
+    "site-packages/", "dist-packages/", "node_modules/", ".venv/", "venv/",
+    "env/lib/", "virtualenv/", "vendor/", "third_party/", "3rdparty/",
+    "lambda-layer/", "lambda_layer/", "/_layers/", "layers/common/python/",
+    "bundle/", ".tox/", "eggs/", "site_packages/",
+)
+
+
+def is_vendored_path(file_path: str) -> bool:
+    """True when the matched file is a vendored dependency, not authored code."""
+    normalised = "/" + file_path.replace("\\", "/").lstrip("/").lower()
+    return any(seg in normalised for seg in VENDORED_PATH_SEGMENTS)
 
 # GitHub orgs each vendor controls. A hit here is the vendor's own code.
 VENDOR_ORGS: Dict[str, Tuple[str, ...]] = {
@@ -77,10 +94,20 @@ def _matches(patterns: Tuple[str, ...], text: str) -> Optional[str]:
     return None
 
 
-def classify(repo: str, vendor_key: str) -> Classification:
-    """`repo` is an `owner/name` slug."""
+def classify(repo: str, vendor_key: str, file_path: str = "") -> Classification:
+    """`repo` is an `owner/name` slug; `file_path` is the matched file."""
     owner, _, name = repo.partition("/")
     owner_l, name_l = owner.lower(), name.lower()
+
+    # Check the path before the name: a vendored SDK inside an ordinary
+    # application repo would otherwise be scored as that application's code.
+    if file_path and is_vendored_path(file_path):
+        segment = next(s for s in VENDORED_PATH_SEGMENTS
+                       if s in "/" + file_path.replace("\\", "/").lstrip("/").lower())
+        return Classification(
+            VENDORED,
+            f"matched inside `{segment.strip('/')}` — a vendored dependency, "
+            f"not code the repo author wrote")
 
     if owner_l in VENDOR_ORGS.get(vendor_key, ()):
         return Classification(VENDOR_OWNED, f"`{owner}` is a {vendor_key} org")
@@ -102,10 +129,10 @@ def classify(repo: str, vendor_key: str) -> Classification:
 def partition(leads: List[dict], vendor_key: str) -> Dict[str, List[dict]]:
     """Split leads into buckets, annotating each with why it landed there."""
     buckets: Dict[str, List[dict]] = {
-        INTEGRATOR: [], ECOSYSTEM: [], VENDOR_OWNED: [], CORPUS: [],
+        INTEGRATOR: [], ECOSYSTEM: [], VENDOR_OWNED: [], CORPUS: [], VENDORED: [],
     }
     for lead in leads:
-        result = classify(lead["repo"], vendor_key)
+        result = classify(lead["repo"], vendor_key, lead.get("file", ""))
         enriched = dict(lead)
         enriched["lead_kind"] = result.kind
         enriched["lead_reason"] = result.reason

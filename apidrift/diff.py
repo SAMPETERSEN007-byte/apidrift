@@ -31,6 +31,7 @@ class Finding:
     github_search: str = ""
     spec_file: str = ""
     occurrences: int = 1
+    affected_op_count: int = 0
     affected_ops: List[str] = field(default_factory=list)
     root_cause: str = ""
 
@@ -48,6 +49,7 @@ class Finding:
             "new": self.new,
             "detail": self.detail,
             "occurrences": self.occurrences,
+            "affected_op_count": self.affected_op_count,
             "root_cause": self.root_cause,
             "affected_ops": self.affected_ops[:25],
             "signatures": self.signatures,
@@ -470,8 +472,17 @@ def collapse(findings: List[Finding], max_ops: int = 200) -> List[Finding]:
         rep = min(members, key=lambda f: (len(f.subject), f.op_key))
         rep.occurrences = len(members)
         rep.root_cause = key[1]
-        rep.affected_ops = sorted({m.op_key for m in members})[:max_ops]
-        if len(members) > 1:
-            rep.detail = f"{rep.detail} — affects {len(members)} operations"
+        # `occurrences` counts distinct paths through the spec that reach this
+        # change; several of them can land on the same operation. Reporting the
+        # occurrence count as an operation count produced "853 operations" for
+        # a spec containing 589, which is wrong on its face.
+        distinct_ops = {m.op_key for m in members}
+        rep.affected_op_count = len(distinct_ops)
+        rep.affected_ops = sorted(distinct_ops)[:max_ops]
+        if len(distinct_ops) > 1:
+            rep.detail = f"{rep.detail} — affects {len(distinct_ops)} operations"
+        elif len(members) > 1:
+            rep.detail = (f"{rep.detail} — reached {len(members)} ways through "
+                          f"1 operation")
         collapsed.append(rep)
     return collapsed
