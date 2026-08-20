@@ -725,3 +725,66 @@ class TestSignatures(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestFieldRelocation(unittest.TestCase):
+    """A schema is an implementation detail; a caller only sees the operation.
+
+    OpenAI removed `ResponseProperties.reasoning` while `POST /responses` kept
+    accepting `reasoning` throughout -- the field moved to another arm of the
+    same `allOf`. Diffing schemas in isolation reported every caller passing
+    `reasoning=` as broken. Five of eighty-four breaking findings were this.
+    """
+
+    def _spec(self, home: str) -> dict:
+        """`/thing` responds with allOf[Head, Tail]; `mode` lives in `home`."""
+        doc = {
+            "openapi": "3.0.3",
+            "info": {"title": "T", "version": "1"},
+            "servers": [{"url": "https://api.test.com"}],
+            "components": {"schemas": {
+                "Head": {"type": "object",
+                         "properties": {"id": {"type": "string"}}},
+                "Tail": {"type": "object",
+                         "properties": {"note": {"type": "string"}}},
+            }},
+            "paths": {"/thing": {"get": {
+                "operationId": "getThing",
+                "responses": {"200": {"content": {"application/json": {"schema": {
+                    "allOf": [{"$ref": "#/components/schemas/Head"},
+                              {"$ref": "#/components/schemas/Tail"}],
+                }}}}},
+            }}},
+        }
+        if home:
+            doc["components"]["schemas"][home]["properties"]["mode"] = {
+                "type": "string"}
+        return doc
+
+    def _kinds_for_mode(self, old: dict, new: dict) -> list:
+        return [f.kind for f in run(old, new).findings if "mode" in f.subject]
+
+    def test_a_field_moving_between_arms_is_not_a_removal(self):
+        found = self._kinds_for_mode(self._spec("Head"), self._spec("Tail"))
+        self.assertEqual(found, [],
+                         "the operation still exposes `mode`; nobody broke")
+
+    def test_a_field_leaving_the_operation_entirely_is_still_a_removal(self):
+        """The control. Without it the suppression could hide everything."""
+        found = self._kinds_for_mode(self._spec("Head"), self._spec(""))
+        self.assertIn("schema_field_removed", found)
+
+    def test_a_schema_no_operation_reaches_is_not_silently_suppressed(self):
+        """Invisible is not the same as unchanged.
+
+        Suppression is only valid as a POSITIVE observation that the field is
+        still there. A schema no operation reaches supports no observation at
+        all, so the change has to be reported, not assumed harmless.
+        """
+        old = self._spec("Head")
+        old["components"]["schemas"]["Orphan"] = {
+            "type": "object", "properties": {"mode": {"type": "string"}}}
+        new = copy.deepcopy(old)
+        del new["components"]["schemas"]["Orphan"]["properties"]["mode"]
+        subjects = [f.subject for f in run(old, new).findings]
+        self.assertIn("Orphan.mode", subjects)

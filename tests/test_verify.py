@@ -417,6 +417,52 @@ class TestWholeSchemaVersusField(unittest.TestCase):
         self.assertEqual(verdict_of(source, f, get("plaid")), NO_DEPENDENCE)
 
 
+class TestASentFieldIsAlsoDependence(unittest.TestCase):
+    """`reasoning={"effort": "low"}` is a keyword argument, not a read.
+
+    The send route used to be reachable only when the finding's KIND contained
+    the word "request", which is a guess about the schema's direction. OpenAI's
+    request body is assembled from `ResponseProperties`, so every caller
+    passing a removed request field was scored unaffected. The spec knows which
+    direction a schema travels; the kind's spelling does not.
+    """
+
+    SENDER = ('import openai\n'
+              'client = openai.OpenAI()\n'
+              'response = client.responses.create(\n'
+              '    model="gpt-5",\n'
+              '    reasoning={"effort": "low"},\n'
+              ')\n')
+
+    def _finding(self):
+        f = finding(kind="schema_field_removed",
+                    subject="ResponseProperties.reasoning",
+                    path="/responses", method="post",
+                    ops=["POST /responses"],
+                    sigs=["client.responses.", ".responses.create"])
+        f.in_request = True
+        return f
+
+    def test_a_sent_field_on_a_request_schema_is_proven(self):
+        verdict, _, _, sites = verify_source(
+            self.SENDER, "app.py", self._finding(), get("openai"))
+        self.assertEqual(verdict, CONFIRMED)
+
+    def test_a_send_is_cited_at_the_line_the_field_is_on(self):
+        """A call opening on line 3 must not be cited for a field on line 5."""
+        _, _, _, sites = verify_source(
+            self.SENDER, "app.py", self._finding(), get("openai"))
+        self.assertEqual(sites[0].line, 5)
+        self.assertIn("reasoning", sites[0].text)
+
+    def test_a_file_that_never_sends_it_is_not_affected(self):
+        source = ('import openai\n'
+                  'client = openai.OpenAI()\n'
+                  'r = client.responses.create(model="gpt-5")\n')
+        self.assertEqual(
+            verdict_of(source, self._finding(), get("openai")), NO_DEPENDENCE)
+
+
 class TestPathsAreNotSelfIdentifying(unittest.TestCase):
     """`/v2/conversations` is Twilio's, and also plenty of other people's."""
 

@@ -325,7 +325,8 @@ def find_sdk_calls(tree: ast.AST, idioms: Sequence[str],
         text = lines[line - 1].strip()[:160] if 0 < line <= len(lines) else ""
         proofs.append(Proof(
             kind=OPERATION_CALL, line=line, text=text,
-            chain=[f"`{chain}(...)` is the SDK form of this operation"],
+            chain=[f"`{chain}(...)` is the SDK form of this operation",
+                   f"which is `{chain}(...)`"],
         ))
     return proofs
 
@@ -466,10 +467,15 @@ def find_field_sends(tree: ast.AST, field_name: str, vendor: Vendor,
             for keyword in node.keywords:
                 if keyword.arg == field_name:
                     written = True
+                    # A call spanning many lines opens well above its
+                    # arguments. Cite the line the field is actually on.
+                    line = getattr(keyword, "lineno", None) or getattr(
+                        keyword.value, "lineno", line)
         elif isinstance(node, ast.Dict):
             for key in node.keys:
                 if literal_of(key) == field_name:
                     written = True
+                    line = getattr(key, "lineno", line)
         elif isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Subscript) \
@@ -529,6 +535,17 @@ def _is_distinctive(name: str) -> bool:
     if not name[0].isalpha():
         return False
     return name.replace("_", "").replace("-", "").isalnum()
+
+
+def _which_is(calls: Sequence["Proof"]) -> List[str]:
+    """The `which is ...` link from the call a derived proof is anchored to.
+
+    Without it a read or a send is reported against the finding's
+    representative operation rather than the one this file actually calls.
+    """
+    if not calls:
+        return []
+    return [link for link in calls[0].chain if link.startswith("which is `")]
 
 
 def _leaf_of(finding: Finding) -> str:
@@ -648,12 +665,13 @@ def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], s
                             f"deleted schema `{finding.subject}` ({shown}"
                             f"{', …' if len(leaves) > 4 else ''})")
             anchor = calls[0].text[:60]
+            tail = _which_is(calls)
             return ([Proof(kind=FIELD_READ, line=t.line, text=t.text,
                            chain=t.chain + [
                                f"a field of the deleted schema "
                                f"`{finding.subject}`",
                                f"and this file calls `{anchor}`, an operation "
-                               f"that carried it"])
+                               f"that carried it"] + tail)
                      for t in touched[:5]], "")
         return calls, ""
 
@@ -674,12 +692,31 @@ def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], s
             return ([Proof(kind=FIELD_READ, line=u.line, text=u.text,
                            chain=u.chain + [
                                f"and this file calls `{calls[0].text[:60]}`, an "
-                               f"operation carrying the changed schema"])
+                               f"operation carrying the changed schema"]
+                           + _which_is(calls))
                      for u in uses], "")
-        if "request" in finding.kind:
+
+    # Route 3: the field is SENT. `reasoning={"effort": "low"}` handed to
+    # `client.responses.create` is a keyword argument, which is neither an
+    # attribute nor a subscript, so route 2 cannot see it. This route used to
+    # be reachable only when the finding's KIND contained "request", which is
+    # a guess about the schema's direction; the spec knows the answer, so ask
+    # it instead. OpenAI removed `ResponseProperties.reasoning` and every
+    # caller passing `reasoning=` was scored unaffected.
+    if finding.in_request or "request" in finding.kind:
+        calls = operation_reached()
+        if calls:
             sends = find_field_sends(tree, leaf, vendor, method, path, lines)
             if sends:
-                return sends, ""
+                anchor = calls[0].text[:60]
+                tail = _which_is(calls)
+                return ([Proof(kind=FIELD_SENT, line=s.line, text=s.text,
+                               chain=s.chain + [
+                                   f"and this file calls `{anchor}`, an "
+                                   f"operation that accepted it"] + tail)
+                         for s in sends[:5]], "")
+
+    if uses:
         return [], (f"reads `{leaf}` but never calls an operation that "
                     f"carries it")
 

@@ -107,6 +107,12 @@ class Finding:
     # who reaches the operation but never reads one of these is unaffected,
     # which was seven of ten refutations in the third adversarial audit.
     leaf_fields: List[str] = field(default_factory=list)
+    # Which direction the schema travels. A field a caller SENDS is
+    # proven by a keyword argument, not by a read, and the two routes
+    # cannot be told apart from the finding's kind alone: OpenAI's
+    # request body is named `ResponseProperties`.
+    in_request: bool = False
+    in_response: bool = False
     root_cause: str = ""
 
     def as_dict(self) -> Dict[str, object]:
@@ -776,8 +782,58 @@ def _same_shape(was: Field, now: Field, old: Spec, new: Spec) -> bool:
     return before is not None and before == after
 
 
+_TYPE_ANNOTATION = re.compile(r"<[^>]*>")
+
+
+def _operation_field_names(spec: Spec) -> Dict[str, Set[str]]:
+    """Every field NAME a consumer can see on each operation, either direction.
+
+    A schema is an implementation detail of an operation; a caller only ever
+    sees the operation. Diffing schemas in isolation therefore cannot tell a
+    field being DELETED from a field being MOVED between two schemas that
+    compose into the same operation -- and the second breaks nobody.
+
+    OpenAI removed `ResponseProperties.reasoning` in this window while
+    `POST /responses` went on accepting `reasoning` throughout, because the
+    field moved to another arm of the same `allOf`. Every caller passing
+    `reasoning=` was reported as broken. Names, not paths, because that is
+    what a caller writes and what `dependence.prove()` matches on.
+    """
+    out: Dict[str, Set[str]] = {}
+    for key, op in spec.operations.items():
+        names: Set[str] = set()
+        for fields in [op.request_fields] + list(op.responses.values()):
+            for path in fields:
+                names.add(_TYPE_ANNOTATION.sub("", path).rsplit(".", 1)[-1])
+        out[key] = names
+    return out
+
+
+def _field_survived_where_it_was_visible(
+    field_name: str, ops: Sequence[str],
+    old_names: Dict[str, Set[str]], new_names: Dict[str, Set[str]],
+) -> bool:
+    """True when removing this field changed nothing any caller can observe.
+
+    Requires that the field was actually visible somewhere -- a schema no
+    operation reaches tells us nothing -- and that it is still visible on
+    every operation where it used to be.
+    """
+    seen_anywhere = False
+    for op_key in ops:
+        was, now = old_names.get(op_key), new_names.get(op_key)
+        if was is None or now is None or field_name not in was:
+            continue
+        seen_anywhere = True
+        if field_name not in now:
+            return False
+    return seen_anywhere
+
+
 def _diff_schema_views(old: Spec, new: Spec) -> List[Finding]:
     out: List[Finding] = []
+    old_op_names = _operation_field_names(old)
+    new_op_names = _operation_field_names(new)
 
     for name in sorted(set(old.schemas) - set(new.schemas)):
         view = old.schemas[name]
@@ -820,6 +876,8 @@ def _diff_schema_views(old: Spec, new: Spec) -> List[Finding]:
             finding = _mk(carrier, kind, severity, detail, subject=subject,
                           old=old_value, new=new_value)
             finding.root_cause = subject
+            finding.in_request = bool(in_request)
+            finding.in_response = bool(in_response)
             finding.affected_ops = ops[:200]
             finding.affected_op_count = len(ops)
             finding.direct_op_count = len(near)
@@ -830,6 +888,9 @@ def _diff_schema_views(old: Spec, new: Spec) -> List[Finding]:
             now = after.fields.get(field_name)
             subject = f"{name}.{field_name}"
             if now is None:
+                if _field_survived_where_it_was_visible(
+                        field_name, ops, old_op_names, new_op_names):
+                    continue      # moved between schemas, not taken away
                 # Losing a field a caller READS breaks them. Losing one they
                 # merely send is usually ignored by the server.
                 emit("schema_field_removed",

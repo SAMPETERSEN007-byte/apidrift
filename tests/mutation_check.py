@@ -18,6 +18,34 @@ PY_BIN = str(ROOT / ".venv" / "bin" / "python")
 
 MUTATIONS = [
     (
+        "a field moving between schemas reported as a removal again",
+        "apidrift/diff.py",
+        "                if _field_survived_where_it_was_visible(",
+        "                if False and _field_survived_where_it_was_visible(",
+        ["test_a_field_moving_between_arms_is_not_a_removal"],
+    ),
+    (
+        "relocation suppresses a schema no operation could ever show",
+        "apidrift/diff.py",
+        "    return seen_anywhere",
+        "    return True",
+        ["test_a_schema_no_operation_reaches_is_not_silently_suppressed"],
+    ),
+    (
+        "a request-side field send no longer proves dependence",
+        "apidrift/dependence.py",
+        '    if finding.in_request or "request" in finding.kind:\n        calls = operation_reached()',
+        '    if "request" in finding.kind:\n        calls = operation_reached()',
+        ["test_a_sent_field_on_a_request_schema_is_proven"],
+    ),
+    (
+        "a keyword argument cited at the line the call opens on",
+        "apidrift/dependence.py",
+        '                    line = getattr(keyword, "lineno", None) or getattr(\n                        keyword.value, "lineno", line)',
+        "                    line = line",
+        ["test_a_send_is_cited_at_the_line_the_field_is_on"],
+    ),
+    (
         "scan: prefilter rejects a path with nothing distinctive to search for",
         "apidrift/scan.py",
         "            if not segments:\n                return True",

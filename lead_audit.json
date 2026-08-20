@@ -36,11 +36,18 @@
     "lead_precision": "0/10",
     "sendable": false,
     "blocker": "Operation reachability is accepted as proof for a whole-schema removal. A caller who reaches the operation but never reads any field of the removed schema is not affected, and seven of ten audited leads were exactly that. The fix is to resolve the removed schema to its leaf field names in the OLD spec and require a read of one of them, rejecting calls whose response is discarded.",
-    "findings_precision": "84/84, zero undecidable, after correcting the security defect above",
+    "findings_precision": "79/79, zero undecidable, after correcting the security defect and the schema-relocation defect above (the earlier 84/84 counted 5 relocations that break no caller)",
     "also_open": [
       "operation_reached() stops at the first affected operation with a hit, in list order, so an alphabetically earlier DELETE whose response is discarded wins over a GET whose response is deserialized. Rank by whether the response is consumed.",
       "A lead's breaks_on names the finding's representative operation while its proof names the operation the file actually calls, with nothing stating the two are related. This misled three auditors who had the repo, the spec and the source in front of them."
     ],
-    "note": "The findings engine is verified. The lead pipeline is not. Do not send outreach built on leads until an audit clears."
+    "note": "The findings engine is verified. The lead pipeline is not. Do not send outreach built on leads until an audit clears.",
+    "blocker_fix_implemented": "The prescribed fix is now in dependence.py: a schema_removed proof requires a read of one of the deleted schema's own field names, and field names too generic to mean anything cannot carry it. NOT YET AUDITED \u2014 lead_precision and sendable stay as they are until a fourth adversarial audit runs."
+  },
+  "findings_defect_found_and_fixed_2": {
+    "what": "A schema is an implementation detail of an operation; a caller only ever sees the operation. Diffing schemas in isolation cannot tell a field being DELETED from a field being MOVED between two schemas that compose into the same operation, and the second breaks nobody.",
+    "evidence": "OpenAI removed `ResponseProperties.reasoning` in this window while `POST /responses` accepted `reasoning` throughout \u2014 it moved to another arm of the same allOf. Found by running the new `apidrift scan` against Azure-Samples/python-openai-demos, which reported reasoning.py:38 as broken. Five of 84 breaking findings were this class (OpenAI 3, Stripe 2).",
+    "why_it_survived": "measure_precision.py asked the schema-level question \u2014 'is the field still in this schema?' \u2014 which is the same question the engine asked, so it agreed. Identical shape to the security OR-of-AND defect above.",
+    "status": "Fixed in both, independently. The engine suppresses a removal when every affected operation still exposes the name; the checker now resolves each affected operation from the RAW document with its own resolver and refutes relocations on its own. Mutation-verified: with the engine's suppression disabled, the checker independently refutes exactly those 5 (23/28 = 82.1%)."
   }
 }

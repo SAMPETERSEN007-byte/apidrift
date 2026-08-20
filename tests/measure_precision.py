@@ -227,6 +227,64 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
             return (body or {}).get("schema")
         return (node or {}).get("schema")
 
+    def _reachable_names(doc, node, depth=0, seen=None):
+        """Every property NAME under `node`, resolving refs and composition.
+
+        Written here, against the raw document, deliberately not sharing the
+        engine's resolver. A checker that reuses the engine's assumptions
+        agrees with the engine's mistakes -- which is exactly how the security
+        OR-of-AND bug survived a 86/86 "independent" measurement.
+        """
+        seen = set() if seen is None else seen
+        names = set()
+        if depth > 8 or not isinstance(node, dict):
+            return names
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            name = ref.rsplit("/", 1)[-1]
+            if name in seen:
+                return names
+            return _reachable_names(doc, schemas_of(doc).get(name) or {},
+                                    depth + 1, seen | {name})
+        for keyword in ("allOf", "anyOf", "oneOf"):
+            for arm in node.get(keyword) or []:
+                names |= _reachable_names(doc, arm, depth + 1, seen)
+        for prop_name, child in (node.get("properties") or {}).items():
+            names.add(prop_name)
+            names |= _reachable_names(doc, child, depth + 1, seen)
+        items = node.get("items")
+        if items is not None:
+            names |= _reachable_names(doc, items, depth + 1, seen)
+        extra = node.get("additionalProperties")
+        if isinstance(extra, dict):
+            names |= _reachable_names(doc, extra, depth + 1, seen)
+        return names
+
+    def _operation_names(doc, op_key):
+        """Field names a caller can see on this operation, either direction."""
+        names = set()
+        for where in ("request", "response"):
+            names |= _reachable_names(doc, _body_schema(doc, op_key, where) or {})
+        return names
+
+    def _is_relocation(field_name, ops):
+        """Did the field merely move between schemas of the same operation?
+
+        The schema-level question ("is it still in this schema?") is not the
+        consumer's question ("can I still send or receive it here?"). OpenAI
+        removed `ResponseProperties.reasoning` while `POST /responses` kept
+        accepting `reasoning` the whole time.
+        """
+        seen_anywhere = False
+        for op_key in (ops or [])[:40]:
+            was = _operation_names(old, op_key)
+            if field_name not in was:
+                continue
+            seen_anywhere = True
+            if field_name not in _operation_names(new, op_key):
+                return False
+        return seen_anywhere
+
     def effective_enum(node, doc, depth=0):
         """Enum values a consumer sees, through refs and nullable unions."""
         if not isinstance(node, dict) or depth > 4:
@@ -412,6 +470,12 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
 
         if kind == "schema_field_removed":
             if field_name in old_props and field_name not in new_props:
+                leaf = field_name.split(".")[-1].replace("[]", "")
+                if _is_relocation(leaf, finding.get("affected_ops")):
+                    return REFUTED, (
+                        f"`{schema_name}.{field_name}` left the schema but every "
+                        f"affected operation still exposes `{leaf}` — a move "
+                        f"between schemas, which breaks no caller")
                 return CONFIRMED, f"`{schema_name}.{field_name}` present at old, absent at new"
             return REFUTED, (f"`{schema_name}.{field_name}` "
                              f"old={field_name in old_props} new={field_name in new_props}")
