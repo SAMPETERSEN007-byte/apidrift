@@ -74,8 +74,18 @@ def is_vendored_path(file_path: str, vendor_key: str = "") -> bool:
     if package:
         parts = clean.split("/")
         directories, basename = parts[:-1], parts[-1]
-        if package in (d.lower() for d in directories) and basename.startswith("_"):
-            return True
+        lowered = [d.lower() for d in directories]
+        if package in lowered:
+            # An SDK-internal module name.
+            if basename.startswith("_"):
+                return True
+            # Or the internal layout a generated client is laid out in:
+            # `plaid/model/...`, `stripe/api_resources/...`. FiscAI committed
+            # `terraform/lambda_function/plaid/model/fdx_initiator_fi_attribute.py`,
+            # which carries neither a venv marker nor an underscore.
+            index = lowered.index(package)
+            if index + 1 < len(lowered) and lowered[index + 1] in _SDK_SUBDIRS:
+                return True
     return False
 
 
@@ -104,6 +114,12 @@ _CORPUS_PATTERNS = (
     # A vendored dependency tree is a copy of other people's code.
     r"^node_modules$", r"^vendor$", r"^third_party$", r"^bundled$",
 )
+
+# Directories a generated client lays its internals out in.
+_SDK_SUBDIRS = frozenset({
+    "model", "models", "api", "apis", "resources", "types", "api_resources",
+    "rest", "schema", "schemas", "generated",
+})
 
 # Names that mark a third-party SDK, wrapper, proxy or test double.
 _ECOSYSTEM_PATTERNS = (

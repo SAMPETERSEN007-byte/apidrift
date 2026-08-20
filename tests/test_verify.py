@@ -357,3 +357,40 @@ def kick(guild_id, user_id):
         verdict, _, _, sites = verify_source(source, "bot.py", f, get("discord"))
         self.assertEqual(verdict, CONFIRMED)
         self.assertTrue(sites)
+
+
+class TestProvenanceAtLeadTime(unittest.TestCase):
+    """The vendor's own SDK must never reach a fetch, let alone a lead."""
+
+    def test_vendor_owned_repo_is_rejected_without_fetching(self):
+        from apidrift.verify import verify_candidate
+        result = verify_candidate("openai/openai-python",
+                                  "src/openai/resources/responses.py",
+                                  "https://example.invalid", finding(),
+                                  get("openai"))
+        self.assertEqual(result.verdict, NOT_AUTHOR_CODE)
+        self.assertFalse(result.is_lead)
+        # Either rule may fire first; both are correct rejections.
+        self.assertTrue(
+            "openai org" in result.reason or "copy of the openai" in result.reason,
+            result.reason)
+
+    def test_a_vendor_repo_is_rejected_on_the_org_alone(self):
+        from apidrift.classify import classify, VENDOR_OWNED
+        self.assertEqual(
+            classify("openai/openai-python", "openai", "README.md").kind,
+            VENDOR_OWNED)
+
+    def test_vendored_dependency_path_is_rejected_without_fetching(self):
+        from apidrift.verify import verify_candidate
+        result = verify_candidate("someone/app",
+                                  "terraform/lambda_function/plaid/model/x.py",
+                                  "https://example.invalid", finding(),
+                                  get("plaid"))
+        self.assertEqual(result.verdict, NOT_AUTHOR_CODE)
+
+    def test_an_ordinary_repo_is_not_rejected_on_provenance(self):
+        from apidrift.classify import classify
+        self.assertTrue(
+            classify("caesar4321/Confio", "twilio",
+                     "backend/twilio_verify.py").is_outreach_target)

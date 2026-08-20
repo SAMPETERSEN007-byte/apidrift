@@ -335,6 +335,14 @@ MUTATIONS = [
         ["test_calling_a_shared_prefix_without_the_field_is_rejected"],
     ),
     (
+        "provenance no longer checked before fetching a candidate",
+        "apidrift/verify.py",
+        "    placement = classify(repo, vendor.key, file_path)\n    if not placement.is_outreach_target:",
+        "    placement = classify(repo, vendor.key, file_path)\n    if False:",
+        ["test_vendor_owned_repo_is_rejected_without_fetching",
+         "test_vendored_dependency_path_is_rejected_without_fetching"],
+    ),
+    (
         "signature builder drops the field name",
         "apidrift/signatures.py",
         "        if leaf and not leaf.startswith(\"<\"):",

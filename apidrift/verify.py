@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .diff import ABSENCE_KINDS, ENDPOINT_KINDS, FIELD_KINDS, Finding
+from .classify import classify
 from .signatures import build_signatures
 from .vendors import Vendor
 
@@ -92,6 +93,7 @@ class Verdict:
     verdict: str
     reason: str = ""
     vendor_evidence: str = ""
+    blob_sha: str = ""
     sites: List[Site] = field(default_factory=list)
 
     @property
@@ -103,6 +105,7 @@ class Verdict:
             "repo": self.repo, "file": self.file_path, "url": self.url,
             "verdict": self.verdict, "reason": self.reason,
             "vendor_evidence": self.vendor_evidence,
+            "blob_sha": self.blob_sha,
             "sites": [{"line": s.line, "kind": s.kind, "text": s.text} for s in self.sites],
         }
 
@@ -373,7 +376,13 @@ class FetchError(RuntimeError):
     pass
 
 
-def fetch_file(repo: str, path: str, ref: str = "") -> str:
+def fetch_file(repo: str, path: str, ref: str = "") -> Tuple[str, str]:
+    """Return (contents, blob sha).
+
+    The sha is what makes a cited line number reproducible. Without it a reader
+    checking the reference against their own checkout can land on a different
+    revision and see unrelated code, which is what happened to one audited lead.
+    """
     args = ["gh", "api", f"repos/{repo}/contents/{path}"]
     if ref:
         args += ["-f", f"ref={ref}"]
@@ -385,7 +394,8 @@ def fetch_file(repo: str, path: str, ref: str = "") -> str:
         raise FetchError(f"unexpected encoding {payload.get('encoding')!r}")
     if int(payload.get("size") or 0) > 800_000:
         raise FetchError("file too large")
-    return base64.b64decode(payload["content"]).decode("utf-8", "replace")
+    return (base64.b64decode(payload["content"]).decode("utf-8", "replace"),
+            str(payload.get("sha") or ""))
 
 
 # --------------------------------------------------------------------------
@@ -496,11 +506,19 @@ def verify_source(
 def verify_candidate(
     repo: str, file_path: str, url: str, finding: Finding, vendor: Vendor,
 ) -> Verdict:
+    # Reject on provenance before spending a fetch. The vendor's own SDK, a
+    # dataset mirror, a vendored dependency and build output are all incapable
+    # of being a customer, whatever their contents say.
+    placement = classify(repo, vendor.key, file_path)
+    if not placement.is_outreach_target:
+        return Verdict(repo=repo, file_path=file_path, url=url,
+                       verdict=NOT_AUTHOR_CODE, reason=placement.reason)
     try:
-        source = fetch_file(repo, file_path)
+        source, blob_sha = fetch_file(repo, file_path)
     except (FetchError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         return Verdict(repo=repo, file_path=file_path, url=url,
                        verdict=ERROR, reason=str(exc)[:160])
     verdict, reason, evidence, sites = verify_source(source, file_path, finding, vendor)
     return Verdict(repo=repo, file_path=file_path, url=url, verdict=verdict,
-                   reason=reason, vendor_evidence=evidence, sites=sites[:5])
+                   reason=reason, vendor_evidence=evidence, blob_sha=blob_sha,
+                   sites=sites[:5])
