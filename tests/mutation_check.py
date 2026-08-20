@@ -362,8 +362,14 @@ MUTATIONS = [
         "apidrift/dependence.py",
         "    if not leaf or leaf.startswith(\"<\") or leaf.startswith(\"/\"):\n        return \"\"\n    if not leaf[0].isalpha():\n        return \"\"\n    if not leaf.replace(\"_\", \"\").replace(\"-\", \"\").isalnum():\n        return \"\"",
         "    if not leaf:\n        return \"\"",
-        ["test_an_endpoint_subject_is_not_read_as_a_field_name",
-         "test_the_same_path_with_the_right_method_is_a_match"],
+        ["test_an_endpoint_subject_is_not_read_as_a_field_name"],
+    ),
+    (
+        "dependence: whole-schema changes demand the schema name in the code",
+        "apidrift/dependence.py",
+        "    if finding.kind in ENDPOINT_KINDS:\n        # Operation-level and whole-schema",
+        "    if finding.kind in ENDPOINT_KINDS and not leaf:\n        # Operation-level and whole-schema",
+        ["test_a_deleted_schema_is_proven_by_reaching_its_operation"],
     ),
     (
         "signature builder drops the field name",

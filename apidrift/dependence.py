@@ -562,7 +562,12 @@ def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], s
                        chain=c.chain + [f"and never supplies required `{leaf}`"])
                  for c in calls], "")
 
-    if finding.kind in ENDPOINT_KINDS and not leaf:
+    if finding.kind in ENDPOINT_KINDS:
+        # Operation-level and whole-schema changes are proven by reaching the
+        # operation. A caller does not name `LinkSessionProtectResult` anywhere
+        # -- schema names are OpenAPI-internal -- but if that schema is deleted
+        # the payload they receive changes. Requiring them to write the name
+        # rejected every genuine caller of every such change.
         calls = operation_reached()
         return calls, ("" if calls else
                        f"no call reaching `{method.upper()} {path or '?'}`")

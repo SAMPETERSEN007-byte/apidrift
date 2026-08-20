@@ -306,3 +306,40 @@ class TestPathAnchoring(unittest.TestCase):
                     path="/guilds/{g}/bulk-ban")
         self.assertEqual(_leaf_of(f), "")
         self.assertEqual(_leaf_of(finding(subject="Card.iin")), "iin")
+
+
+class TestWholeSchemaVersusField(unittest.TestCase):
+    """Deleting a schema and deleting a field are different claims.
+
+    A caller never writes `LinkSessionProtectResult` -- schema names are
+    OpenAPI-internal -- but if that schema is deleted the payload they receive
+    changes. Demanding they name it rejected every genuine caller. A FIELD
+    change is the opposite: only code that touches the field is affected.
+    """
+
+    PLAID_CALLER = ('import plaid\n'
+                    'def check(self, d):\n'
+                    '    return self.api(path="/link/token/get", data=d)\n')
+
+    def test_a_deleted_schema_is_proven_by_reaching_its_operation(self):
+        f = finding(kind="schema_removed", subject="LinkSessionProtectResult",
+                    path="/link/token/get", method="post",
+                    ops=["POST /link/token/get"])
+        self.assertEqual(verdict_of(self.PLAID_CALLER, f, get("plaid")), CONFIRMED)
+
+    def test_a_deleted_field_still_needs_the_field(self):
+        f = finding(kind="schema_field_removed",
+                    subject="LinkSessionGetResponse.protect_results",
+                    path="/link/token/get", method="post",
+                    ops=["POST /link/token/get"])
+        self.assertEqual(verdict_of(self.PLAID_CALLER, f, get("plaid")),
+                         NO_DEPENDENCE)
+
+    def test_a_deleted_schema_still_needs_the_right_operation(self):
+        source = ('import plaid\n'
+                  'def check(self, d):\n'
+                  '    return self.api(path="/item/get", data=d)\n')
+        f = finding(kind="schema_removed", subject="LinkSessionProtectResult",
+                    path="/link/token/get", method="post",
+                    ops=["POST /link/token/get"])
+        self.assertEqual(verdict_of(source, f, get("plaid")), NO_DEPENDENCE)
