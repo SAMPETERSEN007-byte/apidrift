@@ -81,7 +81,12 @@ def to_markdown(results: List[DiffResult], vendors: Dict[str, Vendor], window_da
             fanout = (f" · **{near} operations use it directly**" if near > 1
                       else (f" · **{reach} operations affected**" if reach > 1 else ""))
             lines.append(f"### `{finding.kind}` — `{finding.root_cause or finding.subject}`{fanout}")
-            where = f"Seen at `{finding.method.upper()} {finding.path}`"
+            if finding.path.startswith("#"):
+                # A schema finding with no concrete route: name the schema,
+                # not a JSON pointer dressed up as an endpoint.
+                where = f"In schema `{finding.path.rsplit('/', 1)[-1]}`"
+            else:
+                where = f"Seen at `{finding.method.upper()} {finding.path}`"
             if near > 1:
                 where += f" and {near - 1} other operations"
                 if reach > near:

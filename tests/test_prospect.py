@@ -136,3 +136,61 @@ class TestPseudoPaths(unittest.TestCase):
         f.subject = f.root_cause = "SpamLinkRuleResponse.id"   # weak leaf
         query = build_query(f, get("discord"), "python")
         self.assertIn("SpamLinkRuleResponse", query)
+
+
+class TestPseudoPathRendering(unittest.TestCase):
+    def test_signatures_never_contain_a_json_pointer(self):
+        from apidrift.signatures import build_signatures
+        f = Finding(kind="schema_field_removed", severity=BREAKING,
+                    op_key="GET #/components/schemas/Foo",
+                    path="#/components/schemas/Foo", method="get", detail="",
+                    subject="Foo.bar", root_cause="Foo.bar")
+        for sig in build_signatures(f, get("stripe")):
+            self.assertNotIn("#/components", sig)
+
+
+class TestGrepIsRunnable(unittest.TestCase):
+    """A command we print must actually run when pasted."""
+
+    def test_quoted_signatures_do_not_break_the_shell(self):
+        import subprocess
+        from apidrift.signatures import build_grep
+        cmd = build_grep(['ResponsesClientEventResponseCreate', '"service_tier"',
+                          "'service_tier'", "service_tier="])
+        self.assertNotIn("'service_tier'", cmd)
+        # Parse it the way a shell would; a quoting error raises here.
+        import shlex
+        parts = shlex.split(cmd)
+        self.assertEqual(parts[0], "rg")
+        self.assertIn("-e", parts)
+
+    def test_pattern_is_valid_regex(self):
+        import re
+        from apidrift.signatures import build_grep
+        import shlex
+        cmd = build_grep(['/v1/customers/{customer}', '"iin"', 'stripe.customers.'])
+        pattern = shlex.split(cmd)[shlex.split(cmd).index("-e") + 1]
+        re.compile(pattern)   # raises if the escaping is wrong
+
+
+class TestEveryPrintedCommandIsValid(unittest.TestCase):
+    """Every command in the report must survive a paste into a shell."""
+
+    def test_all_report_commands_parse_and_compile(self):
+        import re
+        import shlex
+        from pathlib import Path
+
+        report = Path(__file__).resolve().parent.parent / "out" / "report.md"
+        if not report.exists():
+            self.skipTest("no report.md; run the CLI first")
+        commands = [line for line in report.read_text().splitlines()
+                    if line.startswith("rg -n")]
+        self.assertGreater(len(commands), 0, "report contains no commands to check")
+        for command in commands:
+            with self.subTest(command=command[:70]):
+                parts = shlex.split(command)          # raises on bad quoting
+                pattern = parts[parts.index("-e") + 1]
+                re.compile(pattern)                    # raises on bad escaping
+                self.assertNotIn("#/components", pattern,
+                                 "a JSON pointer is not a call site")

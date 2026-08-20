@@ -41,6 +41,10 @@ def _strip_version(path: str, vendor: Vendor) -> str:
 
 
 def _resource_segments(path: str, vendor: Vendor) -> List[str]:
+    if path.startswith("#"):
+        # A JSON pointer names a schema, not a resource route. Deriving SDK
+        # call names from it produced `client..components.schemas.foo.`
+        return []
     stripped = _strip_version(path, vendor)
     segs = [s for s in stripped.split("/") if s and not s.startswith("{")]
     # Twilio paths end in `.json`
@@ -86,6 +90,8 @@ def build_signatures(finding: Finding, vendor: Vendor) -> List[str]:
     sigs: List[str] = []
 
     raw = finding.path
+    if raw.startswith("#"):
+        raw = ""          # a JSON pointer is not a call site
     if raw and raw != "/":
         sigs.append(raw)
         stripped = _strip_version(raw, vendor)
@@ -98,6 +104,13 @@ def build_signatures(finding: Finding, vendor: Vendor) -> List[str]:
                 sigs.append(prefix)
 
     sigs.extend(_sdk_names(finding, vendor))
+
+    # For a schema-level finding the schema name is itself a strong literal:
+    # generated clients carry it verbatim as a class or type name.
+    if finding.path.startswith("#"):
+        schema = finding.path.rsplit("/", 1)[-1]
+        if len(schema) > 6:
+            sigs.append(schema)
 
     # Param/field-level findings: the identifier itself is the strongest signal.
     # Both directions want the identifier: a presence check greps for it, and
@@ -120,10 +133,26 @@ def _rg_escape(text: str) -> str:
 
 
 def build_grep(signatures: Sequence[str], limit: int = 4) -> str:
-    picked = [s for s in signatures if len(s) > 3][:limit]
+    """A copy-pasteable ripgrep command.
+
+    Signatures include quoted variants (`"iin"`, `'iin'`) because a verifier
+    wants them. A shell command cannot: a single quote inside a single-quoted
+    argument ends the argument. Strip the decoration and let the regex match
+    the bare identifier.
+    """
+    seen, picked = set(), []
+    for sig in signatures:
+        bare = sig.strip("\"'")
+        if len(bare) > 3 and bare not in seen:
+            seen.add(bare)
+            picked.append(bare)
+        if len(picked) >= limit:
+            break
     if not picked:
         return ""
     pattern = "|".join(_rg_escape(s) for s in picked)
+    if "'" in pattern:      # belt and braces; should be impossible now
+        pattern = pattern.replace("'", ".")
     return f"rg -n --hidden -g '!node_modules' -e '{pattern}'"
 
 
