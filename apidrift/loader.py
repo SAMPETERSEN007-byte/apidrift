@@ -91,6 +91,10 @@ class Spec:
     security_schemes: Dict[str, str]
     schemas: Dict[str, "SchemaView"] = field(default_factory=dict)
     reachable: Dict[str, List[str]] = field(default_factory=dict)
+    # Reachable within two hops: what a consumer would actually see in the
+    # payload. Full transitive reachability on a hyperconnected spec says
+    # "589 of 589 operations", which is true and useless.
+    nearby: Dict[str, List[str]] = field(default_factory=dict)
     request_schemas: frozenset = frozenset()
     response_schemas: frozenset = frozenset()
 
@@ -484,6 +488,7 @@ def load_spec(raw: bytes, filename: str) -> Spec:
         security_schemes=security_schemes,
         schemas=views,
         reachable=reachable_operations(views, every),
+        nearby=reachable_operations(views, every, max_hops=2),
         request_schemas=frozenset(reachable_operations(views, request_roots)),
         response_schemas=frozenset(reachable_operations(views, response_roots)),
     )
@@ -620,6 +625,7 @@ def operation_schema_roots(
 
 def reachable_operations(
     views: Dict[str, SchemaView], roots: Dict[str, List[str]],
+    max_hops: Optional[int] = None,
 ) -> Dict[str, List[str]]:
     """schema name -> operations from which it is reachable.
 
@@ -635,15 +641,17 @@ def reachable_operations(
     out: Dict[str, set] = {}
     for op_key, names in roots.items():
         seen: set = set()
-        queue = list(names)
+        queue = [(name, 0) for name in names]
         while queue:
-            name = queue.pop()
+            name, hops = queue.pop()
             if name in seen:
                 continue
             seen.add(name)
+            if max_hops is not None and hops >= max_hops:
+                continue
             view = views.get(name)
             if view:
-                queue.extend(ref for ref in view.refs if ref not in seen)
+                queue.extend((ref, hops + 1) for ref in view.refs if ref not in seen)
         for name in seen:
             out.setdefault(name, set()).add(op_key)
     return {k: sorted(v) for k, v in out.items()}

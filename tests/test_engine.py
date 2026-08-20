@@ -429,6 +429,25 @@ class TestReachability(unittest.TestCase):
         self.assertEqual(len(reach["Card"]), len(set(reach["Card"])),
                          "operations must not be listed twice")
 
+    def test_direct_reach_is_smaller_than_transitive_reach(self):
+        """"589 of 589 operations" is true and useless; bound it."""
+        doc = self._doc()
+        # GET /wallets roots at Wallet (hop 0), Wallet -> Card (1),
+        # Card -> Bank (2), Bank -> Deep (3). The bound admits two hops.
+        doc["components"]["schemas"]["Card"]["properties"]["bank"] = {
+            "$ref": "#/components/schemas/Bank"}
+        doc["components"]["schemas"]["Deep"] = {
+            "type": "object", "properties": {"v": {"type": "string"}}}
+        doc["components"]["schemas"]["Bank"]["properties"]["deep"] = {
+            "$ref": "#/components/schemas/Deep"}
+        loaded = spec(doc)
+        self.assertIn("GET /wallets", loaded.reachable["Deep"],
+                      "Deep is reachable transitively")
+        self.assertNotIn("GET /wallets", loaded.nearby.get("Deep", []),
+                         "Deep is three hops away, past the bound")
+        self.assertIn("GET /wallets", loaded.nearby["Bank"],
+                      "Bank is two hops away, within the bound")
+
     def test_an_unreferenced_schema_reaches_nothing(self):
         doc = copy.deepcopy(BASE)
         doc["components"]["schemas"]["Orphan"] = {
@@ -451,6 +470,19 @@ class TestCollapseCounting(unittest.TestCase):
         collapsed = collapse([wide])[0]
         self.assertEqual(collapsed.affected_op_count, 589,
                          "the stored list is truncated, the count is not")
+
+    def test_the_detail_line_quotes_the_authoritative_count(self):
+        from apidrift.diff import Finding
+        wide = Finding(
+            kind="schema_field_removed", severity=BREAKING,
+            op_key="GET /a", path="/a", method="get", detail="x was removed",
+            subject="Card.iin", root_cause="Card.iin",
+            affected_ops=[f"GET /op{i}" for i in range(200)],
+            affected_op_count=589,
+        )
+        collapsed = collapse([wide])[0]
+        self.assertIn("589 operations", collapsed.detail)
+        self.assertNotIn("200 operations", collapsed.detail)
 
     def test_the_count_never_undercounts_merged_members(self):
         from apidrift.diff import Finding

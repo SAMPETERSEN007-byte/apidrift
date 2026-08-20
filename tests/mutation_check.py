@@ -159,7 +159,7 @@ MUTATIONS = [
     (
         "reachability stops following schema references",
         "apidrift/loader.py",
-        "                queue.extend(ref for ref in view.refs if ref not in seen)",
+        "                queue.extend((ref, hops + 1) for ref in view.refs if ref not in seen)",
         "                pass",
         ["test_transitive_reference_is_reachable",
          "test_a_cycle_terminates_and_does_not_double_count"],
@@ -255,6 +255,20 @@ MUTATIONS = [
         "                emit(\"schema_field_removed\",\n                     BREAKING if in_response else POTENTIALLY_BREAKING,",
         "                emit(\"schema_field_removed\",\n                     BREAKING,",
         ["test_removing_a_request_only_field_is_downgraded"],
+    ),
+    (
+        "detail line quotes the capped list length instead of the real count",
+        "apidrift/diff.py",
+        "            rep.detail = f\"{rep.detail} — affects {rep.affected_op_count} operations\"",
+        "            rep.detail = f\"{rep.detail} — affects {len(distinct_ops)} operations\"",
+        ["test_the_detail_line_quotes_the_authoritative_count"],
+    ),
+    (
+        "hop limit ignored: nearby collapses into full transitive reach",
+        "apidrift/loader.py",
+        "            if max_hops is not None and hops >= max_hops:\n                continue",
+        "            if False:\n                continue",
+        ["test_direct_reach_is_smaller_than_transitive_reach"],
     ),
     (
         "signature builder drops the field name",

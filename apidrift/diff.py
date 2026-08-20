@@ -61,6 +61,7 @@ class Finding:
     spec_file: str = ""
     occurrences: int = 1
     affected_op_count: int = 0
+    direct_op_count: int = 0
     affected_ops: List[str] = field(default_factory=list)
     root_cause: str = ""
 
@@ -79,6 +80,7 @@ class Finding:
             "detail": self.detail,
             "occurrences": self.occurrences,
             "affected_op_count": self.affected_op_count,
+            "direct_op_count": self.direct_op_count,
             "root_cause": self.root_cause,
             "affected_ops": self.affected_ops[:25],
             "signatures": self.signatures,
@@ -609,9 +611,16 @@ def collapse(findings: List[Finding], max_ops: int = 200) -> List[Finding]:
             distinct_ops.update(member.affected_ops or ())
         # Never shrink a count that reachability already established.
         rep.affected_op_count = max(len(distinct_ops), rep.affected_op_count)
+        rep.direct_op_count = max((m.direct_op_count for m in members), default=0)
         rep.affected_ops = sorted(distinct_ops)[:max_ops]
-        if len(distinct_ops) > 1:
-            rep.detail = f"{rep.detail} — affects {len(distinct_ops)} operations"
+        # Use the authoritative count, not the length of the list, which is
+        # capped for output size. Reporting the capped length here contradicted
+        # the same number printed in the report header.
+        if rep.direct_op_count > 1:
+            rep.detail = (f"{rep.detail} — appears directly in "
+                          f"{rep.direct_op_count} operations")
+        elif rep.affected_op_count > 1:
+            rep.detail = f"{rep.detail} — affects {rep.affected_op_count} operations"
         elif len(members) > 1:
             rep.detail = (f"{rep.detail} — reached {len(members)} ways through "
                           f"1 operation")
@@ -653,6 +662,7 @@ def _diff_schema_views(old: Spec, new: Spec) -> List[Finding]:
         finding.root_cause = name
         finding.affected_ops = ops[:200]
         finding.affected_op_count = len(ops)
+        finding.direct_op_count = len(old.nearby.get(name, []))
         finding.occurrences = len(ops) or 1
         out.append(finding)
 
@@ -664,6 +674,7 @@ def _diff_schema_views(old: Spec, new: Spec) -> List[Finding]:
         # does not. Stripe's request bodies are inline form schemas, so every
         # named schema there is response-side, and scoring "now required" as
         # breaking across all of them would be wrong 36 times over.
+        near = new.nearby.get(name, []) or old.nearby.get(name, [])
         in_request = new.used_in_requests(name) or old.used_in_requests(name)
         in_response = new.used_in_responses(name) or old.used_in_responses(name)
         carrier = _schema_op(name)
@@ -678,6 +689,7 @@ def _diff_schema_views(old: Spec, new: Spec) -> List[Finding]:
             finding.root_cause = subject
             finding.affected_ops = ops[:200]
             finding.affected_op_count = len(ops)
+            finding.direct_op_count = len(near)
             finding.occurrences = len(ops) or 1
             out.append(finding)
 

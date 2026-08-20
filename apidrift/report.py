@@ -75,9 +75,19 @@ def to_markdown(results: List[DiffResult], vendors: Dict[str, Vendor], window_da
 
         shown = res.breaking[:MAX_DETAIL_ROWS]
         for finding in shown:
-            fanout = f" · **{finding.occurrences} operations affected**" if finding.occurrences > 1 else ""
+            near = finding.direct_op_count
+            reach = finding.affected_op_count or finding.occurrences
+            ops = near or reach
+            fanout = (f" · **{near} operations use it directly**" if near > 1
+                      else (f" · **{reach} operations affected**" if reach > 1 else ""))
             lines.append(f"### `{finding.kind}` — `{finding.root_cause or finding.subject}`{fanout}")
-            lines.append(f"First seen at `{finding.method.upper()} {finding.path}`  ")
+            where = f"Seen at `{finding.method.upper()} {finding.path}`"
+            if near > 1:
+                where += f" and {near - 1} other operations"
+                if reach > near:
+                    where += (f" ({reach} in total once indirect schema "
+                              f"references are followed)")
+            lines.append(where + "  ")
             lines.append(f"{finding.detail}  ")
             lines.append(f"`{finding.old}` → `{finding.new}`\n")
             if finding.grep:
