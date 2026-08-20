@@ -185,6 +185,137 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
             return CONFIRMED, f"gained {sorted(gained)}"
         return REFUTED, f"old={sorted(names(op_old))} new={sorted(names(op_new))}"
 
+    def _body_schema(doc, op_key, where):
+        op = find_operation(doc, op_key)
+        if not isinstance(op, dict):
+            return None
+        if where == "request":
+            node = op.get("requestBody") or {}
+        else:
+            responses = op.get("responses") or {}
+            node = responses.get("200") or responses.get("201") or {}
+            if not node:
+                for status, body in responses.items():
+                    if str(status).startswith("2"):
+                        node = body
+                        break
+        if "$ref" in (node or {}):
+            node = schemas_of(doc).get(str(node["$ref"]).rsplit("/", 1)[-1]) or {}
+        content = (node or {}).get("content") or {}
+        for mime in ("application/json", "application/x-www-form-urlencoded"):
+            if mime in content:
+                return (content[mime] or {}).get("schema")
+        for body in content.values():
+            return (body or {}).get("schema")
+        return (node or {}).get("schema")
+
+    def effective_enum(node, doc, depth=0):
+        """Enum values a consumer sees, through refs and nullable unions."""
+        if not isinstance(node, dict) or depth > 4:
+            return None
+        if isinstance(node.get("enum"), list):
+            return tuple(sorted(map(str, node["enum"])))
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            return effective_enum(schemas_of(doc).get(ref.rsplit("/", 1)[-1]),
+                                  doc, depth + 1)
+        for key in ("allOf", "oneOf", "anyOf"):
+            arms = node.get(key)
+            if not isinstance(arms, list):
+                continue
+            found = [effective_enum(a, doc, depth + 1) for a in arms]
+            found = [f for f in found if f]
+            if len(found) == 1:
+                return found[0]
+        # An array of enum values carries the enum on its items.
+        if node.get("type") == "array" or "items" in node:
+            return effective_enum(node.get("items"), doc, depth + 1)
+        return None
+
+    if kind == "endpoint_deprecated":
+        op_old = find_operation(old, finding["op_key"])
+        op_new = find_operation(new, finding["op_key"])
+        if op_new is None:
+            return UNDECIDABLE, "operation absent from the new spec"
+        was = bool((op_old or {}).get("deprecated"))
+        now = bool(op_new.get("deprecated"))
+        if now and not was:
+            return CONFIRMED, "deprecated flag newly set"
+        return REFUTED, f"deprecated old={was} new={now}"
+
+    if kind in ("schema_enum_value_added", "schema_enum_value_removed",
+                "response_enum_value_added", "response_enum_value_removed",
+                "request_enum_value_removed", "schema_field_now_nullable"):
+        parts = root.split(".")
+        available = schemas_of(old) | schemas_of(new)
+        schema_name = None
+        for cut in range(len(parts) - 1, 0, -1):
+            if ".".join(parts[:cut]) in available:
+                schema_name = ".".join(parts[:cut])
+                # `field[]` names the array, not a property called "field[]".
+                field_name = ".".join(parts[cut:]).replace("[]", "")
+                break
+        if schema_name is None:
+            return UNDECIDABLE, f"root `{root}` names no known schema"
+
+        def prop(doc):
+            node = schemas_of(doc).get(schema_name)
+            if not isinstance(node, dict):
+                return None
+            props = dict(node.get("properties") or {})
+            for arm in node.get("allOf") or []:
+                target = schemas_of(doc).get(str(arm.get("$ref", "")).rsplit("/", 1)[-1]) \
+                    if "$ref" in arm else arm
+                if isinstance(target, dict):
+                    props.update(target.get("properties") or {})
+            return props.get(field_name)
+
+        before_prop, after_prop = prop(old), prop(new)
+        if kind == "schema_field_now_nullable":
+            def nullable(node, doc):
+                if not isinstance(node, dict):
+                    return None
+                if node.get("nullable") is True:
+                    return True
+                t = node.get("type")
+                if isinstance(t, list):
+                    return "null" in t
+                ref = node.get("$ref")
+                if isinstance(ref, str):
+                    return nullable(schemas_of(doc).get(ref.rsplit("/", 1)[-1]), doc)
+                return False
+            was, now = nullable(before_prop, old), nullable(after_prop, new)
+            if now and not was:
+                return CONFIRMED, "became nullable"
+            return REFUTED, f"nullable old={was} new={now}"
+
+        before = effective_enum(before_prop, old)
+        after = effective_enum(after_prop, new)
+        if before is None or after is None:
+            # Route-level findings sit inside an inline body rather than a
+            # named schema, so resolve them through the operation instead.
+            where = "request" if "request" in kind else "response"
+            old_body = _body_schema(old, finding["op_key"], where)
+            new_body = _body_schema(new, finding["op_key"], where)
+            path_parts = [p for p in root.replace("[]", ".[].").split(".") if p]
+            if old_body is not None and new_body is not None:
+                found_old, node_old = walk_properties(old_body, path_parts, old)
+                found_new, node_new = walk_properties(new_body, path_parts, new)
+                if found_old and found_new:
+                    before = effective_enum(node_old, old)
+                    after = effective_enum(node_new, new)
+        if before is None or after is None:
+            return UNDECIDABLE, f"no enum resolvable (old={before}, new={after})"
+        gained = sorted(set(after) - set(before))
+        lost = sorted(set(before) - set(after))
+        if kind.endswith("_added"):
+            if gained:
+                return CONFIRMED, f"gained {gained}"
+            return REFUTED, f"no values gained (old={len(before)}, new={len(after)})"
+        if lost:
+            return CONFIRMED, f"lost {lost}"
+        return REFUTED, f"no values lost (old={len(before)}, new={len(after)})"
+
     if kind == "schema_removed":
         name = finding.get("root_cause") or finding["subject"]
         in_old = name in schemas_of(old)
@@ -255,30 +386,6 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
                 return CONFIRMED, f"shape {before} -> {after}"
             return REFUTED, f"same effective shape {before}"
         return UNDECIDABLE, f"no independent check for `{kind}`"
-
-    def _body_schema(doc, op_key, where):
-        op = find_operation(doc, op_key)
-        if not isinstance(op, dict):
-            return None
-        if where == "request":
-            node = op.get("requestBody") or {}
-        else:
-            responses = op.get("responses") or {}
-            node = responses.get("200") or responses.get("201") or {}
-            if not node:
-                for status, body in responses.items():
-                    if str(status).startswith("2"):
-                        node = body
-                        break
-        if "$ref" in (node or {}):
-            node = schemas_of(doc).get(str(node["$ref"]).rsplit("/", 1)[-1]) or {}
-        content = (node or {}).get("content") or {}
-        for mime in ("application/json", "application/x-www-form-urlencoded"):
-            if mime in content:
-                return (content[mime] or {}).get("schema")
-        for body in content.values():
-            return (body or {}).get("schema")
-        return (node or {}).get("schema")
 
     if kind in ("request_field_added_required", "request_field_now_required",
                 "param_added_required", "param_now_required"):

@@ -23,8 +23,11 @@ $PY -m unittest discover -s tests 2>&1 | tail -3 || fail=1
 step "2/4 mutation testing"
 $PY tests/mutation_check.py 2>&1 | tail -2 || fail=1
 
-step "3/4 precision audit (every breaking finding, checked against raw specs)"
-$PY tests/measure_precision.py --sample 1000 2>&1 | sed -n '4,12p' || fail=1
+step "3/4 precision audit (every finding, checked against raw specs)"
+echo "-- breaking --"
+$PY tests/measure_precision.py --sample 1000 --severity breaking 2>&1 | sed -n '4,10p' || fail=1
+echo "-- potentially breaking --"
+$PY tests/measure_precision.py --sample 1000 --severity potentially_breaking 2>&1 | sed -n '4,10p' || fail=1
 
 step "4/4 end-to-end run"
 if $PY -m apidrift.cli --days 90 --quiet; then
