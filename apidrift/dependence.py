@@ -351,8 +351,41 @@ def _is_route_registration(node: ast.Call) -> bool:
     return any(keyword.arg == "prefix" for keyword in node.keywords)
 
 
+_EXPLICIT_HOST = re.compile(r"^[a-z][a-z0-9+.\-]*://([^/]+)", re.I)
+
+
+def written_host(candidate: str) -> Optional[str]:
+    """The host a caller literally wrote into this string, if any.
+
+    Reports only. Whether it is the vendor's is decided once, at the call, so
+    there is a single place to be wrong rather than two that cover for each
+    other.
+
+    An interpolated host is unknowable and so is not reported: an f-string
+    collapses to `https://{}/...`, which names nobody.
+    """
+    match = _EXPLICIT_HOST.match(candidate.strip())
+    if not match:
+        return None
+    host = match.group(1).lower()
+    if "{" in host or "}" in host or "%" in host:
+        return None
+    return host
+
+
+def _is_vendor_host(host: str, vendor: Vendor) -> bool:
+    known = [e.lower() for e in vendor.evidence if "." in e and "/" not in e]
+    return any(k in host for k in known) or vendor.key.lower() in host
+
+
+def _hosts_named(candidates: Sequence[Optional[str]]) -> List[str]:
+    """Every host literally written anywhere in this call."""
+    return [h for h in (written_host(t) for t in candidates if t) if h]
+
+
 def find_operation_calls(tree: ast.AST, method: str, path: str,
-                         lines: Sequence[str]) -> List[Proof]:
+                         lines: Sequence[str],
+                         vendor: Optional[Vendor] = None) -> List[Proof]:
     """Calls that name BOTH the method and a path matching the template.
 
     Requiring both is what separates `POST /guilds/{id}/bulk-ban` from the
@@ -367,6 +400,15 @@ def find_operation_calls(tree: ast.AST, method: str, path: str,
         if _is_route_registration(node):
             continue
         candidates = [literal_of(child) for child in ast.walk(node)]
+        # Hosts are judged for the CALL, not per literal. An f-string yields
+        # its inner Constants as separate candidates, so
+        # `f"https://internal.acme.io{suffix}/v1/charges"` offered a bare
+        # `/v1/charges` that matched with the host nowhere in sight, and the
+        # per-literal check was bypassed by every interpolated URL.
+        if vendor is not None:
+            hosts = _hosts_named(candidates)
+            if hosts and not any(_is_vendor_host(h, vendor) for h in hosts):
+                continue
         matched_path = next(
             (text for text in candidates if text and paths_match(path, text)), None)
         if not matched_path:
@@ -529,28 +571,6 @@ def find_field_sends(tree: ast.AST, field_name: str, vendor: Vendor,
     return proofs
 
 
-def find_missing_required(tree: ast.AST, field_name: str, method: str,
-                          path: str, lines: Sequence[str]) -> List[Proof]:
-    """Calls to the operation that do NOT supply a newly required field.
-
-    The break here is an absence, so the proof is a call that reaches the
-    operation plus the field being absent from the whole file.
-    """
-    calls = find_operation_calls(tree, method, path, lines)
-    if not calls:
-        return []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            if any(kw.arg == field_name for kw in node.keywords):
-                return []
-        if isinstance(node, ast.Dict):
-            if any(literal_of(key) == field_name for key in node.keys):
-                return []
-    return [Proof(kind=FIELD_MISSING, line=call.line, text=call.text,
-                  chain=call.chain + [f"and never supplies `{field_name}`"])
-            for call in calls]
-
-
 # ---------------------------------------------------------------------------
 # entry point
 # ---------------------------------------------------------------------------
@@ -671,7 +691,8 @@ def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], s
             op_method, _, op_path = op_key.partition(" ")
             if not op_path or op_path.startswith("#"):
                 continue
-            hits = find_operation_calls(tree, op_method.lower(), op_path, lines)
+            hits = find_operation_calls(tree, op_method.lower(), op_path,
+                                        lines, vendor)
             if hits:
                 # A change can touch many operations; say which one this file
                 # actually calls. Reporting the representative made a Twilio

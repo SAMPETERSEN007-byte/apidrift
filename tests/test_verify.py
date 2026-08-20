@@ -662,3 +662,69 @@ class TestASendNeedsAVendorReceiver(unittest.TestCase):
             self.BODY_DICT, "app.py", self._finding(), STRIPE)
         self.assertEqual(verdict, CONFIRMED)
         self.assertEqual(sites[0].line, 3)
+
+
+class TestAWrittenHostIsDecisive(unittest.TestCase):
+    """`paths_match` is end-anchored, and that makes it host-blind.
+
+    The anchoring exists for a good reason: `f"{BASE}/v1/charges"` has to match
+    when the host lives in a variable. The cost is that
+    `paths_match("/v1/charges", "https://internal.acme.io/v1/charges")` is
+    True, and vendor evidence is only ever established file-wide — so any file
+    importing stripe anywhere had its own internal service read as a Stripe
+    call. A host the caller wrote down is decisive; an absent one is not.
+    """
+
+    def _finding(self):
+        return finding(kind="endpoint_removed", subject="/v1/charges",
+                       path="/v1/charges", method="post",
+                       ops=["POST /v1/charges"])
+
+    def test_another_service_sharing_the_tail_path_is_not_the_vendor(self):
+        source = ('import stripe\n'
+                  'import requests\n'
+                  'def internal(body):\n'
+                  '    return requests.post("https://internal.acme.io/v1/charges",\n'
+                  '                         json=body)\n')
+        self.assertEqual(verdict_of(source, self._finding(), STRIPE),
+                         NO_DEPENDENCE)
+
+    def test_the_vendors_own_host_still_matches(self):
+        source = ('import stripe\n'
+                  'import requests\n'
+                  'def charge(body):\n'
+                  '    return requests.post("https://api.stripe.com/v1/charges",\n'
+                  '                         json=body)\n')
+        self.assertEqual(verdict_of(source, self._finding(), STRIPE), CONFIRMED)
+
+    def test_an_absent_host_is_not_decisive_either_way(self):
+        """The whole reason the matcher is end-anchored."""
+        source = ('import stripe\n'
+                  'import requests\n'
+                  'BASE = os.environ["STRIPE_BASE"]\n'
+                  'def charge(body):\n'
+                  '    return requests.post(f"{BASE}/v1/charges", json=body)\n')
+        self.assertEqual(verdict_of(source, self._finding(), STRIPE), CONFIRMED)
+
+    def test_an_interpolated_url_cannot_smuggle_a_foreign_host_past(self):
+        """An f-string yields its inner Constants as separate candidates.
+
+        So `f"https://internal.acme.io{suffix}/v1/charges"` offered a bare
+        `/v1/charges` with the host nowhere in sight, and a per-literal host
+        check was bypassed by every interpolated URL. Hosts are judged for the
+        whole call.
+        """
+        source = ('import stripe\n'
+                  'import requests\n'
+                  'def internal(suffix, body):\n'
+                  '    return requests.post(\n'
+                  '        f"https://internal.acme.io{suffix}/v1/charges", json=body)\n')
+        self.assertEqual(verdict_of(source, self._finding(), STRIPE),
+                         NO_DEPENDENCE)
+
+    def test_an_interpolated_host_is_unknowable_and_so_not_rejected(self):
+        source = ('import stripe\n'
+                  'import requests\n'
+                  'def charge(host, body):\n'
+                  '    return requests.post(f"https://{host}/v1/charges", json=body)\n')
+        self.assertEqual(verdict_of(source, self._finding(), STRIPE), CONFIRMED)

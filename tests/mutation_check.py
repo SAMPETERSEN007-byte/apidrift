@@ -18,6 +18,28 @@ PY_BIN = str(ROOT / ".venv" / "bin" / "python")
 
 MUTATIONS = [
     (
+        "path matching goes host-blind again",
+        "apidrift/dependence.py",
+        "            if hosts and not any(_is_vendor_host(h, vendor) for h in hosts):",
+        "            if False:",
+        ["test_another_service_sharing_the_tail_path_is_not_the_vendor",
+         "test_an_interpolated_url_cannot_smuggle_a_foreign_host_past"],
+    ),
+    (
+        "an interpolated host reported as if it named someone",
+        "apidrift/dependence.py",
+        '    if "{" in host or "}" in host or "%" in host:\n        return None',
+        "    if False:\n        return None",
+        ["test_an_interpolated_host_is_unknowable_and_so_not_rejected"],
+    ),
+    (
+        "the vendor's own host rejected as foreign",
+        "apidrift/dependence.py",
+        "    return any(k in host for k in known) or vendor.key.lower() in host",
+        "    return False",
+        ["test_the_vendors_own_host_still_matches"],
+    ),
+    (
         "a send no longer requires the vendor to be receiving it",
         "apidrift/dependence.py",
         "        if not link:\n            continue\n\n        anchors:",
