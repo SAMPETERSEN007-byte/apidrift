@@ -85,7 +85,14 @@ class Operation:
     request_fields: Dict[str, Field] = field(default_factory=dict)
     request_required: bool = False
     responses: Dict[str, Dict[str, Field]] = field(default_factory=dict)
-    security: Tuple[str, ...] = ()
+    # One frozenset per ALTERNATIVE, each holding the schemes that must be
+    # satisfied together: `[{A}, {B}]` is "A or B". The annotation said
+    # `Tuple[str, ...]` until 2026-08-20 — a fossil of the flattened model that
+    # scored nine Twilio operations as breaking when an alternative was ADDED.
+    # `_security_names` has returned `Tuple[frozenset, ...]` since that fix, so
+    # the annotation described a shape the loader never produces, and anyone
+    # reading the dataclass re-learned the misconception the fix removed.
+    security: Tuple[frozenset, ...] = ()
 
     @property
     def key(self) -> str:

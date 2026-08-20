@@ -1,0 +1,103 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gate.sh)",
+      "Bash(./run.sh:*)",
+
+      "Bash(./.venv/bin/python -m unittest:*)",
+      "Bash(./.venv/bin/python tests/mutation_check.py:*)",
+      "Bash(./.venv/bin/python tests/measure_precision.py:*)",
+      "Bash(./.venv/bin/python tests/verify_against_specs.py:*)",
+      "Bash(./.venv/bin/python -m apidrift.cli:*)",
+      "Bash(./.venv/bin/python -m apidrift:*)",
+      "Bash(./.venv/bin/python leads_run.py:*)",
+      "Bash(./.venv/bin/python brief_run.py:*)",
+      "Bash(./.venv/bin/python prospect_run.py:*)",
+      "Bash(./.venv/bin/python -c:*)",
+      "Bash(./.venv/bin/python -m pip list:*)",
+      "Bash(./.venv/bin/python -m pip show:*)",
+      "Bash(./.venv/bin/python -V)",
+      "Bash(.venv/bin/python:*)",
+      "Bash(python3 -c:*)",
+      "Bash(python3 -V)",
+
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git diff:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git -c:*)",
+      "Bash(git -C:*)",
+      "Bash(git branch:*)",
+      "Bash(git checkout:*)",
+      "Bash(git switch:*)",
+      "Bash(git restore:*)",
+      "Bash(git stash:*)",
+      "Bash(git ls-files:*)",
+      "Bash(git ls-tree:*)",
+      "Bash(git ls-remote:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git rev-list:*)",
+      "Bash(git cat-file:*)",
+      "Bash(git merge-base:*)",
+      "Bash(git blame:*)",
+      "Bash(git shortlog:*)",
+      "Bash(git clone:*)",
+      "Bash(git fetch:*)",
+      "Bash(git remote:*)",
+      "Bash(git worktree:*)",
+      "Bash(git --version)",
+
+      "Bash(gh api:*)",
+      "Bash(gh auth status:*)",
+      "Bash(gh repo view:*)",
+      "Bash(gh search:*)",
+
+      "Bash(rg:*)",
+      "Bash(grep:*)",
+      "Bash(sqlite3:*)",
+      "Bash(jq:*)",
+      "Bash(sed:*)",
+      "Bash(awk:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(cat:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(wc:*)",
+      "Bash(sort:*)",
+      "Bash(uniq:*)",
+      "Bash(cut:*)",
+      "Bash(tr:*)",
+      "Bash(diff:*)",
+      "Bash(file:*)",
+      "Bash(stat:*)",
+      "Bash(du:*)",
+      "Bash(echo:*)",
+      "Bash(printf:*)",
+      "Bash(pwd)",
+      "Bash(date:*)",
+      "Bash(mkdir:*)",
+      "Bash(touch:*)",
+      "Bash(cp:*)",
+      "Bash(mv:*)",
+      "Bash(ruff:*)",
+      "Bash(mypy:*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/claudebot/apidrift/.claude/hooks/fast-suite.sh",
+            "timeout": 15000
+          }
+        ]
+      }
+    ]
+  }
+}
