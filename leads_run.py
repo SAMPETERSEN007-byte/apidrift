@@ -21,7 +21,9 @@ ROOT = Path(__file__).resolve().parent
 FINDINGS_PER_VENDOR = int(sys.argv[1]) if len(sys.argv) > 1 else 2
 CANDIDATES_PER_FINDING = int(sys.argv[2]) if len(sys.argv) > 2 else 10
 LANGUAGE = sys.argv[3] if len(sys.argv) > 3 else "python"
-VENDOR_FILTER = sys.argv[4].split(",") if len(sys.argv) > 4 else None
+MAX_ATTEMPTS = int(sys.argv[5]) if len(sys.argv) > 5 else 14
+VENDOR_FILTER = (None if len(sys.argv) <= 4 or sys.argv[4] in ("all", "")
+                 else sys.argv[4].split(","))
 
 
 def load_findings(entry):
@@ -32,6 +34,8 @@ def load_findings(entry):
             old=f["old"], new=f["new"], operation_id=f.get("operation_id"),
             signatures=f["signatures"], occurrences=f["occurrences"],
             root_cause=f.get("root_cause", ""),
+            affected_ops=f.get("affected_ops") or [],
+            affected_op_count=f.get("affected_op_count") or 0,
         )
         for f in entry["findings"] if f["severity"] == "breaking"
     ]
@@ -53,7 +57,8 @@ def main() -> int:
         print(f"\n[{vendor.name}]")
         ranked = sorted(findings, key=lambda f: -f.occurrences)
         prospects = prospect(ranked, vendor, limit=FINDINGS_PER_VENDOR,
-                             language=LANGUAGE, verbose=True)
+                             language=LANGUAGE, verbose=True,
+                             max_attempts=MAX_ATTEMPTS)
         by_finding = {p.root_cause: p for p in prospects}
 
         vendor_leads = []

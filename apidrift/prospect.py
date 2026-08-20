@@ -6,6 +6,7 @@ part a vendor is willing to pay for.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -90,6 +91,27 @@ def _leaf(finding: Finding) -> str:
     return leaf if leaf and not leaf.startswith("<") else ""
 
 
+def canonical_path(finding: Finding) -> str:
+    """The most representative endpoint for a finding, not just the first one.
+
+    A change to a shared schema is reachable from many operations, and the
+    representative is whichever sorted first. That is often a niche endpoint:
+    `payment_intent.amount_capturable` is a widely used field, but paired with
+    `/v1/terminal/readers` the search returns nothing. The shortest affected
+    path is almost always the primary resource endpoint.
+    """
+    candidates = []
+    for op_key in finding.affected_ops or []:
+        _, _, path = op_key.partition(" ")
+        if path:
+            candidates.append(path)
+    if not candidates:
+        return finding.path
+    # Fewest segments wins, then fewest path parameters, then shortest.
+    return min(candidates,
+               key=lambda p: (p.count("/"), p.count("{"), len(p)))
+
+
 def build_query(finding: Finding, vendor: Vendor, language: str = "") -> str:
     """Build the most discriminating code-search query for one finding.
 
@@ -101,9 +123,10 @@ def build_query(finding: Finding, vendor: Vendor, language: str = "") -> str:
     """
     terms: List[str] = []
     path_literal = ""
-    if finding.path and finding.path != "/":
-        path_literal = (finding.path.split("{", 1)[0].rstrip("/")
-                        if "{" in finding.path else finding.path)
+    best_path = canonical_path(finding)
+    if best_path and best_path != "/":
+        path_literal = (best_path.split("{", 1)[0].rstrip("/")
+                        if "{" in best_path else best_path)
 
     leaf = _leaf(finding)
     # A newly-required field is verified by its ABSENCE, so searching for it
@@ -135,12 +158,52 @@ def build_query(finding: Finding, vendor: Vendor, language: str = "") -> str:
     return " ".join(terms)
 
 
+_COMPOUND = re.compile(r"_|(?<=[a-z])(?=[A-Z])")
+
+
+def searchability(finding: Finding) -> int:
+    """How likely this finding is to yield a usable code search.
+
+    Fan-out measures how much of the spec a change touches. It says nothing
+    about whether the change can be FOUND in someone's code. `frequency` and
+    `day` have high fan-out and are unsearchable; `SpamLinkRuleResponse` and
+    `hd_streaming_buyer_id` have low fan-out and are unmistakable. Ranking by
+    fan-out alone left 29 real Discord findings unsearched.
+    """
+    subject = finding.root_cause or finding.subject
+    leaf = subject.split(".")[-1].replace("[]", "").strip("<>")
+    if not leaf:
+        return -10
+    score = 0
+    if _COMPOUND.search(leaf):
+        score += 3               # multi-word identifier: rarely a coincidence
+    if len(leaf) >= 14:
+        score += 3
+    elif len(leaf) >= 9:
+        score += 2
+    elif len(leaf) >= 6:
+        score += 1
+    if leaf.lower() in _WEAK_TOKENS:
+        score -= 6               # a common English word finds everything
+    if len(leaf) <= 4:
+        score -= 2
+    if finding.kind in _ENDPOINT_KINDS:
+        # Endpoint changes search on the path, which is specific by nature.
+        score += 2
+    return score
+
+
+def rank_findings(findings: Sequence[Finding]) -> List[Finding]:
+    """Order findings for prospecting: most findable first, then widest reach."""
+    return sorted(findings, key=lambda f: (-searchability(f), -f.occurrences))
+
+
 def prospect(
     findings: Sequence[Finding], vendor: Vendor, limit: int = 5,
     language: str = "python", verbose: bool = True, max_attempts: int = 14,
 ) -> List[Prospect]:
     out: List[Prospect] = []
-    ranked = sorted(findings, key=lambda f: -f.occurrences)
+    ranked = rank_findings(findings)
     seen_queries: set = set()
     index = 0
     usable = 0

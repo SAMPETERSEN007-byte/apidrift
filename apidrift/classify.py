@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 
 VENDOR_OWNED = "vendor_owned"
 VENDORED = "vendored"
+GENERATED = "generated"
 ECOSYSTEM = "ecosystem"
 INTEGRATOR = "integrator"
 CORPUS = "corpus"
@@ -36,10 +37,55 @@ VENDORED_PATH_SEGMENTS = (
 )
 
 
-def is_vendored_path(file_path: str) -> bool:
-    """True when the matched file is a vendored dependency, not authored code."""
-    normalised = "/" + file_path.replace("\\", "/").lstrip("/").lower()
-    return any(seg in normalised for seg in VENDORED_PATH_SEGMENTS)
+# The vendor's own package directory, as it appears once installed.
+VENDOR_PACKAGE_DIR: Dict[str, str] = {
+    "stripe": "stripe", "openai": "openai", "twilio": "twilio",
+    "plaid": "plaid", "discord": "discord",
+}
+
+# Compiled or bundled output. The author wrote the source, not this file, and
+# nobody can act on "line 823 of your minified chunk".
+_GENERATED_DIRS = frozenset({
+    ".next", "_next", "dist", "build", "unpacked", "out", "bundle",
+    "__pycache__", ".output", "generated", "coverage",
+})
+_GENERATED_FILE = re.compile(
+    r"^(bundle|vendors?|polyfills|runtime|main|chunk)[.\-_]?.*\.js$"
+    r"|^\d+\.js$"
+    r"|\.min\.js$"
+    r"|\.bundle\.js$",
+    re.I,
+)
+
+
+def is_vendored_path(file_path: str, vendor_key: str = "") -> bool:
+    """True when the matched file is a dependency copy, not authored code."""
+    clean = file_path.replace("\\", "/").lstrip("/")
+    normalised = "/" + clean.lower()
+    if any(seg in normalised for seg in VENDORED_PATH_SEGMENTS):
+        return True
+
+    # An SDK-internal module sitting in a directory named for the vendor's
+    # package is that package, wherever it was copied to. This is what catches
+    # `stripe/_payment_record.py`, `extracted/st/stripe/stripe/_payment_record.py`
+    # and `lambdas/print_shop/stripe/_payment_record.py`, none of which contain
+    # a site-packages or venv marker.
+    package = VENDOR_PACKAGE_DIR.get(vendor_key)
+    if package:
+        parts = clean.split("/")
+        directories, basename = parts[:-1], parts[-1]
+        if package in (d.lower() for d in directories) and basename.startswith("_"):
+            return True
+    return False
+
+
+def is_generated_path(file_path: str) -> bool:
+    """True for compiled, bundled or otherwise machine-produced files."""
+    clean = file_path.replace("\\", "/").lstrip("/")
+    parts = clean.split("/")
+    if any(d.lower() in _GENERATED_DIRS for d in parts[:-1]):
+        return True
+    return bool(_GENERATED_FILE.search(parts[-1]))
 
 # GitHub orgs each vendor controls. A hit here is the vendor's own code.
 VENDOR_ORGS: Dict[str, Tuple[str, ...]] = {
@@ -101,13 +147,15 @@ def classify(repo: str, vendor_key: str, file_path: str = "") -> Classification:
 
     # Check the path before the name: a vendored SDK inside an ordinary
     # application repo would otherwise be scored as that application's code.
-    if file_path and is_vendored_path(file_path):
-        segment = next(s for s in VENDORED_PATH_SEGMENTS
-                       if s in "/" + file_path.replace("\\", "/").lstrip("/").lower())
+    if file_path and is_vendored_path(file_path, vendor_key):
         return Classification(
             VENDORED,
-            f"matched inside `{segment.strip('/')}` — a vendored dependency, "
+            f"`{file_path}` is a copy of the {vendor_key} package, "
             f"not code the repo author wrote")
+    if file_path and is_generated_path(file_path):
+        return Classification(
+            GENERATED,
+            f"`{file_path}` is compiled or bundled output, not authored source")
 
     if owner_l in VENDOR_ORGS.get(vendor_key, ()):
         return Classification(VENDOR_OWNED, f"`{owner}` is a {vendor_key} org")
@@ -129,7 +177,8 @@ def classify(repo: str, vendor_key: str, file_path: str = "") -> Classification:
 def partition(leads: List[dict], vendor_key: str) -> Dict[str, List[dict]]:
     """Split leads into buckets, annotating each with why it landed there."""
     buckets: Dict[str, List[dict]] = {
-        INTEGRATOR: [], ECOSYSTEM: [], VENDOR_OWNED: [], CORPUS: [], VENDORED: [],
+        INTEGRATOR: [], ECOSYSTEM: [], VENDOR_OWNED: [], CORPUS: [],
+        VENDORED: [], GENERATED: [],
     }
     for lead in leads:
         result = classify(lead["repo"], vendor_key, lead.get("file", ""))

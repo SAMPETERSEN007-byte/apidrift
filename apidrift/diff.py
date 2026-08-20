@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
-from .loader import Field, Operation, Param, Spec
+from .loader import TRUNCATED, Field, Operation, Param, Spec
 
 BREAKING = "breaking"
 POTENTIALLY_BREAKING = "potentially_breaking"
@@ -85,15 +85,38 @@ class DiffResult:
 
 
 
-def _blind(path: str) -> str:
-    """Erase the identity of anonymous union arms.
+_ROOT_MARKER = re.compile(r"^<[^>]+>\.?")
+_SEGMENT = re.compile(r"[.\[<]")
 
-    An arm named for a real schema (`<Card>`) keeps its identity. One named by
-    a content fingerprint (`<enum-3410da5c>`) or a bare primitive (`<integer>`)
-    is anonymous: editing it renames it, so the name cannot be compared.
+
+def _segments(path: str) -> int:
+    """How many hops from the root this field path represents."""
+    return len([p for p in _SEGMENT.split(_strip_root_marker(path)) if p])
+
+
+def _strip_root_marker(path: str) -> str:
+    """Drop a leading `<Schema>` marker.
+
+    The root marker names the schema the whole body or response IS, not a field
+    inside it. When a vendor moves a request body from an inline schema to a
+    `$ref` — OpenAI did exactly this to `POST /batches` — the old side has
+    `completion_window` and the new side has `<CreateBatchRequest>.completion_window`.
+    Comparing those literally reports every field as removed AND as newly
+    required, which is a fabricated breaking change in both directions.
+    """
+    return _ROOT_MARKER.sub("", path, count=1)
+
+
+def _blind(path: str) -> str:
+    """Erase identity that is about the schema rather than about the field.
+
+    That means the root marker (see above) and anonymous union arms. An interior
+    arm named for a real schema (`<Card>`) keeps its identity, because there it
+    distinguishes which member of a union the field belongs to.
     """
     return _ARM.sub(
-        lambda m: m.group(0) if _is_nameable(m.group(1)) else "<*>", path
+        lambda m: m.group(0) if _is_nameable(m.group(1)) else "<*>",
+        _strip_root_marker(path),
     )
 
 
@@ -188,11 +211,36 @@ def _diff_fields(
     old_blind = {_blind(key) for key in old_fields}
     reshaped: Set[str] = set()
 
+    # Where either side stopped flattening, absence is ignorance, not deletion.
+    #
+    # Prefix matching alone is not enough. When one version nests one level
+    # deeper, the two sides truncate at different *paths*, so the deeper side's
+    # marker need not prefix the shallower side's field. The defensible rule is
+    # a depth bound: below the shallowest point where a side stopped looking,
+    # that side cannot support a claim about anything.
+    new_cut_depth = min((_segments(k) for k, v in new_fields.items()
+                         if v.type == TRUNCATED), default=None)
+    old_cut_depth = min((_segments(k) for k, v in old_fields.items()
+                         if v.type == TRUNCATED), default=None)
+
+    def _beyond(path: str, cut_depth: Optional[int]) -> bool:
+        return cut_depth is not None and _segments(path) >= cut_depth
+
     for name, f_old in old_fields.items():
+        if f_old.type == TRUNCATED:
+            continue  # a marker, not a field
         f_new = new_fields.get(name)
+        if f_new is not None and f_new.type == TRUNCATED:
+            continue  # the new side was not walked this far
+        if f_new is None and _beyond(name, new_cut_depth):
+            continue  # absent only because flattening stopped short
         if f_new is None:
             blind = _blind(name)
-            if blind != name and blind in new_blind:
+            # No `blind != name` guard: the marker may sit on the NEW side only,
+            # as it does when a body moves from an inline schema to a `$ref`.
+            # Reaching here already means `name` itself is absent from the new
+            # side, so a blind hit is always a different key reshaped.
+            if blind in new_blind:
                 parent = _synthetic_parent(name)
                 if parent in reshaped:
                     continue
@@ -225,6 +273,13 @@ def _diff_fields(
                         op, f"{where}_field_type_changed", BREAKING,
                         f"{label} field `{display}` changed shape",
                         subject=parent, old=f_old.type, new=counterpart.type,
+                    ))
+                # A reshape must not swallow a real tightening of the contract.
+                if where == "request" and not f_old.required and counterpart.required:
+                    out.append(_mk(
+                        op, "request_field_now_required", BREAKING,
+                        f"{label} field `{name}` became required",
+                        subject=name, old="optional", new="required",
                     ))
                 continue
             kind = "request_field_removed" if where == "request" else "response_field_removed"
@@ -274,10 +329,12 @@ def _diff_fields(
                 ))
 
     for name, f_new in new_fields.items():
-        if name in old_fields:
+        if f_new.type == TRUNCATED or name in old_fields:
             continue
-        if _blind(name) != name and _blind(name) in old_blind:
-            continue  # same arm, re-fingerprinted — already reported as a reshape
+        if _beyond(name, old_cut_depth):
+            continue  # the old side was not walked this far
+        if _blind(name) in old_blind:
+            continue  # same field reshaped or re-rooted — already accounted for
         if where == "request" and f_new.required:
             out.append(_mk(
                 op, "request_field_added_required", BREAKING,
@@ -290,6 +347,8 @@ def _diff_fields(
 def _diff_operation(old: Operation, new: Operation) -> List[Finding]:
     out: List[Finding] = []
     out.extend(_diff_params(old, new))
+    # Only the shallow, inline part of a body is compared here; anything named
+    # is handled exactly by the schema diff.
     out.extend(_diff_fields(old.request_fields, new.request_fields, new, "request"))
 
     if not old.request_required and new.request_required:
@@ -309,6 +368,10 @@ def _diff_operation(old: Operation, new: Operation) -> List[Finding]:
                     subject=status, old=status, new="<removed>",
                 ))
             continue
+        # Shallow only (MAX_DEPTH=2). Named schemas are handled exactly by the
+        # schema diff, and `collapse()` merges the two views because both reduce
+        # to the same root cause. What this still covers is an INLINE response
+        # body, which has no named schema for the other pass to find.
         out.extend(_diff_fields(old_resp, new_resp, new, "response", status))
 
     if set(new.security) - set(old.security):
@@ -382,6 +445,8 @@ def diff_specs(vendor: str, old: Spec, new: Spec, meta: Dict[str, str]) -> DiffR
     for key in sorted(old_keys & new_keys):
         findings.extend(_diff_operation(old.operations[key], new.operations[key]))
 
+    findings.extend(_diff_schema_views(old, new))
+
     old_servers, new_servers = set(old.servers), set(new.servers)
     if old_servers and new_servers and not (old_servers & new_servers):
         pseudo = Operation(path="/", method="get", operation_id=None,
@@ -448,6 +513,37 @@ def root_cause_key(subject: str) -> str:
     return _ARM.sub("", subject).replace("..", ".").strip(".") or subject
 
 
+# The same edit is seen twice: once as a schema definition change and once as
+# an inline body change on a route that reaches it. They are one finding.
+_KIND_CLASS = {
+    "schema_field_removed": "field_removed",
+    "response_field_removed": "field_removed",
+    "request_field_removed": "field_removed",
+    "schema_field_type_changed": "field_type_changed",
+    "response_field_type_changed": "field_type_changed",
+    "request_field_type_changed": "field_type_changed",
+    "schema_field_now_required": "field_now_required",
+    "request_field_now_required": "field_now_required",
+    "schema_field_added_required": "field_added_required",
+    "request_field_added_required": "field_added_required",
+    "schema_enum_value_removed": "enum_value_removed",
+    "request_enum_value_removed": "enum_value_removed",
+    "response_enum_value_removed": "enum_value_removed",
+    "schema_enum_value_added": "enum_value_added",
+    "response_enum_value_added": "enum_value_added",
+    "schema_field_now_nullable": "field_now_nullable",
+    "response_field_now_nullable": "field_now_nullable",
+}
+
+# When two views of one change merge, the schema view is the authoritative one:
+# its reachability comes from a graph walk rather than from one route.
+_SCHEMA_KINDS = frozenset(k for k in _KIND_CLASS if k.startswith("schema_"))
+
+
+def _kind_class(kind: str) -> str:
+    return _KIND_CLASS.get(kind, kind)
+
+
 def collapse(findings: List[Finding], max_ops: int = 200) -> List[Finding]:
     """Group findings that share one root cause into a single finding.
 
@@ -458,7 +554,8 @@ def collapse(findings: List[Finding], max_ops: int = 200) -> List[Finding]:
     groups: Dict[Tuple[str, str, str, str], List[Finding]] = {}
     order: List[Tuple[str, str, str, str]] = []
     for finding in findings:
-        key = (finding.kind, root_cause_key(finding.subject), finding.old, finding.new)
+        key = (_kind_class(finding.kind), root_cause_key(finding.subject),
+               "", "")
         if key not in groups:
             groups[key] = []
             order.append(key)
@@ -469,15 +566,20 @@ def collapse(findings: List[Finding], max_ops: int = 200) -> List[Finding]:
         members = groups[key]
         # Keep the shortest path as representative: it is the most direct route
         # to the changed schema and reads best in a report.
-        rep = min(members, key=lambda f: (len(f.subject), f.op_key))
-        rep.occurrences = len(members)
+        # Prefer the schema view: its op list is a graph walk, not one route.
+        rep = min(members, key=lambda f: (f.kind not in _SCHEMA_KINDS,
+                                          len(f.subject), f.op_key))
+        rep.occurrences = max(len(members), rep.occurrences)
         rep.root_cause = key[1]
         # `occurrences` counts distinct paths through the spec that reach this
         # change; several of them can land on the same operation. Reporting the
         # occurrence count as an operation count produced "853 operations" for
         # a spec containing 589, which is wrong on its face.
         distinct_ops = {m.op_key for m in members}
-        rep.affected_op_count = len(distinct_ops)
+        for member in members:
+            distinct_ops.update(member.affected_ops or ())
+        # Never shrink a count that reachability already established.
+        rep.affected_op_count = max(len(distinct_ops), rep.affected_op_count)
         rep.affected_ops = sorted(distinct_ops)[:max_ops]
         if len(distinct_ops) > 1:
             rep.detail = f"{rep.detail} — affects {len(distinct_ops)} operations"
@@ -486,3 +588,99 @@ def collapse(findings: List[Finding], max_ops: int = 200) -> List[Finding]:
                           f"1 operation")
         collapsed.append(rep)
     return collapsed
+
+
+# ---------------------------------------------------------------------------
+# Schema-level diffing
+#
+# This replaces deep response-path expansion, which could not be made reliable:
+# on Stripe ~45% of the tree is truncated at any depth, and the two sides
+# truncate at different points, so most "removed field" findings were really
+# "we stopped looking here but not there". A named schema has one definition,
+# so comparing definitions is exact.
+# ---------------------------------------------------------------------------
+
+def _schema_op(name: str) -> Operation:
+    """A carrier so schema findings reuse the Finding shape."""
+    return Operation(path=f"#/components/schemas/{name}", method="get",
+                     operation_id=name, summary="", deprecated=False)
+
+
+def _diff_schema_views(old: Spec, new: Spec) -> List[Finding]:
+    out: List[Finding] = []
+
+    for name in sorted(set(old.schemas) - set(new.schemas)):
+        view = old.schemas[name]
+        ops = old.reachable.get(name, [])
+        op = _schema_op(name)
+        if ops:
+            op.path = ops[0].partition(" ")[2] or op.path
+            op.method = (ops[0].partition(" ")[0] or "get").lower()
+        finding = _mk(
+            op, "schema_removed", BREAKING,
+            f"schema `{name}` was removed from the spec",
+            subject=name, old=f"{len(view.fields)} fields", new="<removed>",
+        )
+        finding.root_cause = name
+        finding.affected_ops = ops[:200]
+        finding.affected_op_count = len(ops)
+        finding.occurrences = len(ops) or 1
+        out.append(finding)
+
+    for name in sorted(set(old.schemas) & set(new.schemas)):
+        before, after = old.schemas[name], new.schemas[name]
+        ops = new.reachable.get(name, []) or old.reachable.get(name, [])
+        carrier = _schema_op(name)
+        if ops:
+            carrier.path = ops[0].partition(" ")[2] or carrier.path
+            carrier.method = (ops[0].partition(" ")[0] or "get").lower()
+
+        def emit(kind: str, severity: str, detail: str, subject: str,
+                 old_value: str, new_value: str) -> None:
+            finding = _mk(carrier, kind, severity, detail, subject=subject,
+                          old=old_value, new=new_value)
+            finding.root_cause = subject
+            finding.affected_ops = ops[:200]
+            finding.affected_op_count = len(ops)
+            finding.occurrences = len(ops) or 1
+            out.append(finding)
+
+        for field_name, was in before.fields.items():
+            now = after.fields.get(field_name)
+            subject = f"{name}.{field_name}"
+            if now is None:
+                emit("schema_field_removed", BREAKING,
+                     f"`{subject}` was removed from the schema",
+                     subject, was.signature(), "<removed>")
+                continue
+            if was.type != now.type:
+                emit("schema_field_type_changed", BREAKING,
+                     f"`{subject}` changed type", subject, was.type, now.type)
+            if not was.required and now.required:
+                emit("schema_field_now_required", BREAKING,
+                     f"`{subject}` became required", subject, "optional", "required")
+            if was.enum and now.enum:
+                dropped = sorted(set(was.enum) - set(now.enum))
+                added = sorted(set(now.enum) - set(was.enum))
+                if dropped:
+                    emit("schema_enum_value_removed", BREAKING,
+                         f"`{subject}` no longer allows: {', '.join(dropped)}",
+                         subject, "|".join(was.enum), "|".join(now.enum))
+                if added:
+                    emit("schema_enum_value_added", POTENTIALLY_BREAKING,
+                         f"`{subject}` gained values: {', '.join(added)} "
+                         f"(exhaustive switches will fall through)",
+                         subject, "|".join(was.enum), "|".join(now.enum))
+            if not was.nullable and now.nullable:
+                emit("schema_field_now_nullable", POTENTIALLY_BREAKING,
+                     f"`{subject}` became nullable", subject, "non-null", "nullable")
+
+        for field_name, now in after.fields.items():
+            if field_name in before.fields:
+                continue
+            if now.required:
+                subject = f"{name}.{field_name}"
+                emit("schema_field_added_required", BREAKING,
+                     f"schema `{name}` gained required field `{field_name}`",
+                     subject, "<absent>", now.signature())
+    return out

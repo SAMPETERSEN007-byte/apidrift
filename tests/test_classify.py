@@ -7,8 +7,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from apidrift.classify import (CORPUS, ECOSYSTEM, INTEGRATOR, VENDOR_OWNED,
-                               VENDORED, classify, dedupe_by_repo,
+from apidrift.classify import (CORPUS, ECOSYSTEM, GENERATED, INTEGRATOR,
+                               VENDOR_OWNED, VENDORED, classify,
+                               dedupe_by_repo, is_generated_path,
                                is_vendored_path, partition)
 
 
@@ -94,6 +95,72 @@ class TestVendoredPaths(unittest.TestCase):
         result = classify("someone/app", "stripe", "app/services/billing.py")
         self.assertEqual(result.kind, INTEGRATOR)
         self.assertTrue(result.is_outreach_target)
+
+
+class TestVendorPackageModules(unittest.TestCase):
+    """An SDK module keeps its identity wherever it was copied to.
+
+    These four real paths carry no site-packages, venv or layer marker, so the
+    directory-segment filter alone let all four through as customer code.
+    """
+
+    COPIES = (
+        "stripe/_payment_record.py",
+        "extracted/st/stripe/stripe/_payment_record.py",
+        "lambdas/print_shop/stripe/_payment_record.py",
+        "layers/common/python/stripe/_payment_record 2.py",
+    )
+    AUTHORED = (
+        ".claude/skills/stripe/query.mjs",   # their own skill, in a stripe/ dir
+        "02 Business/07 Payment/stripe/query.mjs",
+        "src/stripe.js",                      # their own wrapper
+        "lnbits/fiat/stripe.py",
+    )
+
+    def test_sdk_internal_modules_are_vendored(self):
+        for path in self.COPIES:
+            with self.subTest(path=path):
+                self.assertTrue(is_vendored_path(path, "stripe"))
+                self.assertEqual(classify("someone/app", "stripe", path).kind, VENDORED)
+
+    def test_author_files_in_a_vendor_named_dir_are_kept(self):
+        for path in self.AUTHORED:
+            with self.subTest(path=path):
+                self.assertFalse(is_vendored_path(path, "stripe"))
+                self.assertEqual(classify("someone/app", "stripe", path).kind, INTEGRATOR)
+
+    def test_rule_needs_the_vendor_key(self):
+        # Without knowing whose package it is, the leading underscore alone
+        # must not condemn a file.
+        self.assertFalse(is_vendored_path("stripe/_payment_record.py", ""))
+
+
+class TestGeneratedOutput(unittest.TestCase):
+    """Nobody can act on a line number inside a minified chunk."""
+
+    BUILT = (
+        "unpacked/_next/static/chunks/131.js",
+        ".next/server/chunks/5285.js",
+        "public/js/bundle.js",
+        "dist/main.min.js",
+        "build/vendors.js",
+    )
+    SOURCE = ("src/stripe.js", "api/stripe.js", "server/apis/stripe.js")
+
+    def test_build_output_is_detected(self):
+        for path in self.BUILT:
+            with self.subTest(path=path):
+                self.assertTrue(is_generated_path(path))
+
+    def test_source_files_are_not_flagged(self):
+        for path in self.SOURCE:
+            with self.subTest(path=path):
+                self.assertFalse(is_generated_path(path))
+
+    def test_generated_files_are_not_outreach_targets(self):
+        result = classify("someone/app", "stripe", ".next/server/chunks/5285.js")
+        self.assertEqual(result.kind, GENERATED)
+        self.assertFalse(result.is_outreach_target)
 
 
 class TestPartitionAndDedupe(unittest.TestCase):

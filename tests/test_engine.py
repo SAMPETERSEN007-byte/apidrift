@@ -126,10 +126,16 @@ class TestBreakingDetection(unittest.TestCase):
         self.new["paths"]["/charges"]["get"]["parameters"][1]["schema"]["enum"] = ["paid", "pending"]
         self.assertIn("request_enum_value_removed", kinds(run(self.old, self.new)))
 
-    def test_response_field_removed_through_ref(self):
+    def test_field_removed_from_a_named_schema(self):
         del self.new["components"]["schemas"]["Card"]["properties"]["iin"]
-        result = run(self.old, self.new)
-        self.assertIn("response_field_removed", kinds(result))
+        self.assertIn("schema_field_removed", kinds(run(self.old, self.new)))
+
+    def test_field_removed_from_an_inline_response(self):
+        """No named schema exists here, so only the route pass can catch it."""
+        body = self.new["paths"]["/charges"]["get"]["responses"]["200"][
+            "content"]["application/json"]["schema"]
+        del body["properties"]["currency"]
+        self.assertIn("response_field_removed", kinds(run(self.old, self.new)))
 
     def test_response_field_type_changed(self):
         self.new["paths"]["/charges"]["get"]["responses"]["200"]["content"][
@@ -245,43 +251,216 @@ class TestAnonymousArmReshape(unittest.TestCase):
         self.assertNotIn("response_field_removed", found)
 
 
+class TestInlineToRefMove(unittest.TestCase):
+    """Moving a request body from an inline schema to a `$ref` changes nothing.
+
+    Regression: OpenAI moved `POST /batches` to `$ref: CreateBatchRequest`, and
+    every already-required field was reported BOTH as removed and as newly
+    required. Five fabricated breaking changes on one endpoint.
+    """
+
+    def setUp(self):
+        self.old = copy.deepcopy(BASE)
+        self.new = copy.deepcopy(BASE)
+        self.new["components"]["schemas"]["CreateChargeRequest"] = {
+            "type": "object",
+            "properties": {"amount": {"type": "integer"}, "note": {"type": "string"}},
+            "required": ["amount"],
+        }
+        self.new["paths"]["/charges"]["post"]["requestBody"]["content"][
+            "application/json"]["schema"] = {
+                "$ref": "#/components/schemas/CreateChargeRequest"}
+
+    def test_inlining_to_a_ref_produces_no_findings(self):
+        result = run(self.old, self.new)
+        self.assertEqual(result.findings, [],
+                         f"unchanged contract produced {[f.kind for f in result.findings]}")
+
+    def test_a_real_tightening_still_surfaces_across_the_move(self):
+        self.new["components"]["schemas"]["CreateChargeRequest"]["required"] = [
+            "amount", "note"]
+        found = {f.kind for f in run(self.old, self.new).findings}
+        self.assertIn("request_field_now_required", found,
+                      "the ref move must not swallow a genuine new requirement")
+
+    def test_a_real_removal_still_surfaces_across_the_move(self):
+        del self.new["components"]["schemas"]["CreateChargeRequest"]["properties"]["note"]
+        found = {f.kind for f in run(self.old, self.new).findings}
+        self.assertTrue(found, "removing a field across the move must be reported")
+
+
+class TestDepthTruncation(unittest.TestCase):
+    """Absence past the depth cap is ignorance, not deletion.
+
+    Regression: at MAX_DEPTH=6 Stripe's terminal-reader response flattened to
+    571 fields on the old side and 208 on the new, because the new schema nests
+    one level deeper along the same paths. Every field past the cap read as
+    removed, and a random-sample audit refuted 39 of 44 `response_field_removed`
+    findings on this alone. All four real paths were identical on both sides.
+    """
+
+    @staticmethod
+    def _chain(levels, extra_at=None):
+        """A `down.down.…` chain, optionally carrying a second property."""
+        node = {"type": "object", "properties": {"leaf": {"type": "string"}}}
+        for level in range(levels):
+            props = {"down": node}
+            if extra_at == level:
+                props["extra"] = {"type": "string"}
+            node = {"type": "object", "properties": props}
+        return node
+
+    def _build(self, levels, extra_at=None):
+        doc = copy.deepcopy(BASE)
+        doc["paths"]["/refunds/{id}"]["get"]["responses"]["200"]["content"][
+            "application/json"]["schema"] = self._chain(levels, extra_at)
+        return doc
+
+    def test_deep_absence_is_not_reported_as_removal(self):
+        # Identical deep chains; the old side alone carries `extra` far below
+        # the point where flattening stops. Nothing can be concluded there.
+        old = self._build(9, extra_at=1)
+        new = self._build(9)
+        removals = [f for f in run(old, new).findings
+                    if f.kind == "response_field_removed"]
+        self.assertEqual(removals, [],
+                         f"claimed {len(removals)} removals past the depth cap")
+
+    def test_the_reverse_direction_is_also_safe(self):
+        old = self._build(9)
+        new = self._build(9, extra_at=1)
+        added = [f for f in run(old, new).findings
+                 if f.kind.endswith("added_required")]
+        self.assertEqual(added, [])
+
+    def test_a_shallow_removal_is_still_caught(self):
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        del new["components"]["schemas"]["Card"]["properties"]["iin"]
+        found = {f.kind for f in run(old, new).findings}
+        self.assertIn("schema_field_removed", found,
+                      "the truncation guard must not suppress real removals")
+
+    def test_truncation_markers_never_become_findings(self):
+        old = self._build(9)
+        new = self._build(12)
+        for finding in run(old, new).findings:
+            self.assertNotIn("__truncated__", f"{finding.old}{finding.new}",
+                             "a truncation marker leaked into a finding")
+
+
+class TestReachability(unittest.TestCase):
+    """A schema is visible from an operation that reaches it indirectly."""
+
+    def _doc(self):
+        doc = copy.deepcopy(BASE)
+        doc["components"]["schemas"]["Wallet"] = {
+            "type": "object",
+            "properties": {"primary": {"$ref": "#/components/schemas/Card"}},
+        }
+        doc["paths"]["/wallets"] = {"get": {
+            "operationId": "listWallets",
+            "responses": {"200": {"content": {"application/json": {
+                "schema": {"$ref": "#/components/schemas/Wallet"}}}}}}}
+        return doc
+
+    def test_transitive_reference_is_reachable(self):
+        # GET /wallets names only Wallet, and Wallet names Card.
+        reach = spec(self._doc()).reachable
+        self.assertIn("GET /wallets", reach["Card"],
+                      "Card must be reachable through Wallet")
+        self.assertIn("GET /wallets", reach["Wallet"])
+
+    def test_a_cycle_terminates_and_does_not_double_count(self):
+        doc = self._doc()
+        # Card points back at Wallet: the graph now has a cycle.
+        doc["components"]["schemas"]["Card"]["properties"]["wallet"] = {
+            "$ref": "#/components/schemas/Wallet"}
+        reach = spec(doc).reachable
+        self.assertIn("GET /wallets", reach["Card"])
+        self.assertEqual(len(reach["Card"]), len(set(reach["Card"])),
+                         "operations must not be listed twice")
+
+    def test_an_unreferenced_schema_reaches_nothing(self):
+        doc = copy.deepcopy(BASE)
+        doc["components"]["schemas"]["Orphan"] = {
+            "type": "object", "properties": {"x": {"type": "string"}}}
+        self.assertEqual(spec(doc).reachable.get("Orphan", []), [])
+
+
+class TestCollapseCounting(unittest.TestCase):
+    """`affected_ops` is capped for output size; the COUNT must not be."""
+
+    def test_a_capped_op_list_does_not_shrink_the_count(self):
+        from apidrift.diff import Finding
+        wide = Finding(
+            kind="schema_field_removed", severity=BREAKING,
+            op_key="GET /a", path="/a", method="get", detail="x",
+            subject="Card.iin", root_cause="Card.iin",
+            affected_ops=[f"GET /op{i}" for i in range(200)],
+            affected_op_count=589,          # reachability found far more
+        )
+        collapsed = collapse([wide])[0]
+        self.assertEqual(collapsed.affected_op_count, 589,
+                         "the stored list is truncated, the count is not")
+
+    def test_the_count_never_undercounts_merged_members(self):
+        from apidrift.diff import Finding
+        members = [
+            Finding(kind="schema_field_removed", severity=BREAKING,
+                    op_key=f"GET /op{i}", path=f"/op{i}", method="get",
+                    detail="x", subject="Card.iin", root_cause="Card.iin")
+            for i in range(4)
+        ]
+        collapsed = collapse(members)[0]
+        self.assertEqual(collapsed.affected_op_count, 4)
+
+
+class TestUnionArmNaming(unittest.TestCase):
+    """Arm identity must not depend on arm order.
+
+    With schema diffing carrying most of the load this is no longer visible
+    through a whole-spec diff, so the contract is asserted directly rather than
+    left to a test that would pass either way.
+    """
+
+    @staticmethod
+    def _flatten(arms):
+        from apidrift.loader import Resolver, flatten_schema
+        doc = {"components": {"schemas": {
+            "A": {"type": "object", "properties": {"x": {"type": "string"}}},
+            "B": {"type": "object", "properties": {"y": {"type": "string"}}},
+            "C": {"type": "object", "properties": {"z": {"type": "string"}}},
+        }}}
+        schema = {"anyOf": [{"$ref": f"#/components/schemas/{a}"} for a in arms]}
+        return set(flatten_schema(schema, Resolver(doc), "root"))
+
+    def test_arm_paths_are_independent_of_order(self):
+        self.assertEqual(self._flatten(["A", "B"]), self._flatten(["B", "A"]))
+
+    def test_inserting_an_arm_leaves_the_others_untouched(self):
+        before = self._flatten(["A", "B"])
+        after = self._flatten(["C", "A", "B"])
+        self.assertTrue(before.issubset(after),
+                        "inserting an arm rewrote the paths of its siblings")
+
+
 class TestRootCauseCollapse(unittest.TestCase):
     def test_shared_schema_change_collapses_to_one_finding(self):
+        """One edit seen as a schema change and as a route change is one finding."""
         old = copy.deepcopy(BASE)
         new = copy.deepcopy(BASE)
-        # Card is reachable from GET /charges (via anyOf) and POST /charges.
         del new["components"]["schemas"]["Card"]["properties"]["iin"]
         raw = diff_specs("test", spec(old), spec(new), {})
-        raw_removals = [f for f in raw.findings if f.kind == "response_field_removed"]
-        collapsed = [f for f in collapse(raw.findings) if f.kind == "response_field_removed"]
-        self.assertGreater(len(raw_removals), 1, "fixture must fan out to prove collapsing")
+        removals_raw = [f for f in raw.findings
+                        if f.kind.endswith("field_removed")]
+        collapsed = [f for f in collapse(raw.findings)
+                     if f.kind.endswith("field_removed")]
+        self.assertGreater(len(removals_raw), 1,
+                           "fixture must produce both views to prove merging")
         self.assertEqual(len(collapsed), 1)
-        self.assertEqual(collapsed[0].occurrences, len(raw_removals))
         self.assertEqual(collapsed[0].root_cause, "Card.iin")
         self.assertEqual(collapsed[0].severity, BREAKING,
-                         "losing a response field breaks every consumer reading it")
-
-    def test_operation_count_is_distinct_operations_not_occurrences(self):
-        """853 "operations" in a 589-operation spec was an occurrence count."""
-        old = copy.deepcopy(BASE)
-        new = copy.deepcopy(BASE)
-        # Two union routes to Card inside the SAME operation, plus one in another.
-        for doc in (old, new):
-            doc["paths"]["/charges"]["get"]["responses"]["200"]["content"][
-                "application/json"]["schema"]["properties"]["fallback"] = {
-                    "anyOf": [{"$ref": "#/components/schemas/Card"},
-                              {"$ref": "#/components/schemas/Bank"}]}
-        del new["components"]["schemas"]["Card"]["properties"]["iin"]
-        raw = diff_specs("test", spec(old), spec(new), {})
-        collapsed = [f for f in collapse(raw.findings)
-                     if f.root_cause == "Card.iin"][0]
-        distinct = len({f.op_key for f in raw.findings
-                        if f.kind == "response_field_removed"})
-        self.assertGreater(collapsed.occurrences, collapsed.affected_op_count,
-                           "fixture must have more routes than operations")
-        self.assertEqual(collapsed.affected_op_count, distinct)
-        self.assertIn(f"{distinct} operations", collapsed.detail)
-        self.assertNotIn(f"{collapsed.occurrences} operations", collapsed.detail)
+                         "losing a field breaks every consumer reading it")
 
     def test_root_cause_key_is_route_independent(self):
         self.assertEqual(root_cause_key("error.source<Card>.iin"), "Card.iin")

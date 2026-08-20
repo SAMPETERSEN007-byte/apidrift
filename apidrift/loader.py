@@ -19,7 +19,14 @@ HTTP_METHODS = ("get", "put", "post", "delete", "options", "head", "patch", "tra
 # Depth cap for $ref expansion. Real specs (Stripe) have schemas that nest far
 # deeper than any consumer meaningfully depends on, and expanding them fully is
 # quadratic. 6 covers `data[].object.nested.field` style access.
-MAX_DEPTH = 6
+MAX_DEPTH = 2
+
+# Marker type for a subtree the flattener stopped short of. It has to be
+# recorded rather than silently dropped: if one version nests one level deeper
+# than the other, everything past the cap on the deeper side simply vanishes,
+# and a diff reads that absence as deletion. That single asymmetry produced
+# most of Stripe's "removed response field" findings.
+TRUNCATED = "__truncated__"
 
 
 class SpecParseError(Exception):
@@ -82,6 +89,8 @@ class Spec:
     servers: Tuple[str, ...]
     operations: Dict[str, Operation]
     security_schemes: Dict[str, str]
+    schemas: Dict[str, "SchemaView"] = field(default_factory=dict)
+    reachable: Dict[str, List[str]] = field(default_factory=dict)
 
     @property
     def op_count(self) -> int:
@@ -259,7 +268,11 @@ def flatten_schema(
     actually accesses it.
     """
     out: Dict[str, Field] = {}
-    if depth > MAX_DEPTH or schema is None:
+    if schema is None:
+        return out
+    if depth > MAX_DEPTH:
+        if prefix:
+            out[prefix] = Field(type=TRUNCATED, required=required, nullable=False)
         return out
     # A response/body that is a bare `$ref` still belongs to a named schema.
     # Seeding the prefix with that name lets one edit to a shared schema group
@@ -453,10 +466,159 @@ def load_spec(raw: bytes, filename: str) -> Spec:
             )
             operations[op.key] = op
 
+    views = build_schema_views(doc)
     return Spec(
         version=version,
         title=title,
         servers=tuple(servers),
         operations=operations,
         security_schemes=security_schemes,
+        schemas=views,
+        reachable=reachable_operations(views, operation_schema_roots(doc)),
     )
+
+
+# ---------------------------------------------------------------------------
+# Schema-level view
+#
+# Flattening an operation's response into deep dotted paths cannot work on a
+# spec whose schema graph is effectively unbounded: measured on Stripe, ~45% of
+# the tree is truncated at every depth from 6 to 9, and doubling the cap only
+# doubles the cost. Worse, the two sides truncate at different points, so the
+# difference between them is dominated by where the walk stopped rather than by
+# what the vendor changed.
+#
+# A named schema, by contrast, has exactly one definition. Comparing those
+# definitions one level deep is exact, and reachability -- which operations a
+# schema is visible from -- is a graph walk with a visited set, so it is linear
+# rather than exponential and needs no cap at all.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SchemaView:
+    """One named schema, resolved one level deep."""
+    name: str
+    fields: Dict[str, Field]
+    required: Tuple[str, ...]
+    refs: Tuple[str, ...]          # schemas this one references, directly
+    kind: str                      # object | array | enum | primitive | union
+
+
+def _ref_name(node: Any) -> Optional[str]:
+    if isinstance(node, dict):
+        ref = node.get("$ref")
+        if isinstance(ref, str) and "/" in ref:
+            return ref.rsplit("/", 1)[-1]
+    return None
+
+
+def _direct_refs(node: Any, depth: int = 0) -> List[str]:
+    """Every schema name referenced inside `node`, without following them."""
+    out: List[str] = []
+    if depth > 8 or not isinstance(node, (dict, list)):
+        return out
+    if isinstance(node, list):
+        for item in node:
+            out.extend(_direct_refs(item, depth + 1))
+        return out
+    name = _ref_name(node)
+    if name:
+        out.append(name)
+        return out
+    for value in node.values():
+        out.extend(_direct_refs(value, depth + 1))
+    return out
+
+
+def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
+    """One entry per named schema, with its own properties resolved one level."""
+    raw = ((doc.get("components") or {}).get("schemas")
+           or doc.get("definitions") or {})
+    if not isinstance(raw, dict):
+        return {}
+    resolver = Resolver(doc)
+    views: Dict[str, SchemaView] = {}
+
+    for name, schema in raw.items():
+        if not isinstance(schema, dict):
+            continue
+        merged = _merge_all_of(schema, resolver, set()) if "allOf" in schema else schema
+        stype = _type_of(merged)
+        required = tuple(sorted(str(r) for r in (merged.get("required") or [])))
+        fields: Dict[str, Field] = {}
+
+        props = merged.get("properties")
+        if isinstance(props, dict):
+            for prop_name, prop in props.items():
+                # One level only: the property's own type, plus the name of the
+                # schema it points at. Following it is the graph walk's job.
+                target = _ref_name(prop)
+                resolved, _ = resolver.resolve(prop, None) if not target else (prop, None)
+                node = prop if target else (resolved if isinstance(resolved, dict) else {})
+                fields[str(prop_name)] = Field(
+                    type=(f"->{target}" if target else _type_of(node)),
+                    required=str(prop_name) in required,
+                    nullable=_is_nullable(node) if isinstance(node, dict) else False,
+                    enum=_enum_of(node) if isinstance(node, dict) else None,
+                )
+
+        views[str(name)] = SchemaView(
+            name=str(name),
+            fields=fields,
+            required=required,
+            refs=tuple(sorted(set(_direct_refs(schema)))),
+            kind=stype,
+        )
+    return views
+
+
+def operation_schema_roots(doc: Dict[str, Any]) -> Dict[str, List[str]]:
+    """op_key -> schema names its request or responses reference directly."""
+    out: Dict[str, List[str]] = {}
+    paths = doc.get("paths")
+    if not isinstance(paths, dict):
+        return out
+    for path, item in paths.items():
+        if not isinstance(item, dict):
+            continue
+        for method in HTTP_METHODS:
+            op = item.get(method)
+            if not isinstance(op, dict):
+                continue
+            names = set(_direct_refs(op.get("requestBody")))
+            names |= set(_direct_refs(op.get("responses")))
+            names |= set(_direct_refs(op.get("parameters")))
+            if names:
+                out[f"{method.upper()} {path}"] = sorted(names)
+    return out
+
+
+def reachable_operations(
+    views: Dict[str, SchemaView], roots: Dict[str, List[str]],
+) -> Dict[str, List[str]]:
+    """schema name -> operations from which it is reachable.
+
+    A breadth-first walk per operation, each with its own visited set. That is
+    linear in the graph and terminates on cycles, which is exactly what path
+    flattening could not do.
+
+    Memoising a per-schema closure was tried and is WRONG here: when the walk
+    cuts a cycle it returns a result that depended on the current stack, and
+    caching that under the node's name poisons every later lookup. `Card` in a
+    Wallet/Card cycle came back reachable from nothing.
+    """
+    out: Dict[str, set] = {}
+    for op_key, names in roots.items():
+        seen: set = set()
+        queue = list(names)
+        while queue:
+            name = queue.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            view = views.get(name)
+            if view:
+                queue.extend(ref for ref in view.refs if ref not in seen)
+        for name in seen:
+            out.setdefault(name, set()).add(op_key)
+    return {k: sorted(v) for k, v in out.items()}
