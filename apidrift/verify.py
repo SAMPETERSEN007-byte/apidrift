@@ -341,7 +341,9 @@ def _named_identifier(finding: Finding) -> str:
     # Only a name a caller could plausibly write. A status code, a version
     # string or a path fragment is not something to demand appear in the
     # source: a caller of `/bulk-ban` never writes "204".
-    if not leaf[0].isalpha() or not leaf.replace("_", "").isalnum():
+    # Hyphens are legal in schema names (`Conversation-2`), and skipping them
+    # let three test files pass on a `/responses` prefix alone.
+    if not leaf[0].isalpha() or not leaf.replace("_", "").replace("-", "").isalnum():
         return ""
     if leaf.lower() in {"id", "type", "name", "url", "data", "status"}:
         return ""

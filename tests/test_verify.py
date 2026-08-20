@@ -455,3 +455,23 @@ class TestIdentifierGateScope(unittest.TestCase):
         f = finding(subject="GuildChannelResponse.icon_emoji")
         f.root_cause = "GuildChannelResponse.icon_emoji"
         self.assertEqual(_named_identifier(f), "icon_emoji")
+
+
+class TestHyphenatedIdentifiers(unittest.TestCase):
+    def test_a_hyphenated_schema_name_is_demanded(self):
+        from apidrift.verify import _named_identifier
+        f = finding(kind="schema_removed", subject="Conversation-2")
+        f.root_cause = "Conversation-2"
+        self.assertEqual(_named_identifier(f), "Conversation-2")
+
+    def test_a_file_that_never_names_it_is_rejected(self):
+        f = finding(kind="schema_removed", subject="Conversation-2",
+                    path="/responses")
+        f.root_cause = "Conversation-2"
+        source = ('import openai\n'
+                  'def t():\n'
+                  '    return client.post("/responses", json={})\n')
+        verdict, reason, _, _ = verify_source(source, "test_x.py", f,
+                                              get("openai"))
+        self.assertEqual(verdict, NO_SITE)
+        self.assertIn("never names", reason)

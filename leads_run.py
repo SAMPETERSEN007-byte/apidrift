@@ -79,10 +79,13 @@ def main() -> int:
                 if verdict.is_lead:
                     record = verdict.as_dict()
                     record["vendor"] = vendor.key
+                    # A bare status code or pseudo-subject says nothing; name
+                    # the operation instead.
+                    uninformative = (key in ("security", "server", "operation")
+                                     or not key[:1].isalpha())
                     record["breaks_on"] = (
                         f"{finding.kind} on {finding.method.upper()} {finding.path}"
-                        if key in ("security", "server", "operation")
-                        else key)
+                        if uninformative else key)
                     record["change"] = finding.detail
                     vendor_leads.append(record)
                     leads.append(record)

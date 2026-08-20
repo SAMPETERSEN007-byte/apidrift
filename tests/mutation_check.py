@@ -353,7 +353,7 @@ MUTATIONS = [
     (
         "identifier gate demands status codes and path fragments too",
         "apidrift/verify.py",
-        "    if not leaf[0].isalpha() or not leaf.replace(\"_\", \"\").isalnum():\n        return \"\"",
+        "    if not leaf[0].isalpha() or not leaf.replace(\"_\", \"\").replace(\"-\", \"\").isalnum():\n        return \"\"",
         "    if False:\n        return \"\"",
         ["test_a_status_code_is_not_demanded", "test_the_actual_route_still_matches"],
     ),
