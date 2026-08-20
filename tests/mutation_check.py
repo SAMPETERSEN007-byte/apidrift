@@ -358,6 +358,13 @@ MUTATIONS = [
         ["test_a_status_code_is_not_demanded", "test_the_actual_route_still_matches"],
     ),
     (
+        "type names matched case-insensitively again",
+        "apidrift/verify.py",
+        "    if identifier[:1].isupper():\n        return identifier in source",
+        "    if False:\n        return identifier in source",
+        ["test_a_type_name_must_match_case"],
+    ),
+    (
         "signature builder drops the field name",
         "apidrift/signatures.py",
         "        if leaf and not leaf.startswith(\"<\"):",

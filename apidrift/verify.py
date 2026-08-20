@@ -351,8 +351,20 @@ def _named_identifier(finding: Finding) -> str:
 
 
 def _identifier_present(source: str, identifier: str) -> bool:
-    """Does the identifier occur in any common casing convention?"""
+    """Does the identifier occur in the source?
+
+    A PascalCase name is a TYPE name, and generated clients carry it verbatim.
+    Matching it case-insensitively is too loose: OpenAI has a schema called
+    `Conversation-2`, and `conversation-2` is also an entirely ordinary test
+    fixture string. Three leads were three test files using it as sample data.
+
+    A snake_case field name has no such collision problem, and different
+    languages case it differently, so those are matched across conventions.
+    """
     parts = [p for p in _IDENT_SPLIT.split(identifier) if p]
+    if identifier[:1].isupper():
+        return identifier in source
+
     snake = "_".join(p.lower() for p in parts)
     camel = parts[0].lower() + "".join(p.capitalize() for p in parts[1:])
     pascal = "".join(p.capitalize() for p in parts)

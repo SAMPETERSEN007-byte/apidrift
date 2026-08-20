@@ -475,3 +475,25 @@ class TestHyphenatedIdentifiers(unittest.TestCase):
                                               get("openai"))
         self.assertEqual(verdict, NO_SITE)
         self.assertIn("never names", reason)
+
+
+class TestIdentifierCasing(unittest.TestCase):
+    """A type name is carried verbatim; a field name is not."""
+
+    def test_a_type_name_must_match_case(self):
+        from apidrift.verify import _identifier_present
+        self.assertTrue(_identifier_present('x = Conversation-2', "Conversation-2"))
+        self.assertFalse(
+            _identifier_present('cid = "conversation-2"', "Conversation-2"),
+            "lowercase test-fixture data is not a use of the schema")
+
+    def test_a_field_name_matches_across_conventions(self):
+        from apidrift.verify import _identifier_present
+        for text in ('x.safety_identifier', 'x.safetyIdentifier',
+                     '"SafetyIdentifier"', "'safety-identifier'"):
+            with self.subTest(text=text):
+                self.assertTrue(_identifier_present(text, "safety_identifier"))
+
+    def test_an_absent_field_is_absent(self):
+        from apidrift.verify import _identifier_present
+        self.assertFalse(_identifier_present("x.other_thing", "safety_identifier"))
