@@ -72,6 +72,8 @@ def analyse(vendor: Vendor, cache_dir: Path, since: str, fetch: bool) -> DiffRes
         sub = diff_specs(vendor.key, old_spec, new_spec, meta)
         for finding in sub.findings:
             finding.spec_file = pair.path
+        for reason, count in sub.suppressed.items():
+            result.suppressed[reason] = result.suppressed.get(reason, 0) + count
         result.findings.extend(sub.findings)
         for addition in sub.additions:
             addition.spec_file = pair.path

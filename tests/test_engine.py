@@ -917,3 +917,173 @@ class TestProseIsNotAPI(unittest.TestCase):
                  if a.subject == "Card.network"]
         self.assertTrue(added, "a new optional field is an addition")
         self.assertIn("card network", added[0].blurb.lower())
+
+
+class TestSchemaRemovalIsObservable(unittest.TestCase):
+    """A schema NAME never travels on the wire.
+
+    The same fact that made a field moving between schemas a non-event and a
+    path-parameter rename a non-event was never applied to the schema itself.
+    Measured across 21 vendors, 694 of 1007 `schema_removed` findings described
+    nothing a caller could observe, and the precision checker agreed with every
+    one of them because it asked the engine's own question -- "is the name
+    still in components/schemas?" -- which is the spec author's question.
+    """
+
+    def setUp(self):
+        self.old = copy.deepcopy(BASE)
+        self.new = copy.deepcopy(BASE)
+
+    def _removed(self, result):
+        return {f.subject for f in result.findings if f.kind == "schema_removed"}
+
+    # -- still reported ----------------------------------------------------
+
+    def test_a_reachable_schema_removal_is_still_reported(self):
+        """The control. If this ever goes quiet the suppressors have eaten the
+        signal, and every test below would pass over a dead engine."""
+        del self.new["components"]["schemas"]["Card"]
+        self.assertIn("Card", self._removed(run(self.old, self.new)))
+
+    # -- unreachable -------------------------------------------------------
+
+    def test_a_schema_no_operation_reaches_is_not_a_break(self):
+        """Sentry publishes a dereferenced spec whose whole components table is
+        vestigial: 25 of 25 of its removals reached no operation at all."""
+        self.old["components"]["schemas"]["Ghost"] = {
+            "type": "object", "properties": {"x": {"type": "string"}}}
+        self.assertNotIn("Ghost", self._removed(run(self.old, self.new)))
+
+    def test_unreachable_is_not_claimed_when_nothing_is_reachable(self):
+        """The control for the control.
+
+        On a document that links nothing, EVERY schema looks unreachable, so
+        the test is satisfied by 100% of inputs and measures nothing. Refusing
+        to suppress there is what keeps a dereferenced spec's real breaks --
+        Sentry inlines each schema body straight into the operation.
+        """
+        for doc in (self.old, self.new):
+            doc["paths"] = {"/ping": {"get": {
+                "operationId": "ping",
+                "responses": {"200": {"content": {"application/json": {
+                    "schema": {"type": "object",
+                               "properties": {"ok": {"type": "boolean"}}}}}}}}}}
+        del self.new["components"]["schemas"]["Card"]
+        result = run(self.old, self.new)
+        self.assertIn("Card", self._removed(result))
+        self.assertIn("unreachable_unmeasurable", result.suppressed)
+
+    # -- relocated ---------------------------------------------------------
+
+    def test_a_schema_inlined_at_its_only_use_site_is_not_a_break(self):
+        """Klaviyo stopped naming single-value enum schemas and inlined them at
+        the identical property. The bytes are identical."""
+        for doc in (self.old, self.new):
+            doc["components"]["schemas"]["Card"]["properties"]["brand"] = {
+                "$ref": "#/components/schemas/Brand"}
+            doc["components"]["schemas"]["Brand"] = {
+                "type": "string", "enum": ["visa", "amex"]}
+        del self.new["components"]["schemas"]["Brand"]
+        self.new["components"]["schemas"]["Card"]["properties"]["brand"] = {
+            "type": "string", "enum": ["visa", "amex"]}
+        result = run(self.old, self.new)
+        self.assertNotIn("Brand", self._removed(result))
+        self.assertEqual(1, result.suppressed.get("relocated"))
+
+    def test_inlining_a_DIFFERENT_shape_is_still_a_break(self):
+        """The mirror of the test above. If the inlined value is not the same
+        thing, the name going away is the least of it."""
+        for doc in (self.old, self.new):
+            doc["components"]["schemas"]["Card"]["properties"]["brand"] = {
+                "$ref": "#/components/schemas/Brand"}
+            doc["components"]["schemas"]["Brand"] = {
+                "type": "string", "enum": ["visa", "amex"]}
+        del self.new["components"]["schemas"]["Brand"]
+        self.new["components"]["schemas"]["Card"]["properties"]["brand"] = {
+            "type": "string", "enum": ["visa"]}
+        self.assertIn("Brand", self._removed(run(self.old, self.new)))
+
+    # -- renamed at an operation root --------------------------------------
+
+    def test_a_root_schema_renamed_to_an_identical_shape_is_not_a_break(self):
+        """Cloudflare renamed its response envelopes in bulk: 191 removals were
+        `x_components-schemas-api-response-common-failure` becoming
+        `x_api-response-common-failure-3` at the same operation with the same
+        body."""
+        self.new["components"]["schemas"]["CardV2"] = copy.deepcopy(
+            self.new["components"]["schemas"]["Card"])
+        del self.new["components"]["schemas"]["Card"]
+        self.new["paths"]["/charges"]["post"]["responses"]["200"]["content"][
+            "application/json"]["schema"] = {"$ref": "#/components/schemas/CardV2"}
+        self.new["paths"]["/charges"]["get"]["responses"]["200"]["content"][
+            "application/json"]["schema"]["properties"]["source"]["anyOf"][0] = {
+                "$ref": "#/components/schemas/CardV2"}
+        result = run(self.old, self.new)
+        self.assertNotIn("Card", self._removed(result))
+        self.assertEqual(1, result.suppressed.get("renamed"))
+
+    def test_a_rename_that_also_drops_a_field_is_still_a_break(self):
+        """A rename is invisible; a rename plus a deletion is not."""
+        self.new["components"]["schemas"]["CardV2"] = copy.deepcopy(
+            self.new["components"]["schemas"]["Card"])
+        del self.new["components"]["schemas"]["CardV2"]["properties"]["iin"]
+        del self.new["components"]["schemas"]["Card"]
+        self.new["paths"]["/charges"]["post"]["responses"]["200"]["content"][
+            "application/json"]["schema"] = {"$ref": "#/components/schemas/CardV2"}
+        self.new["paths"]["/charges"]["get"]["responses"]["200"]["content"][
+            "application/json"]["schema"]["properties"]["source"]["anyOf"][0] = {
+                "$ref": "#/components/schemas/CardV2"}
+        self.assertIn("Card", self._removed(run(self.old, self.new)))
+
+    # -- subsumed ----------------------------------------------------------
+
+    def test_a_removal_reachable_only_through_another_removal_is_reported_once(self):
+        """PayPal's `error_409` lived only inside `error_default`, and both went
+        in the same release. One restructure is one finding, not ninety-two."""
+        for doc in (self.old, self.new):
+            doc["components"]["schemas"]["Inner"] = {
+                "type": "object", "properties": {"code": {"type": "string"}}}
+            doc["components"]["schemas"]["Outer"] = {
+                "type": "object",
+                "properties": {"inner": {"$ref": "#/components/schemas/Inner"}}}
+            doc["paths"]["/charges"]["get"]["responses"]["200"]["content"][
+                "application/json"]["schema"]["properties"]["envelope"] = {
+                    "$ref": "#/components/schemas/Outer"}
+        del self.new["components"]["schemas"]["Inner"]
+        del self.new["components"]["schemas"]["Outer"]
+        del self.new["paths"]["/charges"]["get"]["responses"]["200"]["content"][
+            "application/json"]["schema"]["properties"]["envelope"]
+        removed = self._removed(run(self.old, self.new))
+        self.assertIn("Outer", removed)
+        self.assertNotIn("Inner", removed)
+
+    # -- the pseudo-operation ----------------------------------------------
+
+    def test_a_schema_carrier_is_never_counted_as_an_affected_operation(self):
+        """`GET #/components/schemas/X` is a carrier minted so schema findings
+        can reuse the Finding shape. Counting it meant a schema reachable from
+        ZERO operations still reported `affected_op_count: 1`, naming an
+        operation that exists in no spec. A count of affected operations has to
+        be able to reach zero or it can never say "this affects nobody".
+
+        Written against the DEREFERENCED case on purpose: that is the only path
+        that still emits a finding with no real operation behind it. The first
+        version of this test used a reachable schema, whose `op_key` is
+        rewritten to a real operation before the count is taken -- so it passed
+        with the bug present and killed no mutation. A test that cannot fail is
+        not a test.
+        """
+        for doc in (self.old, self.new):
+            doc["paths"] = {"/ping": {"get": {
+                "operationId": "ping",
+                "responses": {"200": {"content": {"application/json": {
+                    "schema": {"type": "object",
+                               "properties": {"ok": {"type": "boolean"}}}}}}}}}}
+        del self.new["components"]["schemas"]["Card"]
+        card = [f for f in run(self.old, self.new).findings
+                if f.kind == "schema_removed" and f.subject == "Card"][0]
+        self.assertTrue(all("#/components/schemas/" not in op
+                            for op in card.affected_ops),
+                        f"pseudo-operation leaked into {card.affected_ops}")
+        self.assertEqual(0, card.affected_op_count,
+                         "a schema no operation reaches affects zero operations")

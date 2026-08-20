@@ -6,3 +6,4 @@ __pycache__/
 .snapshots/
 .claude/.fast-suite-last
 .serena/
+out_all/

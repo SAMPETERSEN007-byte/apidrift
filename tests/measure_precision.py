@@ -143,6 +143,162 @@ def find_operation(doc: Dict[str, Any], op_key: str) -> Optional[Dict[str, Any]]
     return item.get(method.lower())
 
 
+
+# --------------------------------------------------------------------------
+# schema_removed, asked the CALLER's way
+#
+# The engine's question is "is the name still in components/schemas?", and for
+# 1007 findings across 21 vendors this checker asked exactly the same thing and
+# agreed 1007/1007. That is the fifth time a checker has shared the engine's
+# assumption, and it is the largest: 36% of the whole breaking population,
+# audited by a test that could not fail.
+#
+# A schema NAME never travels on the wire. Its disappearance can only break a
+# caller if the CONTRACT AT THE PLACE IT WAS USED changed. So find every $ref
+# to it in the OLD document and look at the same place in the NEW one.
+# --------------------------------------------------------------------------
+
+_MISSING = object()
+
+
+def ref_sites(node: Any, target: Optional[str], path: Tuple[Any, ...] = ()) -> List[Tuple[Any, ...]]:
+    """Every JSON location in `node` holding `{"$ref": target}`.
+
+    `target=None` matches ANY reference into `components/schemas`, which is how
+    the control counts whether this document links schemas at all.
+    """
+    found: List[Tuple[Any, ...]] = []
+    if isinstance(node, dict):
+        ref = node.get("$ref")
+        if (ref == target if target is not None
+                else isinstance(ref, str) and "/schemas/" in ref):
+            found.append(path)
+        for key, value in node.items():
+            found.extend(ref_sites(value, target, path + (key,)))
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            found.extend(ref_sites(value, target, path + (index,)))
+    return found
+
+
+def value_at(doc: Any, path: Tuple[Any, ...]) -> Any:
+    cur = doc
+    for step in path:
+        try:
+            cur = cur[step]
+        except (KeyError, IndexError, TypeError):
+            return _MISSING
+    return cur
+
+
+def follow(doc: Dict[str, Any], node: Any, budget: int = 8) -> Any:
+    """Resolve a chain of local $refs. Returns the node itself if it cannot."""
+    while isinstance(node, dict) and "$ref" in node and budget > 0:
+        target = str(node["$ref"])
+        if not target.startswith("#/"):
+            return node
+        cur: Any = doc
+        for part in target[2:].split("/"):
+            part = part.replace("~1", "/").replace("~0", "~")
+            try:
+                cur = cur[part]
+            except (KeyError, IndexError, TypeError):
+                return node
+        node, budget = cur, budget - 1
+    return node
+
+
+def _same_contract(old: Dict[str, Any], new: Dict[str, Any],
+                   old_body: Any, site: Tuple[Any, ...]) -> bool:
+    """Does the NEW document still present `old_body` where the ref used to be?
+
+    Compared at the same JSON location, and — because deleting one arm of a
+    `oneOf` shifts every later index — also against every member of the
+    enclosing list when the site sits inside one.
+    """
+    here = value_at(new, site)
+    if here is not _MISSING and follow(new, here) == old_body:
+        return True
+    if site and isinstance(site[-1], int):
+        siblings = value_at(new, site[:-1])
+        if isinstance(siblings, list):
+            return any(follow(new, member) == old_body for member in siblings)
+    return False
+
+
+def _removed_ancestors(old: Dict[str, Any], new: Dict[str, Any],
+                       site: Tuple[Any, ...]) -> Optional[str]:
+    """The nearest named schema ENCLOSING this site that is also gone.
+
+    `error_409` lived only inside `error_default`, and PayPal deleted both.
+    That is one restructure, not two breaks: nothing can observe the inner
+    removal except through the outer one, which is reported on its own.
+    """
+    if len(site) >= 3 and site[0] == "components" and site[1] == "schemas":
+        owner = str(site[2])
+        if owner in schemas_of(old) and owner not in schemas_of(new):
+            return owner
+    return None
+
+
+def check_schema_removed(finding: Dict[str, Any], old: Dict[str, Any],
+                         new: Dict[str, Any]) -> Tuple[str, str]:
+    name = finding.get("root_cause") or finding["subject"]
+    old_schemas, new_schemas = schemas_of(old), schemas_of(new)
+    if name not in old_schemas:
+        return REFUTED, f"schema `{name}` was not in the old spec either"
+    if name in new_schemas:
+        return REFUTED, f"schema `{name}` is still defined in the new spec"
+
+    target = f"#/components/schemas/{name}"
+    sites = ref_sites(old, target)
+    if not sites:
+        # CONTROL. On a DEREFERENCED document nothing references anything, so
+        # "no $ref points at it" is true of every schema and decides nothing.
+        # Sentry's `openapi-derefed.json` inlines each schema body straight
+        # into the operation, and refuting on absence-of-$ref there would
+        # discard real breaks. Count the linking constructs first: a refuter
+        # whose precondition holds for 100% of inputs is a broken instrument,
+        # not a result.
+        linked = len(ref_sites(old, None))
+        if linked == 0:
+            return UNDECIDABLE, ("the old document contains no $ref into "
+                                 "components/schemas at all — it is "
+                                 "dereferenced, so reference-based reasoning "
+                                 "has no signal here")
+        return REFUTED, (f"nothing in the old document referenced it, though "
+                         f"{linked} other schema reference(s) exist — no "
+                         f"request or response could carry it, so no caller "
+                         f"can observe its removal")
+
+    old_body = follow(old, {"$ref": target})
+    if old_body == {"$ref": target}:
+        return UNDECIDABLE, f"could not resolve `{name}` in the old document"
+
+    intact, subsumed, broken = 0, [], []
+    for site in sites:
+        if _same_contract(old, new, old_body, site):
+            intact += 1
+            continue
+        owner = _removed_ancestors(old, new, site)
+        if owner:
+            subsumed.append(owner)
+            continue
+        broken.append("/".join(str(x) for x in site))
+
+    if intact == len(sites):
+        return REFUTED, (f"inlined or renamed: all {intact} use site(s) still "
+                         f"carry an identical shape, so the wire contract is "
+                         f"unchanged")
+    if not broken and subsumed:
+        owners = sorted(set(subsumed))
+        return REFUTED, (f"not independently observable — every use site is "
+                         f"inside `{owners[0]}`, which was removed too and is "
+                         f"reported on its own")
+    return CONFIRMED, (f"{len(broken)} of {len(sites)} use site(s) no longer "
+                       f"carry the shape, e.g. {broken[0]}")
+
+
 def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
           old_tree: List[str], new_tree: List[str]) -> Tuple[str, str]:
     kind = finding["kind"]
@@ -433,12 +589,7 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
         return REFUTED, f"no values lost (old={len(before)}, new={len(after)})"
 
     if kind == "schema_removed":
-        name = finding.get("root_cause") or finding["subject"]
-        in_old = name in schemas_of(old)
-        in_new = name in schemas_of(new)
-        if in_old and not in_new:
-            return CONFIRMED, f"schema `{name}` present at old, absent at new"
-        return REFUTED, f"schema `{name}` old={in_old} new={in_new}"
+        return check_schema_removed(finding, old, new)
 
     if kind in ("schema_field_removed", "schema_field_type_changed",
                 "schema_field_now_required", "schema_field_added_required",
@@ -538,8 +689,15 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
             return UNDECIDABLE, f"no parameters resolvable on `{finding['op_key']}`"
         entry = new_params.get(name) or old_params.get(name) or {}
         # A path parameter is POSITIONAL: its name is substituted into the URL
-        # and never sent, so nothing a caller wrote depends on it.
-        if entry.get("in") == "path":
+        # and never sent, so nothing a caller wrote depends on its NAME.
+        #
+        # That is a claim about the name and nothing else. The VALUE very much
+        # reaches the wire, so a type change on a path parameter has to be
+        # decided on its merits -- applying the positional rule to
+        # `param_type_changed` refuted six real findings on a premise that had
+        # nothing to do with them. Over-refuting is the same failure as
+        # over-confirming: a checker that answers a question it was not asked.
+        if entry.get("in") == "path" and kind != "param_type_changed":
             return REFUTED, (
                 f"`{name}` is a PATH parameter — positional in the URL and "
                 f"never sent by name, so no caller can depend on its name")
@@ -554,6 +712,16 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
             if now and not was:
                 return CONFIRMED, f"`{name}` newly required"
             return REFUTED, f"`{name}` required old={was} new={now}"
+        if kind == "param_type_changed":
+            was = (old_params.get(name) or {}).get("schema")
+            now = (new_params.get(name) or {}).get("schema")
+            if was is None or now is None:
+                return UNDECIDABLE, f"`{name}` has no schema on one side"
+            before = effective_shape(was, old)
+            after = effective_shape(now, new)
+            if before == after:
+                return REFUTED, f"same effective shape {before}"
+            return CONFIRMED, f"{before} -> {after}"
         return UNDECIDABLE, f"no independent check for `{kind}`"
 
     if kind in ("request_field_added_required", "request_field_now_required"):
@@ -641,9 +809,19 @@ def main() -> int:
     parser.add_argument("--sample", type=int, default=60)
     parser.add_argument("--seed", type=int, default=20260820)
     parser.add_argument("--severity", default="breaking")
+    parser.add_argument("--findings", default=str(ROOT / "out" / "findings.json"),
+                        help="findings.json to audit (default: the 5-vendor run)")
+    parser.add_argument("--vendor", default="",
+                        help="comma-separated vendor keys; default is all in the file")
+    parser.add_argument("--by-vendor", action="store_true",
+                        help="print precision per vendor. A vendor with no row "
+                             "here is UNMEASURED, which is not a pass.")
     args = parser.parse_args()
 
-    data = json.load(open(ROOT / "out" / "findings.json"))
+    data = json.load(open(args.findings))
+    if args.vendor:
+        keep = {k.strip() for k in args.vendor.split(",") if k.strip()}
+        data = [e for e in data if e["vendor"] in keep]
     population: List[Tuple[str, Dict[str, Any], Dict[str, str]]] = []
     for entry in data:
         for finding in entry["findings"]:
@@ -688,6 +866,7 @@ def main() -> int:
 
     tally = collections.Counter()
     by_kind: Dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    by_vendor: Dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
     refuted: List[str] = []
 
     for vendor_key, finding, _ in sample:
@@ -698,6 +877,7 @@ def main() -> int:
             verdict, why = UNDECIDABLE, f"{type(exc).__name__}: {exc}"
         tally[verdict] += 1
         by_kind[finding["kind"]][verdict] += 1
+        by_vendor[vendor_key][verdict] += 1
         if verdict == REFUTED:
             refuted.append(f"  {vendor_key:8s} {finding['kind']:30s} "
                            f"{(finding.get('root_cause') or finding['subject'])[:40]:42s} {why}")
@@ -723,6 +903,21 @@ def main() -> int:
         rate = f"{counts[CONFIRMED]}/{d}" if d else "0/0"
         print(f"  {kind:34s} confirmed={counts[CONFIRMED]:3d} "
               f"refuted={counts[REFUTED]:3d} undecidable={counts[UNDECIDABLE]:3d}  ({rate})")
+
+    if args.by_vendor:
+        print("\nby vendor — a vendor absent from this table is UNMEASURED, "
+              "which is not a pass:")
+        in_file = {e["vendor"] for e in data}
+        for key in sorted(in_file):
+            counts = by_vendor.get(key)
+            if not counts:
+                print(f"  {key:18s} NOT SAMPLED — unmeasured")
+                continue
+            d = counts[CONFIRMED] + counts[REFUTED]
+            rate = f"{counts[CONFIRMED]}/{d} = {counts[CONFIRMED]/d:.1%}" if d \
+                else "0/0 — nothing decidable, the measurement failed here"
+            print(f"  {key:18s} {rate:26s} "
+                  f"(undecidable {counts[UNDECIDABLE]})")
 
     if refuted:
         print(f"\nREFUTED findings ({len(refuted)}) — each is a real defect:")

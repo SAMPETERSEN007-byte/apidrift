@@ -420,7 +420,7 @@ MUTATIONS = [
     (
         "schema diffing disabled entirely",
         "apidrift/diff.py",
-        "    findings.extend(_diff_schema_views(old, new))",
+        "    findings.extend(_diff_schema_views(old, new, result.suppressed))",
         "    pass",
         ["test_field_removed_from_a_named_schema",
          "test_a_shallow_removal_is_still_caught"],
@@ -683,6 +683,69 @@ MUTATIONS = [
         "        if False:",
         ["test_signatures_include_path_and_field_literals"],
     ),
+    # ---------------------------------------------------------------------
+    # The `schema_removed` suppressors. Each one removes findings, so each one
+    # can hide a real break -- which is why every one of them gets a mutation
+    # in BOTH directions: disable it and the "not a break" test must go red;
+    # make it fire unconditionally and the "still a break" test must go red.
+    # A suppressor with only the first half is a deletion nobody is checking.
+    # ---------------------------------------------------------------------
+    (
+        "unreachable schemas are reported again",
+        "apidrift/diff.py",
+        "        if not reachability_has_signal:\n            return True, \"unreachable_unmeasurable\"\n        return False, \"unreachable\"",
+        "        return True, \"\"",
+        ["test_a_schema_no_operation_reaches_is_not_a_break"],
+    ),
+    (
+        "the dereferenced-document control is dropped (unreachable always suppresses)",
+        "apidrift/diff.py",
+        "        if not reachability_has_signal:\n            return True, \"unreachable_unmeasurable\"\n        return False, \"unreachable\"",
+        "        return False, \"unreachable\"",
+        ["test_unreachable_is_not_claimed_when_nothing_is_reachable"],
+    ),
+    (
+        "the shape-at-parents suppressor is disabled",
+        "apidrift/diff.py",
+        "    if live_parents and _shape_at_parents(name, live_parents, old, new):",
+        "    if False:",
+        ["test_a_schema_inlined_at_its_only_use_site_is_not_a_break"],
+    ),
+    (
+        "shape-at-parents accepts any replacement (inlining a different shape)",
+        "apidrift/diff.py",
+        "            if _field_shape(field, old) != _field_shape(replacement, new):\n                return False",
+        "            if False:\n                return False",
+        ["test_inlining_a_DIFFERENT_shape_is_still_a_break"],
+    ),
+    (
+        "the root-rename suppressor is disabled",
+        "apidrift/diff.py",
+        "        if _renamed_at_roots(name, view, carrying, old, new, new_roots or {}):",
+        "        if False:",
+        ["test_a_root_schema_renamed_to_an_identical_shape_is_not_a_break"],
+    ),
+    (
+        "a root rename is accepted without comparing shapes",
+        "apidrift/diff.py",
+        "        if not any(_view_shape(new.schemas[c], new) == want\n                   for c in candidates if c in new.schemas):\n            return False",
+        "        if not candidates:\n            return False",
+        ["test_a_rename_that_also_drops_a_field_is_still_a_break"],
+    ),
+    (
+        "the subsumption suppressor is disabled",
+        "apidrift/diff.py",
+        "    if parents and not direct and parents <= removed:",
+        "    if False:",
+        ["test_a_removal_reachable_only_through_another_removal_is_reported_once"],
+    ),
+    (
+        "the schema carrier is counted as an affected operation again",
+        "apidrift/diff.py",
+        "        distinct_ops = {m.op_key for m in members if not _is_pseudo_op(m.op_key)}",
+        "        distinct_ops = {m.op_key for m in members}",
+        ["test_a_schema_carrier_is_never_counted_as_an_affected_operation"],
+    ),
 ]
 
 
@@ -707,6 +770,7 @@ def main() -> int:
     print(f"baseline: green ({re.search(r'Ran (\d+) tests', baseline).group(1)} tests)\n")
 
     survived = []
+    stale = []
     for name, rel_path, needle, replacement, expect in MUTATIONS:
         with tempfile.TemporaryDirectory() as tmp:
             tree = Path(tmp) / "apidrift_mut"
@@ -715,8 +779,13 @@ def main() -> int:
             target = tree / rel_path
             source = target.read_text()
             if needle not in source:
-                print(f"  ✗ {name}: MUTATION DID NOT APPLY (needle not found in {rel_path})")
-                survived.append(name)
+                # A different problem from a surviving mutation, and it needs a
+                # different fix. A stale needle means this harness is broken;
+                # a survivor means the SUITE is. Reporting both as "survived"
+                # sends you looking for missing coverage that is already there.
+                print(f"  ✗ {name}: STALE MUTATION — needle no longer in "
+                      f"{rel_path}, so nothing was mutated and nothing was tested")
+                stale.append(name)
                 continue
             target.write_text(source.replace(needle, replacement, 1))
 
@@ -734,11 +803,17 @@ def main() -> int:
                 print(f"      caught by: {', '.join(caught)}")
 
     print()
+    if stale:
+        print(f"{len(stale)}/{len(MUTATIONS)} mutations are STALE — the code moved "
+              f"under them, so they tested nothing:")
+        for name in stale:
+            print(f"   - {name}")
     if survived:
         print(f"{len(survived)}/{len(MUTATIONS)} mutations SURVIVED — those behaviours "
               f"are not actually covered:")
         for name in survived:
             print(f"   - {name}")
+    if stale or survived:
         return 1
     print(f"all {len(MUTATIONS)} mutations killed — the suite has real teeth")
     return 0

@@ -108,6 +108,11 @@ class Spec:
     security_schemes: Dict[str, str]
     schemas: Dict[str, "SchemaView"] = field(default_factory=dict)
     reachable: Dict[str, List[str]] = field(default_factory=dict)
+    # schema name -> operations that reference it DIRECTLY from a requestBody,
+    # a parameter or a response. Distinct from `reachable`, which is the whole
+    # transitive walk: a schema can be reachable only through other schemas,
+    # and then removing it is not separately observable.
+    rooted_at: Dict[str, List[str]] = field(default_factory=dict)
     # Reachable within two hops: what a consumer would actually see in the
     # payload. Full transitive reachability on a hyperconnected spec says
     # "589 of 589 operations", which is true and useless.
@@ -514,6 +519,7 @@ def load_spec(raw: bytes, filename: str) -> Spec:
         security_schemes=security_schemes,
         schemas=views,
         reachable=reachable_operations(views, every),
+        rooted_at=_invert_roots(every),
         nearby=reachable_operations(views, every, max_hops=2),
         request_schemas=frozenset(reachable_operations(views, request_roots)),
         response_schemas=frozenset(reachable_operations(views, response_roots)),
@@ -696,6 +702,15 @@ def operation_schema_roots(
             if req or resp:
                 every[key] = sorted(req | resp)
     return every, request, response
+
+
+def _invert_roots(roots: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """schema name -> the operations naming it directly."""
+    out: Dict[str, List[str]] = {}
+    for op_key, names in roots.items():
+        for name in names:
+            out.setdefault(name, []).append(op_key)
+    return {k: sorted(v) for k, v in out.items()}
 
 
 def reachable_operations(

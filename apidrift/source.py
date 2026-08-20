@@ -1,6 +1,7 @@
 """Git-backed retrieval of a vendor's OpenAPI spec(s) at two points in time."""
 from __future__ import annotations
 
+import datetime as dt
 import fnmatch
 import subprocess
 from dataclasses import dataclass
@@ -14,6 +15,28 @@ class GitError(RuntimeError):
     pass
 
 
+class HistoryTooShort(GitError):
+    """The repository itself is younger than the requested look-back window.
+
+    Its own state, deliberately not an error and emphatically not a clean
+    result. Nothing is broken: the tool correctly has nothing behind the
+    window to compare against. Calling it a FAILURE hides a working vendor
+    among misconfigured ones; calling it "0 breaking changes" is the false
+    all-clear cd1c31e removed at the FILE level, told one level up.
+
+    Carries the date history actually begins so every surface can say how far
+    back it CAN see, and the caller can opt into the shorter window on purpose
+    rather than being handed one silently.
+    """
+
+    def __init__(self, message: str, first_commit_date: str,
+                 first_ref: str = "", observable_days: int = 0) -> None:
+        super().__init__(message)
+        self.first_commit_date = first_commit_date
+        self.first_ref = first_ref
+        self.observable_days = observable_days
+
+
 def _run(args: List[str], cwd: Optional[Path] = None, binary: bool = False):
     proc = subprocess.run(
         args, cwd=str(cwd) if cwd else None,
@@ -24,6 +47,13 @@ def _run(args: List[str], cwd: Optional[Path] = None, binary: bool = False):
             f"$ {' '.join(args[:4])}…\n{proc.stderr.decode('utf-8', 'replace').strip()[:300]}"
         )
     return proc.stdout if binary else proc.stdout.decode("utf-8", "replace").strip()
+
+
+def _days_between(a: str, b: str) -> int:
+    try:
+        return (dt.date.fromisoformat(b) - dt.date.fromisoformat(a)).days
+    except ValueError:
+        return 0
 
 
 @dataclass
@@ -57,10 +87,32 @@ def head_ref(repo_dir: Path) -> str:
     return _run(["git", "rev-parse", "HEAD"], cwd=repo_dir)
 
 
+def first_commit(repo_dir: Path) -> str:
+    """The oldest commit reachable from HEAD.
+
+    `--max-parents=0` can return several roots when history was grafted or
+    merged in; the oldest one is what bounds what this repo can ever show,
+    so take the last line `rev-list` prints (it orders newest first).
+    """
+    roots = _run(["git", "rev-list", "--max-parents=0", "HEAD"],
+                 cwd=repo_dir).splitlines()
+    if not roots:
+        raise GitError("repository has no commits")
+    return roots[-1].strip()
+
+
 def commit_before(repo_dir: Path, date: str) -> str:
     ref = _run(["git", "rev-list", "-1", f"--before={date}", "HEAD"], cwd=repo_dir)
     if not ref:
-        raise GitError(f"no commit before {date}")
+        root = first_commit(repo_dir)
+        began = commit_date(repo_dir, root)
+        observable = _days_between(began, commit_date(repo_dir, head_ref(repo_dir)))
+        raise HistoryTooShort(
+            f"repository history begins {began}, after the window opened at "
+            f"{date}; {observable} day(s) are observable. Re-run with "
+            f"--days {observable} to diff the range that exists.",
+            first_commit_date=began, first_ref=root, observable_days=observable,
+        )
     return ref
 
 

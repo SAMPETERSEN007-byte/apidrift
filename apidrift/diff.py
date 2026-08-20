@@ -157,6 +157,10 @@ class DiffResult:
     specs_matched: int = 0
     specs_changed: int = 0
     raw_finding_count: int = 0
+    # Why a removal was NOT reported, counted by reason. Never a silent drop:
+    # a suppressor that cannot say how often it fired is indistinguishable
+    # from an engine that never found anything.
+    suppressed: Dict[str, int] = field(default_factory=dict)
     # Spec files that did not exist at the start of the window. Nothing before
     # them could be compared, so a "0 breaking changes" over the requested
     # range is a claim about a period the tool could not see. OpenAI's repo
@@ -783,7 +787,7 @@ def diff_specs(vendor: str, old: Spec, new: Spec, meta: Dict[str, str]) -> DiffR
     for key in sorted(old_keys & new_keys):
         findings.extend(_diff_operation(old.operations[key], new.operations[key]))
 
-    findings.extend(_diff_schema_views(old, new))
+    findings.extend(_diff_schema_views(old, new, result.suppressed))
 
     result.additions = _diff_additions(old, new)
 
@@ -915,9 +919,10 @@ def collapse(findings: List[Finding], max_ops: int = 200) -> List[Finding]:
         # change; several of them can land on the same operation. Reporting the
         # occurrence count as an operation count produced "853 operations" for
         # a spec containing 589, which is wrong on its face.
-        distinct_ops = {m.op_key for m in members}
+        distinct_ops = {m.op_key for m in members if not _is_pseudo_op(m.op_key)}
         for member in members:
-            distinct_ops.update(member.affected_ops or ())
+            distinct_ops.update(k for k in (member.affected_ops or ())
+                                if not _is_pseudo_op(k))
         # Never shrink a count that reachability already established.
         rep.affected_op_count = max(len(distinct_ops), rep.affected_op_count)
         rep.direct_op_count = max((m.direct_op_count for m in members), default=0)
@@ -1040,14 +1045,250 @@ def _field_survived_where_it_was_visible(
     return seen_anywhere
 
 
-def _diff_schema_views(old: Spec, new: Spec) -> List[Finding]:
+
+def _is_pseudo_op(op_key: str) -> bool:
+    """`GET #/components/schemas/X` is a carrier, not an operation.
+
+    `_schema_op` mints one so schema findings can reuse the Finding shape. It
+    was then being counted as an affected operation, which is why a schema
+    reachable from ZERO operations still reported `affected_op_count: 1` and
+    named an operation that exists in no spec. A count of affected operations
+    has to be able to reach zero, or it can never say "this affects nobody".
+    """
+    return "#/components/schemas/" in op_key
+
+
+def _truncated_ops(spec: Spec) -> Set[str]:
+    """Operations whose flattened fields hit the depth cap.
+
+    Anything past `MAX_DEPTH` is invisible on that side, so "the name is still
+    there" cannot be established for these. The suppressors below abstain
+    instead of guessing, and the abstention is counted rather than silent --
+    the standing complaint about the relocation suppressor is that it goes
+    quiet exactly where it is least sure.
+    """
+    out: Set[str] = set()
+    for key, op in spec.operations.items():
+        for fields in [op.request_fields] + list(op.responses.values()):
+            if any(f.type == TRUNCATED for f in fields.values()):
+                out.add(key)
+                break
+    return out
+
+
+def _incoming_refs(spec: Spec) -> Dict[str, Set[str]]:
+    """schema name -> the named schemas that reference it directly."""
+    out: Dict[str, Set[str]] = {}
+    for name, view in spec.schemas.items():
+        for ref in view.refs:
+            out.setdefault(ref, set()).add(name)
+    return out
+
+
+def _schema_leaf_names(view: "SchemaView") -> Set[str]:
+    """The field names this schema contributes to whatever carries it."""
+    return {_TYPE_ANNOTATION.sub("", f).rsplit(".", 1)[-1] for f in view.fields}
+
+
+def _shape_at_parents(name: str, parents: Set[str],
+                      old: Spec, new: Spec) -> bool:
+    """Does every surviving parent still present the same shape where it
+    pointed at `name`?
+
+    This is the question a caller can answer and the schema table cannot.
+    Klaviyo stopped naming its single-value enums: `InTheLastEnum` became
+    `{"type": "string", "enum": ["in-the-last"]}` inline at the identical
+    property. `_field_shape` already knows a named schema and an inline
+    definition of the same thing are the same thing -- it was just never asked
+    about the schema that disappeared.
+    """
+    for parent in parents:
+        before, after = old.schemas.get(parent), new.schemas.get(parent)
+        if before is None or after is None:
+            return False
+        for field_name, field in before.fields.items():
+            if field.type != f"->{name}":
+                continue
+            replacement = after.fields.get(field_name)
+            if replacement is None:
+                return False
+            if _field_shape(field, old) != _field_shape(replacement, new):
+                return False
+    return True
+
+
+def _view_shape(view, spec: Spec) -> Tuple:
+    """What a caller sees of a named schema, one level deep and name-free.
+
+    Deliberately excludes the schema's own NAME: that is the whole point. Two
+    schemas with the same kind, the same fields carrying the same shapes, the
+    same enum and the same required set are the same thing on the wire no
+    matter what the spec author calls them.
+    """
+    return (view.kind, view.enum, tuple(sorted(view.required)),
+            tuple((f, _field_shape(field, spec))
+                  for f, field in sorted(view.fields.items())))
+
+
+def _renamed_at_roots(name: str, view, direct: Sequence[str],
+                      old: Spec, new: Spec,
+                      new_roots: Dict[str, Set[str]]) -> bool:
+    """Did every operation that named this schema simply start naming another
+    schema of the identical shape?
+
+    Cloudflare renamed its response envelopes in bulk --
+    `aaa_components-schemas-api-response-common-failure` became
+    `aaa_api-response-common-failure-3` at the same operation with the same
+    `{errors, messages, success}` body. 191 of Cloudflare's removals are that
+    and nothing else. A schema rename is invisible on the wire for exactly the
+    reason a path-parameter rename is (7a61f0d): the name never travels.
+
+    Anything that genuinely changed inside the body is still reported, by the
+    operation-level diff, against the operation. This suppresses the duplicate
+    claim, not the change.
+    """
+    if not direct:
+        return False
+    want = _view_shape(view, old)
+    for op_key in direct:
+        candidates = new_roots.get(op_key) or set()
+        if not any(_view_shape(new.schemas[c], new) == want
+                   for c in candidates if c in new.schemas):
+            return False
+    return True
+
+
+def _invert_rooted_at(spec: Spec) -> Dict[str, Set[str]]:
+    """operation -> the schemas it names directly."""
+    out: Dict[str, Set[str]] = {}
+    for schema_name, ops in spec.rooted_at.items():
+        for op_key in ops:
+            out.setdefault(op_key, set()).add(schema_name)
+    return out
+
+
+def _removal_is_observable(
+    name: str, view, ops: Sequence[str], removed: Set[str],
+    incoming: Dict[str, Set[str]], old: Spec, new: Spec,
+    old_names: Dict[str, Set[str]], new_names: Dict[str, Set[str]],
+    truncated: Set[str], reachability_has_signal: bool = True,
+    new_roots: Optional[Dict[str, Set[str]]] = None,
+) -> Tuple[bool, str]:
+    """Can any caller tell that this schema is gone?
+
+    A schema NAME never travels on the wire -- the same fact that made a field
+    moving between schemas a non-event (f650b2f) and a path-parameter rename a
+    non-event (7a61f0d). It was never applied to the schema ITSELF, and that is
+    the largest defect this engine has had: 694 of 1007 `schema_removed`
+    findings across 21 vendors describe nothing a caller can observe.
+
+    Three ways a removal is invisible, each decided by a different question:
+
+    unreachable  no operation reaches it, so no request or response could ever
+                 have carried it. Sentry publishes a DEREFERENCED spec, whose
+                 `components/schemas` table is vestigial: 25 of 25.
+    relocated    every place that pointed at it still presents the same shape.
+                 Klaviyo stopped naming single-value enum schemas and inlined
+                 them at the identical property; the bytes are identical.
+    subsumed     no operation names it directly and every schema that does was
+                 removed in the same change, each reported on its own. PayPal's
+                 `error_409` lived only inside `error_default`. One restructure
+                 is one finding, not ninety-two.
+
+    Returns `(observable, reason_when_not)`.
+    """
+    if not ops:
+        # CONTROL, and it is not optional. On a DEREFERENCED document nothing
+        # references anything: every schema looks unreachable, so the test is
+        # satisfied by 100% of inputs and measures nothing. Sentry publishes
+        # `openapi-derefed.json`, and suppressing on this would have silently
+        # deleted a real break -- `DetailedOrganizationSerializerWithProjects
+        # AndTeams` is verbatim the 200 body of a PUT that still exists and
+        # lost seven required response properties. An empty measurement is a
+        # claim about the instrument until something says otherwise.
+        if not reachability_has_signal:
+            return True, "unreachable_unmeasurable"
+        return False, "unreachable"
+
+    parents = incoming.get(name) or set()
+    direct = set(old.rooted_at.get(name, []))
+
+    # Reached only through other schemas, all of which went in the same
+    # change. Nothing can observe this removal except through one of those,
+    # and each of those is judged on its own terms.
+    if parents and not direct and parents <= removed:
+        return False, "subsumed"
+
+    live_parents = parents - removed
+    if live_parents and _shape_at_parents(name, live_parents, old, new):
+        if not direct:
+            return False, "relocated"
+
+    if direct:
+        # An operation names it directly: what a caller sees is that
+        # operation's own surface, so ask whether any name it contributed
+        # stopped being visible there.
+        contributed = _schema_leaf_names(view)
+        # An operation that no longer exists cannot show anything either way,
+        # and its disappearance is already reported as `endpoint_removed`.
+        # Judge on the ones a caller can still reach.
+        carrying = [op for op in direct if op in new_names]
+        if not carrying:
+            return False, "subsumed"
+        if _renamed_at_roots(name, view, carrying, old, new, new_roots or {}):
+            return False, "renamed"
+        # This branch, and only this branch, reads the flattened field names.
+        # Past `MAX_DEPTH` a name is invisible on that side, so "it is still
+        # there" cannot be established: abstain, and let the caller count the
+        # abstention. A suppressor that goes quiet exactly where it is least
+        # sure is how the relocation blind spot stayed open. The shape test
+        # above needs none of this -- it compares schemas, not flattenings.
+        if any(op in truncated for op in carrying):
+            return True, "truncated"
+        if contributed and all(
+                not (contributed - (new_names.get(op) or set()))
+                for op in carrying
+                if contributed & (old_names.get(op) or set())):
+            return False, "relocated"
+        if not contributed and all(
+                not ((old_names.get(op) or set()) - (new_names.get(op) or set()))
+                for op in carrying):
+            return False, "relocated"
+
+    return True, ""
+
+
+def _diff_schema_views(old: Spec, new: Spec,
+                       suppressed: Optional[Dict[str, int]] = None) -> List[Finding]:
     out: List[Finding] = []
     old_op_names = _operation_field_names(old)
     new_op_names = _operation_field_names(new)
+    counts = suppressed if suppressed is not None else {}
 
-    for name in sorted(set(old.schemas) - set(new.schemas)):
+    removed_names = set(old.schemas) - set(new.schemas)
+    incoming = _incoming_refs(old)
+    old_truncated = _truncated_ops(old)
+    new_roots = _invert_rooted_at(new)
+    # The control for the unreachable test: does this document link schemas at
+    # all? If nothing anywhere is reachable, "unreachable" is a property of
+    # the document's style, not of the schema.
+    reachability_has_signal = bool(old.reachable)
+
+    for name in sorted(removed_names):
         view = old.schemas[name]
         ops = old.reachable.get(name, [])
+        observable, reason = _removal_is_observable(
+            name, view, ops, removed_names, incoming, old, new,
+            old_op_names, new_op_names, old_truncated, reachability_has_signal,
+            new_roots,
+        )
+        if not observable:
+            counts[reason] = counts.get(reason, 0) + 1
+            continue
+        if reason:
+            # Reported, but the suppressors could not judge it. Counted so an
+            # abstention is never mistaken for a decision.
+            counts[reason] = counts.get(reason, 0) + 1
         op = _schema_op(name)
         if ops:
             op.path = ops[0].partition(" ")[2] or op.path
