@@ -62,7 +62,7 @@ class GhError(RuntimeError):
     pass
 
 
-def _gh_code_search(query: str, per_page: int = 5) -> Dict:
+def _gh_code_search(query: str, per_page: int = 20) -> Dict:
     proc = subprocess.run(
         ["gh", "api", "-X", "GET", "search/code",
          "-f", f"q={query}", "-f", f"per_page={per_page}"],
@@ -106,7 +106,11 @@ def build_query(finding: Finding, vendor: Vendor, language: str = "") -> str:
                         if "{" in finding.path else finding.path)
 
     leaf = _leaf(finding)
+    # A newly-required field is verified by its ABSENCE, so searching for it
+    # would return precisely the callers who are already fine.
+    from .verify import _ABSENCE_KINDS
     field_usable = (finding.kind not in _ENDPOINT_KINDS
+                    and finding.kind not in _ABSENCE_KINDS
                     and len(leaf) >= 3 and leaf.lower() not in _WEAK_TOKENS)
 
     if field_usable:
@@ -153,7 +157,7 @@ def prospect(
             time.sleep(_SPACING)
         index += 1
         try:
-            payload = _gh_code_search(query)
+            payload = _gh_code_search(query, per_page=20)
         except GhError as exc:
             result.error = str(exc)
         else:

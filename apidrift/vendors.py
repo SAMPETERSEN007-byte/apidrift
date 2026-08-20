@@ -17,6 +17,9 @@ class Vendor:
     # Path prefix stripped before deriving SDK-style call names.
     version_prefixes: Tuple[str, ...] = ()
     sdk_style: str = "generic"  # generic | stripe | openai | plaid | twilio | discord
+    # Literals that tie a source file to THIS vendor's API. Without one of
+    # these, a matching symbol is a coincidence, not a customer.
+    evidence: Tuple[str, ...] = ()
 
 
 VENDORS: Dict[str, Vendor] = {
@@ -28,6 +31,7 @@ VENDORS: Dict[str, Vendor] = {
         docs_url="https://docs.stripe.com/api",
         version_prefixes=("/v1", "/v2"),
         sdk_style="stripe",
+        evidence=("import stripe", "from stripe", "require('stripe')", 'require("stripe")', "api.stripe.com", "STRIPE_SECRET", "STRIPE_API_KEY", "stripe."),
     ),
     "openai": Vendor(
         key="openai",
@@ -37,6 +41,7 @@ VENDORS: Dict[str, Vendor] = {
         docs_url="https://platform.openai.com/docs/api-reference",
         version_prefixes=("/v1",),
         sdk_style="openai",
+        evidence=("import openai", "from openai", "require('openai')", 'require("openai")', "api.openai.com", "OPENAI_API_KEY", "openai."),
     ),
     "twilio": Vendor(
         key="twilio",
@@ -46,6 +51,7 @@ VENDORS: Dict[str, Vendor] = {
         docs_url="https://www.twilio.com/docs/usage/api",
         version_prefixes=("/2010-04-01",),
         sdk_style="twilio",
+        evidence=("import twilio", "from twilio", "require('twilio')", 'require("twilio")', "api.twilio.com", "TWILIO_AUTH_TOKEN", "TWILIO_ACCOUNT_SID"),
     ),
     "plaid": Vendor(
         key="plaid",
@@ -54,6 +60,7 @@ VENDORS: Dict[str, Vendor] = {
         spec_path="2020-09-14.yml",
         docs_url="https://plaid.com/docs/api",
         sdk_style="plaid",
+        evidence=("import plaid", "from plaid", "require('plaid')", 'require("plaid")', "plaid.com", "PLAID_SECRET", "PLAID_CLIENT_ID"),
     ),
     "discord": Vendor(
         key="discord",
@@ -63,6 +70,7 @@ VENDORS: Dict[str, Vendor] = {
         docs_url="https://discord.com/developers/docs",
         version_prefixes=("/v10", "/v9"),
         sdk_style="discord",
+        evidence=("import discord", "from discord", "require('discord", "discord.com/api", "DISCORD_TOKEN", "DISCORD_BOT_TOKEN", "discordapp.com/api"),
     ),
 }
 
