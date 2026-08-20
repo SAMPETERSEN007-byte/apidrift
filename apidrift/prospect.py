@@ -137,9 +137,14 @@ def static_run(path: str) -> str:
         runs.append(current)
     if not runs:
         return ""
-    # Longest by characters; on a tie prefer the later, more specific run.
-    best = max(runs, key=lambda run: (len("/".join(run)), runs.index(run)))
-    return "/" + "/".join(best)
+    # The LAST run identifies the sub-resource, which is what distinguishes
+    # one operation from its siblings. Choosing the longest instead collapsed
+    # `/v1/Stores/{storeId}/Profiles/{profileId}/Events` to `/v1/Stores`,
+    # identical to /Recall, /Lookup and /Observations on the same resource.
+    tail = "/" + "/".join(runs[-1])
+    if len(tail) >= 5:
+        return tail
+    return "/" + "/".join(max(runs, key=lambda run: len("/".join(run))))
 
 
 def build_query(finding: Finding, vendor: Vendor, language: str = "") -> str:

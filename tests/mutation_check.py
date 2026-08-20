@@ -308,9 +308,9 @@ MUTATIONS = [
     (
         "path truncated at the first parameter again",
         "apidrift/prospect.py",
-        "    best = max(runs, key=lambda run: (len(\"/\".join(run)), runs.index(run)))",
-        "    best = runs[0]",
-        ["test_the_specific_tail_is_preferred_over_a_generic_head"],
+        "    tail = \"/\" + \"/\".join(runs[-1])\n    if len(tail) >= 5:",
+        "    tail = \"/\" + \"/\".join(runs[0])\n    if len(tail) >= 5:",
+        ["test_sibling_sub_resources_get_distinct_literals"],
     ),
     (
         "generated-code provenance gate removed",
@@ -363,6 +363,34 @@ MUTATIONS = [
         "    if identifier[:1].isupper():\n        return identifier in source",
         "    if False:\n        return identifier in source",
         ["test_a_type_name_must_match_case"],
+    ),
+    (
+        "removing a success status scored breaking even when others remain",
+        "apidrift/diff.py",
+        "                remaining = sorted(new_success)\n                if remaining:",
+        "                remaining = sorted(new_success)\n                if False:",
+        ["test_removing_one_success_status_is_not_breaking_when_others_remain"],
+    ),
+    (
+        "`pop` counted as a use of a field",
+        "apidrift/verify.py",
+        "            \"get\", \"setdefault\", \"getdefault\"",
+        "            \"get\", \"pop\", \"setdefault\", \"getdefault\"",
+        ["test_pop_is_not_a_use_of_a_field"],
+    ),
+    (
+        "endpoint quoted in prose counted as a call",
+        "apidrift/verify.py",
+        "        if any(ch.isspace() for ch in node.value):\n            continue",
+        "        if False:\n            continue",
+        ["test_an_endpoint_quoted_in_prose_is_not_a_call"],
+    ),
+    (
+        "vendor evidence matched as an unbounded substring",
+        "apidrift/verify.py",
+        "            if not (following.isalnum() or following == \"_\"):\n                return marker",
+        "            if True:\n                return marker",
+        ["test_vendor_evidence_needs_a_word_boundary"],
     ),
     (
         "signature builder drops the field name",

@@ -497,3 +497,44 @@ class TestIdentifierCasing(unittest.TestCase):
     def test_an_absent_field_is_absent(self):
         from apidrift.verify import _identifier_present
         self.assertFalse(_identifier_present("x.other_thing", "safety_identifier"))
+
+
+class TestReauditFindings(unittest.TestCase):
+    """Regressions for what a SECOND adversarial audit found."""
+
+    def test_pop_is_not_a_use_of_a_field(self):
+        # `payload.pop("safety_identifier", None)` deletes a key that is never
+        # populated. It is a defensive no-op, not a call site.
+        sites, _ = python_sites(
+            'payload.pop("safety_identifier", None)\n', "safety_identifier")
+        self.assertEqual(sites, [])
+
+    def test_get_is_still_a_use(self):
+        sites, _ = python_sites(
+            'x = payload.get("safety_identifier")\n', "safety_identifier")
+        self.assertEqual([s.kind for s in sites], ["dict_get"])
+
+    def test_an_endpoint_quoted_in_prose_is_not_a_call(self):
+        from apidrift.verify import python_endpoint_sites
+        source = ('import twilio\n'
+                  'st.caption("Runs POST /v1/Stores/x/Events and returns rows")\n')
+        sites, _ = python_endpoint_sites(source, "/Events")
+        self.assertEqual(sites, [], "documentation is not an API call")
+
+    def test_an_endpoint_in_a_url_string_is_a_call(self):
+        from apidrift.verify import python_endpoint_sites
+        source = ('import twilio\n'
+                  'r = post(f"{BASE}/v1/Stores/{sid}/Events")\n')
+        sites, _ = python_endpoint_sites(source, "/Events")
+        self.assertTrue(sites)
+
+    def test_vendor_evidence_needs_a_word_boundary(self):
+        from apidrift.verify import find_vendor_evidence
+        self.assertEqual(
+            find_vendor_evidence(
+                "from some_pkg.config import OpenAICompatibleConfig\n",
+                get("openai")),
+            "", "a longer identifier is not an import of the vendor")
+        self.assertEqual(
+            find_vendor_evidence("import openai\n", get("openai")),
+            "import openai")

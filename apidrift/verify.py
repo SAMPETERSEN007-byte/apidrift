@@ -146,8 +146,11 @@ class _PythonSites(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
+        # `pop` REMOVES a key. `payload.pop("safety_identifier", None)` on a
+        # key that is never populated is a defensive no-op, not a use of the
+        # field, and it was scored as a call site.
         if isinstance(node.func, ast.Attribute) and node.func.attr in (
-            "get", "pop", "setdefault", "getdefault"
+            "get", "setdefault", "getdefault"
         ):
             if node.args and isinstance(node.args[0], ast.Constant) \
                     and node.args[0].value == self.symbol:
@@ -245,6 +248,11 @@ def python_endpoint_sites(source: str, path_literal: str) -> Tuple[List[Site], O
             continue
         if id(node) in skip or path_literal not in node.value:
             continue
+        # A URL in code has no spaces. Prose that happens to quote an endpoint
+        # -- `st.caption("Runs `POST /v1/Stores/...` - returns observations")`
+        # -- is documentation, not a call.
+        if any(ch.isspace() for ch in node.value):
+            continue
         line = getattr(node, "lineno", 0)
         sites.append(Site(line=line, kind="endpoint_ref",
                           text=lines[line - 1].strip()[:160]
@@ -318,10 +326,27 @@ def _sites_matching_direction(sites: List[Site], finding: Finding) -> List[Site]
 
 
 def find_vendor_evidence(source: str, vendor: Vendor) -> str:
+    """A marker tying this file to the vendor's API, matched at a word boundary.
+
+    An unbounded substring search is not evidence. A line reading
+    `from some_pkg.config import OpenAICompatibleConfig` contains the substring
+    "import openai", so a file with no OpenAI import at all cleared the gate --
+    and that was the vendor evidence recorded on the one lead that survived an
+    adversarial audit.
+    """
     lowered = source.lower()
     for marker in vendor.evidence:
-        if marker.lower() in lowered:
-            return marker
+        needle = marker.lower()
+        start = 0
+        while True:
+            at = lowered.find(needle, start)
+            if at < 0:
+                break
+            after = at + len(needle)
+            following = lowered[after] if after < len(lowered) else " "
+            if not (following.isalnum() or following == "_"):
+                return marker
+            start = at + 1
     return ""
 
 

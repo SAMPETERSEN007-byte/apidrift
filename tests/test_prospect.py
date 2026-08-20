@@ -223,10 +223,24 @@ class TestStaticRun(unittest.TestCase):
             static_run("/guilds/{guild_id}/auto-moderation/rules"),
             "/auto-moderation/rules")
 
-    def test_a_longer_head_still_wins(self):
+    def test_the_tail_sub_resource_identifies_the_operation(self):
         from apidrift.prospect import static_run
+        # `/cards` distinguishes this from every other /v1/customers operation.
         self.assertEqual(
-            static_run("/v1/customers/{customer}/cards"), "/v1/customers")
+            static_run("/v1/customers/{customer}/cards"), "/cards")
+
+    def test_sibling_sub_resources_get_distinct_literals(self):
+        from apidrift.prospect import static_run
+        base = "/v1/Stores/{storeId}/Profiles/{profileId}"
+        self.assertEqual(static_run(base + "/Events"), "/Events")
+        self.assertEqual(static_run(base + "/Recall"), "/Recall")
+        self.assertNotEqual(static_run(base + "/Events"),
+                            static_run(base + "/Recall"))
+
+    def test_a_very_short_tail_falls_back_to_the_longest_run(self):
+        from apidrift.prospect import static_run
+        self.assertEqual(static_run("/v1/customers/{customer}/id"),
+                         "/v1/customers")
 
     def test_a_path_with_no_parameters_is_returned_whole(self):
         from apidrift.prospect import static_run

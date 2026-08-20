@@ -429,15 +429,34 @@ def _diff_operation(old: Operation, new: Operation) -> List[Finding]:
             subject="<body>", old="optional", new="required",
         ))
 
+    new_success = {s for s in new.responses if s.startswith("2")}
     for status, old_resp in old.responses.items():
         new_resp = new.responses.get(status)
         if new_resp is None:
             if status.startswith("2"):
-                out.append(_mk(
-                    new, "response_status_removed", BREAKING,
-                    f"success response `{status}` was removed",
-                    subject=status, old=status, new="<removed>",
-                ))
+                # Removing one success status while others remain NARROWS what
+                # the server can return. A client already handling the survivor
+                # is unaffected; only one that branched exclusively on the
+                # removed code notices, and the spec cannot show that. Discord
+                # dropped 204 from bulk-ban while keeping 200, and scoring that
+                # as breaking produced ten leads against libraries that never
+                # read the status at all.
+                remaining = sorted(new_success)
+                if remaining:
+                    out.append(_mk(
+                        new, "response_status_removed", POTENTIALLY_BREAKING,
+                        f"success response `{status}` was removed; "
+                        f"{', '.join(remaining)} remain, so only a client "
+                        f"branching on `{status}` alone is affected",
+                        subject=status, old=status, new="<removed>",
+                    ))
+                else:
+                    out.append(_mk(
+                        new, "response_status_removed", BREAKING,
+                        f"success response `{status}` was removed and no "
+                        f"success status remains",
+                        subject=status, old=status, new="<removed>",
+                    ))
             continue
         # Shallow only (MAX_DEPTH=2). Named schemas are handled exactly by the
         # schema diff, and `collapse()` merges the two views because both reduce

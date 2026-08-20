@@ -153,9 +153,25 @@ class TestBreakingDetection(unittest.TestCase):
         self.assertIn("security_requirement_added", kinds(run(self.old, self.new)))
 
     def test_success_response_removed(self):
+        # No success status remains, so callers have nothing to fall back to.
         self.new["paths"]["/refunds/{id}"]["get"]["responses"] = {
             "404": {"description": "gone"}}
         self.assertIn("response_status_removed", kinds(run(self.old, self.new)))
+
+    def test_removing_one_success_status_is_not_breaking_when_others_remain(self):
+        """Discord dropped 204 from bulk-ban and kept 200.
+
+        That NARROWS what the server returns. Every client already handling
+        the 200-with-body is unaffected, and scoring it breaking produced ten
+        leads against libraries that never read the status.
+        """
+        self.old["paths"]["/refunds/{id}"]["get"]["responses"]["204"] = {
+            "description": "no content"}
+        result = run(self.old, self.new)
+        self.assertNotIn("response_status_removed",
+                         {f.kind for f in result.breaking})
+        self.assertIn("response_status_removed",
+                      {f.kind for f in result.potentially_breaking})
 
     def test_server_url_changed(self):
         self.new["servers"] = [{"url": "https://api.test.com/v2"}]
