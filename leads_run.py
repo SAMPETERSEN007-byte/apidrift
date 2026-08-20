@@ -20,6 +20,8 @@ from apidrift.verify import CONFIRMED, LIKELY, verify_candidate
 ROOT = Path(__file__).resolve().parent
 FINDINGS_PER_VENDOR = int(sys.argv[1]) if len(sys.argv) > 1 else 2
 CANDIDATES_PER_FINDING = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+LANGUAGE = sys.argv[3] if len(sys.argv) > 3 else "python"
+VENDOR_FILTER = sys.argv[4].split(",") if len(sys.argv) > 4 else None
 
 
 def load_findings(entry):
@@ -42,6 +44,8 @@ def main() -> int:
     report = {}
 
     for entry in data:
+        if VENDOR_FILTER and entry["vendor"] not in VENDOR_FILTER:
+            continue
         vendor = get(entry["vendor"])
         findings = load_findings(entry)
         if not findings:
@@ -49,7 +53,7 @@ def main() -> int:
         print(f"\n[{vendor.name}]")
         ranked = sorted(findings, key=lambda f: -f.occurrences)
         prospects = prospect(ranked, vendor, limit=FINDINGS_PER_VENDOR,
-                             verbose=True)
+                             language=LANGUAGE, verbose=True)
         by_finding = {p.root_cause: p for p in prospects}
 
         vendor_leads = []
@@ -79,7 +83,7 @@ def main() -> int:
                     leads.append(record)
         report[vendor.key] = vendor_leads
 
-    (ROOT / "out" / "leads.json").write_text(json.dumps(report, indent=2),
+    (ROOT / "out" / f"leads_{LANGUAGE}.json").write_text(json.dumps(report, indent=2),
                                             encoding="utf-8")
 
     total = sum(verdict_counts.values())

@@ -31,15 +31,17 @@ def kind_table(findings: List[dict]) -> str:
     return "\n".join(lines)
 
 
-def lead_rows(leads: List[dict], limit: int = 12) -> str:
-    lines = ["| Repository | File | Line | Code |", "|---|---|---:|---|"]
+def lead_rows(leads: List[dict], limit: int = 14) -> str:
+    lines = ["| Repository | File | Line | Evidence | Code |",
+             "|---|---|---:|---|---|"]
     for lead in leads[:limit]:
         site = (lead.get("sites") or [{}])[0]
-        code = str(site.get("text", "")).replace("|", "\\|")[:88]
+        code = str(site.get("text", "")).replace("|", "\\|")[:76]
+        strength = "parsed" if lead.get("verdict") == "confirmed" else "lexical"
         lines.append(
             f"| [{lead['repo']}](https://github.com/{lead['repo']}) "
             f"| `{lead['file'].rsplit('/', 1)[-1]}` | {site.get('line', '?')} "
-            f"| `{code}` |"
+            f"| {strength} | `{code}` |"
         )
     return "\n".join(lines)
 
@@ -49,9 +51,15 @@ def build(vendor_key: str, entry: dict, leads: List[dict], window: dict) -> str:
     breaking = [f for f in entry["findings"] if f["severity"] == "breaking"]
     potential = [f for f in entry["findings"] if f["severity"] == "potentially_breaking"]
     buckets = partition(leads, vendor_key)
-    integrators = dedupe_by_repo(buckets[INTEGRATOR])
-    ecosystem = dedupe_by_repo(buckets[ECOSYSTEM])
+    rank = lambda rows: sorted(
+        dedupe_by_repo(rows),
+        key=lambda l: (l.get("verdict") != "confirmed", l["repo"].lower()))
+    integrators = rank(buckets[INTEGRATOR])
+    ecosystem = rank(buckets[ECOSYSTEM])
     excluded = len(buckets["vendor_owned"]) + len(buckets["corpus"])
+    swept = sorted({l.get("language", "python") for l in leads}) or ["python"]
+    languages_swept = " and ".join(swept) if len(swept) < 3 else \
+        ", ".join(swept[:-1]) + " and " + swept[-1]
 
     out: List[str] = []
     out.append(f"# {vendor.name} — breaking API changes, "
@@ -85,10 +93,11 @@ def build(vendor_key: str, entry: dict, leads: List[dict], window: dict) -> str:
 
     out.append("## Who this lands on\n")
     out.append(
-        "Every row below was confirmed by fetching the file and parsing it. "
+        "Every row below was checked by fetching the file and inspecting it. "
         "A match inside a comment, a docstring or a prose string does not "
         "count as a call site, and a file with no import, host or key tying it "
-        "to your API is discarded regardless of what it matches.\n")
+        "to your API is discarded regardless of what it matches. The evidence "
+        "column says how the call site was established.\n")
 
     if integrators:
         out.append(f"### Applications calling the affected endpoints "
@@ -112,18 +121,25 @@ def build(vendor_key: str, entry: dict, leads: List[dict], window: dict) -> str:
         "above. Nothing here is inferred from documentation or changelogs.\n"
         "- One edit to a shared schema is reported once, with the number of "
         "operations it reaches, rather than once per operation.\n"
-        "- Search covers **public GitHub repositories with Python as the "
-        "detected language only**. It is a floor, not a census: private "
-        "repositories are invisible, and other languages were not swept.\n"
-        "- Python call sites are established with the `ast` module. Other "
-        "languages fall back to a lexical scan and are labelled as weaker "
-        "evidence.\n")
+        f"- Search covers **public GitHub repositories only**, in "
+        f"{languages_swept}. It is a floor, not a census: private repositories "
+        f"are invisible, GitHub indexes only default branches, and other "
+        f"languages were not swept.\n"
+        "- Python call sites are established with the `ast` module and are "
+        "marked `parsed`. JavaScript is scanned lexically with comments "
+        "stripped and is marked `lexical`, which is weaker evidence.\n")
     return "\n".join(out) + "\n"
 
 
 def main() -> int:
     findings = {e["vendor"]: e for e in json.load(open(ROOT / "out" / "findings.json"))}
-    leads = json.load(open(ROOT / "out" / "leads.json"))
+    leads: Dict[str, List[dict]] = {}
+    for path in sorted((ROOT / "out").glob("leads*.json")):
+        language = path.stem.replace("leads_", "") if "_" in path.stem else "python"
+        for vendor_key, rows in json.load(open(path)).items():
+            for row in rows:
+                row["language"] = language
+            leads.setdefault(vendor_key, []).extend(rows)
     OUT.mkdir(parents=True, exist_ok=True)
 
     written = []

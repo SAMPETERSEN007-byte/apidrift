@@ -38,6 +38,8 @@ _CORPUS_PATTERNS = (
     r"top-pypi", r"sdists", r"pypi-mirror", r"\bmirror\b", r"^awesome-",
     r"allpythoncontent", r"pyreco", r"-dataset$", r"^dataset-", r"code-corpus",
     r"the-stack", r"github-crawl",
+    # A vendored dependency tree is a copy of other people's code.
+    r"^node_modules$", r"^vendor$", r"^third_party$", r"^bundled$",
 )
 
 # Names that mark a third-party SDK, wrapper, proxy or test double.
@@ -45,6 +47,7 @@ _ECOSYSTEM_PATTERNS = (
     r"\.py$", r"\.js$", r"\.http$", r"-sdk$", r"^sdk-", r"-client$", r"^client-",
     r"-wrapper$", r"-api$", r"^api-", r"-mock$", r"^mock-", r"local[a-z]+$",
     r"-proxy$", r"^proxy-", r"-bindings$", r"litellm", r"aisuite",
+    r"-api-gen$", r"-codegen$", r"^openapi-",
 )
 
 # Well-known ecosystem projects whose names give nothing away.
@@ -52,6 +55,8 @@ _KNOWN_ECOSYSTEM = frozenset({
     "disnake", "pycord", "nextcord", "hikari", "interactions.py", "discord.py",
     "epikcord.py", "discord.http", "litellm", "aisuite", "localstripe",
     "openworker", "uni-api", "agents", "dspy", "langchain", "llamaindex",
+    # JavaScript Discord libraries, whose names give nothing away.
+    "eris", "discord.js", "oceanic.js", "detritus", "seyfert",
 })
 
 

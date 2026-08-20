@@ -25,6 +25,15 @@ class TestClassify(unittest.TestCase):
     def test_dataset_dump_is_corpus(self):
         self.assertEqual(classify("AA-Turner/top-pypi-sdists-2000", "stripe").kind, CORPUS)
 
+    def test_vendored_dependency_tree_is_corpus(self):
+        self.assertEqual(classify("AmIgOs434/node_modules", "openai").kind, CORPUS)
+        self.assertEqual(classify("someone/vendor", "openai").kind, CORPUS)
+
+    def test_js_discord_libraries_are_ecosystem(self):
+        for repo in ("abalabahaha/eris", "acode/discord-api-gen"):
+            with self.subTest(repo=repo):
+                self.assertEqual(classify(repo, "discord").kind, ECOSYSTEM)
+
     def test_third_party_sdk_is_ecosystem(self):
         for repo in ("DisnakeDev/disnake", "AlexFlipnote/discord.http",
                      "EpikCord/EpikCord.py", "BerriAI/litellm",
