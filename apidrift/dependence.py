@@ -821,3 +821,42 @@ def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], s
     # names a schema or field, code that never names it cannot be shown to
     # depend on it, however many of the vendor's endpoints it calls.
     return [], f"`{leaf}` is never read or sent in this file"
+
+def prove_relevance(source: str, addition: Finding,
+                    vendor: Vendor) -> Tuple[List[Proof], str]:
+    """Is this repo positioned to USE something the vendor just added?
+
+    Deliberately a weaker standard than `prove()`, and the difference matters.
+    A breaking change requires dependence on the changed element -- reaching
+    the operation is not enough, which is the fix that cleared the standing
+    audit blocker. An ADDITION cannot be depended on by anyone: it did not
+    exist. So reach is not a weak substitute for the proof here, it IS the
+    proof. "You already call this resource" is the whole claim, and it is a
+    claim about opportunity, never about breakage.
+
+    Keeping the two in separate functions is the point. Sharing one would make
+    it one edit away from accepting reach as evidence of a break again.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError) as exc:
+        return [], f"unparseable python: {type(exc).__name__}"
+
+    lines = source.splitlines()
+    idioms = [s for s in (addition.signatures or []) if not s.startswith("/")]
+
+    for op_key in (addition.affected_ops or [])[:40]:
+        op_method, _, op_path = op_key.partition(" ")
+        if not op_path or op_path.startswith("#"):
+            continue
+        hits = find_operation_calls(tree, op_method.lower(), op_path, lines, vendor)
+        if hits:
+            for hit in hits:
+                hit.chain.append(f"which is `{op_method.upper()} {op_path}`")
+            return hits[:3], ""
+
+    sdk = find_sdk_calls(tree, idioms, lines)
+    if sdk:
+        return sdk[:3], ""
+    return [], (f"calls nothing on `{addition.resource or 'this resource'}`, "
+                f"so there is nothing here to adopt it into")

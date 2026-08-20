@@ -27,7 +27,9 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .classify import is_generated_path, is_vendored_path
-from .diff import BREAKING, ENDPOINT_KINDS, Finding, label_for
+from .dependence import prove_relevance
+from .diff import (ADDITIVE_LABEL, BREAKING, ENDPOINT_KINDS, Finding,
+                   label_for)
 from .loader import SpecParseError
 from .source import GitError
 from .vendors import VENDORS, Vendor, get
@@ -48,6 +50,32 @@ SKIP_DIRS = frozenset({
 MAX_FILE_BYTES = 512 * 1024
 
 PY_SUFFIX = ".py"
+
+# A suggestion should point at the code someone would actually change. Anchoring
+# 65 OpenAI additions to the same line of `test_llm.py` is technically a true
+# statement about where the API is called and useless as advice.
+_TEST_MARKERS = ("/test_", "/tests/", "/test/", "_test.py", "/conftest.py",
+                 "/examples/", "/example/", "/docs/", "/samples/", "/demo")
+
+
+def _is_incidental(rel_path: str) -> bool:
+    lowered = "/" + rel_path.lower()
+    return any(marker in lowered for marker in _TEST_MARKERS)
+
+
+# Not every addition is equally worth a developer's attention, and the
+# difference is not a matter of taste. A new field on a RESPONSE requires
+# nothing of you -- it simply arrives. A new field you may SEND, or a whole new
+# endpoint, is something you have to choose to use. Ranking by that is what
+# separates nine useful suggestions from sixty.
+_ADDITION_RANK = {
+    "endpoint_added": 0,
+    "schema_field_added": 1,        # request-side: you could start sending it
+    "param_added_optional": 2,
+    "response_field_added": 3,      # arrives whether you act or not
+}
+
+DEFAULT_OPPORTUNITY_LIMIT = 12
 
 
 @dataclass
@@ -91,7 +119,15 @@ class ScanResult:
     vendors_detected: Dict[str, int] = field(default_factory=dict)
     vendors_failed: Dict[str, str] = field(default_factory=dict)
     findings_considered: int = 0
+    additions_considered: int = 0
     impacts: List[Impact] = field(default_factory=list)
+    # Kept separate from impacts all the way to the output. Nothing here
+    # is wrong with the code; conflating the two would turn a suggestion
+    # into an alarm, and there are five times as many suggestions.
+    opportunities: List[Impact] = field(default_factory=list)
+    # Never a silent truncation. A capped list that does not say it was capped
+    # reads as a census.
+    opportunities_dropped: int = 0
     window_days: int = 90
     asof: str = ""
 
@@ -109,9 +145,13 @@ class ScanResult:
             "vendors_detected": self.vendors_detected,
             "vendors_failed": self.vendors_failed,
             "findings_considered": self.findings_considered,
+            "additions_considered": self.additions_considered,
             "impact_count": len(self.impacts),
             "breaking_count": len(self.breaking),
+            "opportunity_count": len(self.opportunities),
+            "opportunities_dropped": self.opportunities_dropped,
             "impacts": [i.as_dict() for i in self.impacts],
+            "opportunities": [o.as_dict() for o in self.opportunities],
         }
 
 
@@ -244,6 +284,8 @@ def scan_repo(
     asof: str = "",
     window_days: int = 90,
     progress=None,
+    want_opportunities: bool = False,
+    opportunity_limit: int = DEFAULT_OPPORTUNITY_LIMIT,
 ) -> ScanResult:
     from .cli import analyse          # imported here: cli imports this module
 
@@ -298,10 +340,50 @@ def scan_repo(
                     text=site.text.strip()[:120], evidence=evidence,
                     spec_window=window,
                 ))
+        opportunities_before = len(result.opportunities)
+        if want_opportunities:
+            additions = [a for a in diff.additions
+                         if a.kind in ADDITIVE_LABEL]
+            result.additions_considered += len(additions)
+            # Production code first, so a suggestion lands where someone
+            # would act on it rather than in a fixture.
+            ranked = sorted(files, key=lambda pair: _is_incidental(pair[0]))
+            for addition in additions:
+                for rel, source in ranked:
+                    proofs, _ = prove_relevance(source, addition, vendor)
+                    if not proofs:
+                        continue
+                    proof = proofs[0]
+                    operation = ""
+                    for link in proof.chain:
+                        if link.startswith("which is `"):
+                            operation = link[len("which is `"):].rstrip("`")
+                    result.opportunities.append(Impact(
+                        vendor=key, vendor_name=vendor.name, file=rel,
+                        line=proof.line, kind=addition.kind,
+                        label=ADDITIVE_LABEL.get(addition.kind, addition.kind),
+                        severity=addition.severity,
+                        subject=addition.root_cause or addition.subject,
+                        detail=addition.detail, old=addition.old,
+                        new=addition.new, operation=operation or addition.new,
+                        chain=list(proof.chain),
+                        text=proof.text.strip()[:120], evidence="",
+                        spec_window=window,
+                    ))
+                    break     # one place per addition is enough to act on
         if progress:
-            progress(f"{len(result.impacts) - before} impact(s)\n")
+            progress(f"{len(result.impacts) - before} impact(s), "
+                     f"{len(result.opportunities) - opportunities_before} "
+                     f"opportunit"
+                     f"{'y' if len(result.opportunities) - opportunities_before == 1 else 'ies'}\n")
 
     result.impacts.sort(key=lambda i: (i.vendor, i.file, i.line, i.subject))
+    result.opportunities.sort(
+        key=lambda i: (_ADDITION_RANK.get(i.kind, 9), i.vendor, i.subject))
+    if opportunity_limit and len(result.opportunities) > opportunity_limit:
+        result.opportunities_dropped = (
+            len(result.opportunities) - opportunity_limit)
+        result.opportunities = result.opportunities[:opportunity_limit]
     return result
 
 
@@ -335,6 +417,7 @@ def to_markdown(result: ScanResult) -> str:
             f"against every calling file; none could be proven to reach code "
             f"here."
         )
+        lines.extend(_opportunity_markdown(result))
         return "\n".join(lines) + "\n"
 
     by_file: Dict[str, List[Impact]] = {}
@@ -377,15 +460,62 @@ def to_markdown(result: ScanResult) -> str:
                 f"{impact.spec_window}"
             )
             lines.append("")
+    lines.extend(_opportunity_markdown(result))
     return "\n".join(lines) + "\n"
+
+
+def _opportunity_markdown(result: ScanResult) -> List[str]:
+    """Additions are rendered apart from impacts, and said to be optional.
+
+    Nothing here is broken. Presenting a suggestion in the same table as a
+    break is how a useful tool becomes one people mute.
+    """
+    if not result.opportunities:
+        if result.additions_considered:
+            return ["", f"_{result.additions_considered} additions were "
+                        f"checked; none reach a resource this repo calls._"]
+        return []
+    out = ["", f"## {len(result.opportunities)} new capabilit"
+               f"{'y' if len(result.opportunities) == 1 else 'ies'} you could "
+               f"adopt", "",
+           "_Nothing below is broken. These are things the vendor added in "
+           "the same window, on resources this repo already calls._", "",
+           "| Vendor | What is new | Where you already call it |",
+           "|---|---|---|"]
+    for o in result.opportunities:
+        out.append(f"| {o.vendor_name} | {o.label}: `{o.subject}` "
+                   f"| `{o.file}:{o.line}` |")
+    if result.opportunities_dropped:
+        out += ["", f"_{result.opportunities_dropped} further additions ranked "
+                    f"lower and are not listed — mostly new response fields, "
+                    f"which arrive whether you act on them or not. Run with "
+                    f"`--opportunity-limit 0` to see every one._"]
+    return out
+
+
+def _opportunity_lines(result: ScanResult) -> List[str]:
+    if not result.opportunities:
+        return []
+    out = ["", f"{len(result.opportunities)} thing"
+               f"{'' if len(result.opportunities) == 1 else 's'} this vendor "
+               f"added that you are positioned to use:"]
+    for o in result.opportunities:
+        out.append(f"  {o.file}:{o.line}: {o.vendor_name} {o.label} — "
+                   f"{o.subject}")
+    if result.opportunities_dropped:
+        out.append(f"  … and {result.opportunities_dropped} more, ranked "
+                   f"lower (mostly new response fields, which arrive whether "
+                   f"you act or not). --opportunity-limit 0 shows all.")
+    return out
 
 
 def to_text(result: ScanResult) -> str:
     """Terminal/CI output: one line per impact, in the file:line:message form
     every editor and log scraper already knows how to jump to."""
     if not result.impacts:
-        return (f"apidrift: clean — {result.findings_considered} breaking "
-                f"changes checked, none reach this repo\n")
+        head = (f"apidrift: clean — {result.findings_considered} breaking "
+                f"changes checked, none reach this repo")
+        return "\n".join([head] + _opportunity_lines(result)) + "\n"
     out = []
     for impact in result.impacts:
         out.append(
@@ -396,6 +526,7 @@ def to_text(result: ScanResult) -> str:
     out.append("")
     out.append(f"apidrift: {len(result.breaking)} breaking change(s) land on "
                f"this repository")
+    out.extend(_opportunity_lines(result))
     return "\n".join(out) + "\n"
 
 

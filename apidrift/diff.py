@@ -113,6 +113,9 @@ class Finding:
     # request body is named `ResponseProperties`.
     in_request: bool = False
     in_response: bool = False
+    # The resource an addition belongs to, used to judge whether a
+    # repo already working with it would care.
+    resource: str = ""
     root_cause: str = ""
 
     def as_dict(self) -> Dict[str, object]:
@@ -152,6 +155,11 @@ class DiffResult:
     specs_changed: int = 0
     raw_finding_count: int = 0
     findings: List[Finding] = field(default_factory=list)
+    # Additions kept apart from findings on purpose. "What can I now use?"
+    # is not a weaker version of "what did you take away?" -- it has a
+    # different proof (relevance, not dependence) and a different urgency,
+    # and folding it in would change every severity count downstream.
+    additions: List[Finding] = field(default_factory=list)
 
     def by_severity(self, severity: str) -> List[Finding]:
         return [f for f in self.findings if f.severity == severity]
@@ -553,6 +561,11 @@ def caller_visible_path(op_key: str) -> str:
     that produced 15 of 79 breaking findings, none of which breaks anybody.
     """
     method, _, path = op_key.partition(" ")
+    # A query string is not part of the path. OpenAI publishes
+    # `/responses?beta=true` as a path key alongside `/responses`; the endpoint
+    # is the same one and the flag is a parameter, so counting it as a NEW
+    # endpoint told six callers they had gained something they already had.
+    path = path.partition("?")[0]
     return f"{method} {_PATH_PARAM.sub('{}', path)}"
 
 
@@ -569,6 +582,111 @@ def _match_renamed(
         if op.operation_id and op.operation_id in by_id:
             matches[key] = by_id[op.operation_id]
     return matches
+
+
+# --------------------------------------------------------------------------
+# additions
+#
+# The breaking surface is small and the additive surface is not. Measured over
+# the same 90-day window across the five vendors here: 64 breaking changes,
+# against 112 new operations and 332 new optional fields. A tool that only
+# fires on breakage fires almost never for any given repository -- 22 real
+# repositories were scanned against those 64 changes and none was affected.
+#
+# These are not findings. Nothing here is wrong with anyone's code. The claim
+# is weaker and different: this vendor now offers something, and this repo is
+# positioned to use it.
+# --------------------------------------------------------------------------
+
+OPPORTUNITY = "opportunity"
+
+ADDITIVE_KINDS = frozenset({
+    "endpoint_added", "schema_field_added", "param_added_optional",
+    "response_field_added",
+})
+
+ADDITIVE_LABEL = {
+    "endpoint_added": "new endpoint",
+    "schema_field_added": "new optional field",
+    "param_added_optional": "new optional parameter",
+    "response_field_added": "new field in a response",
+}
+
+
+def _resource_of(path: str) -> str:
+    """The first static segment of a path, which is the resource it belongs to.
+
+    `/v1/subscriptions/{id}/cancel` and `/v1/subscriptions` are the same
+    resource; `/v1/charges` is not. This is what makes a NEW endpoint relevant
+    to a repo that has never called it: they already work with this resource.
+    """
+    for segment in path.split("/"):
+        if not segment or "{" in segment:
+            continue
+        if segment.lower() in {"v1", "v2", "v3", "api", "2010-04-01"}:
+            continue
+        return segment
+    return ""
+
+
+def _diff_additions(old: Spec, new: Spec) -> List[Finding]:
+    """What a caller could newly use, with enough context to judge relevance."""
+    out: List[Finding] = []
+
+    old_visible = {caller_visible_path(k) for k in old.operations}
+    for key in sorted(set(new.operations) - set(old.operations)):
+        if caller_visible_path(key) in old_visible:
+            continue          # a renamed parameter, not a new endpoint
+        op = new.operations[key]
+        finding = _mk(
+            op, "endpoint_added", OPPORTUNITY,
+            f"`{key}` is new since the last release",
+            subject=op.path, old="<absent>", new=key,
+        )
+        finding.root_cause = op.path
+        finding.resource = _resource_of(op.path)
+        # Sibling operations on the same resource are what a repo already
+        # calling this resource would be found by.
+        finding.affected_ops = sorted(
+            k for k in new.operations
+            if _resource_of(k.partition(" ")[2]) == finding.resource
+            and k != key
+        )[:200]
+        finding.affected_op_count = len(finding.affected_ops)
+        out.append(finding)
+
+    for name in sorted(set(old.schemas) & set(new.schemas)):
+        before, after = old.schemas[name], new.schemas[name]
+        gained = sorted(set(after.fields) - set(before.fields))
+        if not gained:
+            continue
+        ops = new.reachable.get(name, []) or old.reachable.get(name, [])
+        if not ops:
+            continue          # nothing a caller touches; not an opportunity
+        in_request = new.used_in_requests(name)
+        in_response = new.used_in_responses(name)
+        carrier = _schema_op(name)
+        carrier.path = ops[0].partition(" ")[2] or carrier.path
+        carrier.method = (ops[0].partition(" ")[0] or "get").lower()
+        for field_name in gained:
+            if after.fields[field_name].required:
+                continue      # a newly REQUIRED field is a break, reported there
+            kind = "schema_field_added" if in_request else "response_field_added"
+            finding = _mk(
+                carrier, kind, OPPORTUNITY,
+                f"`{name}.{field_name}` is new and optional",
+                subject=f"{name}.{field_name}",
+                old="<absent>", new=after.fields[field_name].signature(),
+            )
+            finding.root_cause = f"{name}.{field_name}"
+            finding.in_request = bool(in_request)
+            finding.in_response = bool(in_response)
+            finding.resource = _resource_of(carrier.path)
+            finding.affected_ops = ops[:200]
+            finding.affected_op_count = len(ops)
+            out.append(finding)
+
+    return out
 
 
 def diff_specs(vendor: str, old: Spec, new: Spec, meta: Dict[str, str]) -> DiffResult:
@@ -616,6 +734,8 @@ def diff_specs(vendor: str, old: Spec, new: Spec, meta: Dict[str, str]) -> DiffR
         findings.extend(_diff_operation(old.operations[key], new.operations[key]))
 
     findings.extend(_diff_schema_views(old, new))
+
+    result.additions = _diff_additions(old, new)
 
     old_servers, new_servers = set(old.servers), set(new.servers)
     if old_servers and new_servers and not (old_servers & new_servers):

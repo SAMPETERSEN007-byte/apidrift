@@ -18,6 +18,41 @@ PY_BIN = str(ROOT / ".venv" / "bin" / "python")
 
 MUTATIONS = [
     (
+        "a query variant counted as a new endpoint again",
+        "apidrift/diff.py",
+        '    path = path.partition("?")[0]',
+        "    path = path",
+        ["test_a_query_variant_of_an_existing_path_is_not_a_new_endpoint"],
+    ),
+    (
+        "a newly REQUIRED field offered as an opportunity",
+        "apidrift/diff.py",
+        "            if after.fields[field_name].required:\n                continue",
+        "            if False:\n                continue",
+        ["test_a_new_REQUIRED_field_is_a_break_and_not_an_opportunity"],
+    ),
+    (
+        "an addition on a schema no operation reaches is still offered",
+        "apidrift/diff.py",
+        "        if not ops:\n            continue          # nothing a caller touches; not an opportunity",
+        "        if False:\n            continue          # nothing a caller touches; not an opportunity",
+        ["test_a_schema_no_operation_reaches_is_not_an_opportunity"],
+    ),
+    (
+        "relevance stops requiring the repo to call the resource",
+        "apidrift/dependence.py",
+        "    sdk = find_sdk_calls(tree, idioms, lines)\n    if sdk:\n        return sdk[:3], \"\"\n    return [], (f\"calls nothing on",
+        "    sdk = find_sdk_calls(tree, idioms, lines)\n    return sdk[:3] or [Proof(kind=OPERATION_CALL, line=1, text=\"\")], (f\"calls nothing on",
+        ["test_a_repo_calling_nothing_on_it_is_not"],
+    ),
+    (
+        "a fixture ranked as good a place for advice as production",
+        "apidrift/scan.py",
+        "    return any(marker in lowered for marker in _TEST_MARKERS)",
+        "    return False",
+        ["test_a_fixture_is_a_worse_place_to_put_advice_than_production"],
+    ),
+    (
         "path matching goes host-blind again",
         "apidrift/dependence.py",
         "            if hosts and not any(_is_vendor_host(h, vendor) for h in hosts):",

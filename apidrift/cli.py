@@ -57,13 +57,18 @@ def analyse(vendor: Vendor, cache_dir: Path, since: str, fetch: bool) -> DiffRes
         for finding in sub.findings:
             finding.spec_file = pair.path
         result.findings.extend(sub.findings)
+        for addition in sub.additions:
+            addition.spec_file = pair.path
+        result.additions.extend(sub.additions)
 
     if parse_errors and not result.findings:
         raise SpecParseError("; ".join(parse_errors[:3]))
 
     result.raw_finding_count = len(result.findings)
     result.findings = collapse(result.findings)
+    result.additions = collapse(result.additions)
     sig.annotate(result.findings, vendor)
+    sig.annotate(result.additions, vendor)
     from .diff import SEVERITY_RANK
     result.findings.sort(
         key=lambda f: (SEVERITY_RANK[f.severity], f.spec_file, f.path, f.method, f.kind, f.subject)
@@ -79,7 +84,8 @@ def scan_main(argv: List[str]) -> int:
     in front of me". Only the second one has an exit status worth gating a
     build on, so only the second one returns 1 for a finding.
     """
-    from .scan import scan_repo, to_markdown, to_text, write_outputs
+    from .scan import (DEFAULT_OPPORTUNITY_LIMIT, scan_repo,
+                       to_markdown, to_text, write_outputs)
 
     parser = argparse.ArgumentParser(
         prog="apidrift scan",
@@ -102,6 +108,13 @@ def scan_main(argv: List[str]) -> int:
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--exit-zero", action="store_true",
                         help="always exit 0, even when impacts are found")
+    parser.add_argument("--opportunity-limit", type=int, default=None,
+                        help="cap the adoption list (0 = no cap). What is "
+                             "dropped is always stated.")
+    parser.add_argument("--opportunities", action="store_true",
+                        help="also report what the vendor ADDED that this repo "
+                             "is positioned to use. Never affects exit status: "
+                             "nothing here is broken.")
     args = parser.parse_args(argv)
 
     root = Path(args.path).expanduser().resolve()
@@ -127,7 +140,10 @@ def scan_main(argv: List[str]) -> int:
     result = scan_repo(
         root=root, since=since, vendor_keys=keys, cache_dir=Path(args.cache),
         fetch=args.fetch, asof=today.isoformat(), window_days=args.days,
-        progress=progress,
+        progress=progress, want_opportunities=args.opportunities,
+        opportunity_limit=(DEFAULT_OPPORTUNITY_LIMIT
+                           if args.opportunity_limit is None
+                           else args.opportunity_limit),
     )
 
     if args.format == "json":
