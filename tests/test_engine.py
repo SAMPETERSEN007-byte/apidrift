@@ -1175,3 +1175,254 @@ class TestNotationIsNotSemantics(unittest.TestCase):
             {"name": "cursor", "in": "query", "required": False,
              "schema": {"type": "integer"}})
         self.assertIn("param_type_changed", kinds(run(self.old, self.new)))
+
+
+class TestDiscriminatorMapping(unittest.TestCase):
+    """`discriminator.mapping` names subtypes with a bare pointer STRING.
+
+    The only reference form in OpenAPI that is not a `{"$ref": ...}` object, so
+    a walk looking for the object form goes straight past it. The word
+    `discriminator` did not appear anywhere in this codebase until an
+    adversarial audit found Adyen's `Resource`, whose subtypes
+    `BalanceAccountResource` and `MerchantAccountResource` have exactly one
+    reference each in the whole document -- a mapping value. Blind to it, they
+    were called orphans and their removal suppressed.
+    """
+
+    def _doc(self):
+        doc = copy.deepcopy(BASE)
+        doc["components"]["schemas"]["Resource"] = {
+            "type": "object",
+            "properties": {"type": {"type": "string"}},
+            "discriminator": {
+                "propertyName": "type",
+                "mapping": {"card": "#/components/schemas/CardResource"},
+            },
+        }
+        doc["components"]["schemas"]["CardResource"] = {
+            "type": "object", "properties": {"pan": {"type": "string"}}}
+        doc["paths"]["/charges"]["post"]["requestBody"]["content"][
+            "application/json"]["schema"]["properties"]["resource"] = {
+                "$ref": "#/components/schemas/Resource"}
+        return doc
+
+    def test_a_subtype_named_only_by_a_mapping_is_reachable(self):
+        spec_ = spec(self._doc())
+        self.assertTrue(
+            spec_.reachable.get("CardResource"),
+            "a discriminator mapping is how this subtype is reached at all")
+
+    def test_removing_a_subtype_named_only_by_a_mapping_is_reported(self):
+        old, new = self._doc(), self._doc()
+        del new["components"]["schemas"]["CardResource"]
+        del new["components"]["schemas"]["Resource"]["discriminator"]["mapping"]["card"]
+        removed = {f.subject for f in run(old, new).findings
+                   if f.kind == "schema_removed"}
+        self.assertIn("CardResource", removed)
+
+
+class TestSubsumptionGuards(unittest.TestCase):
+    """The `not direct` guard on subsumption is load-bearing.
+
+    An operation that names a schema itself can observe its removal no matter
+    what happened to the schema's other parents. Without this guard PayPal's
+    error_400/401/403/404/409/422/500 all disappear -- each is the declared body
+    of a status-coded response on live operations AND an arm of `error_default`
+    -- along with twenty Cloudflare schemas that are request surfaces in their
+    own right.
+    """
+
+    def _paypal_shaped(self):
+        """`error_409` as PayPal actually writes it: named directly by an
+        operation's 409 response AND listed inside the `error_default` union."""
+        doc = copy.deepcopy(BASE)
+        doc["components"]["schemas"]["Error409"] = {
+            "type": "object", "properties": {"issue": {"type": "string"}}}
+        doc["components"]["schemas"]["ErrorDefault"] = {
+            "oneOf": [{"$ref": "#/components/schemas/Error409"}]}
+        doc["paths"]["/charges"]["post"]["responses"]["409"] = {
+            "content": {"application/json": {
+                "schema": {"$ref": "#/components/schemas/Error409"}}}}
+        doc["paths"]["/charges"]["post"]["responses"]["default"] = {
+            "content": {"application/json": {
+                "schema": {"$ref": "#/components/schemas/ErrorDefault"}}}}
+        return doc
+
+    def test_a_schema_an_operation_names_directly_is_never_subsumed(self):
+        old, new = self._paypal_shaped(), self._paypal_shaped()
+        del new["components"]["schemas"]["Error409"]
+        del new["components"]["schemas"]["ErrorDefault"]
+        del new["paths"]["/charges"]["post"]["responses"]["409"]
+        del new["paths"]["/charges"]["post"]["responses"]["default"]
+        removed = {f.subject for f in run(old, new).findings
+                   if f.kind == "schema_removed"}
+        self.assertIn("Error409", removed,
+                      "an operation named it directly, so its removal is visible")
+
+    def test_a_self_recursive_schema_is_not_its_own_outer_schema(self):
+        """A self-referencing schema satisfies `parents <= removed` with no
+        outer schema in existence, so the chain would have no root to be
+        reported at and the removal would vanish entirely.
+
+        Asserted against `_removal_is_observable` directly, and deliberately so.
+        End to end this input cannot be built: `operation_schema_roots` walks
+        the whole request/response subtree, so anything reachable at all is also
+        `direct`, and the `not direct` guard blocks the branch first. The guard
+        below is therefore defence against a future narrowing of `rooted_at`
+        rather than a live defect -- which is exactly why it is pinned here,
+        where a mutation can still kill it, instead of behind a pipeline test
+        that would stay green either way.
+        """
+        from apidrift.diff import _removal_is_observable
+        old = spec(copy.deepcopy(BASE))
+        new = spec(copy.deepcopy(BASE))
+        # No operation names it directly -- otherwise the `not direct` guard
+        # short-circuits the branch under test and this would pass either way.
+        old.rooted_at = {}
+        view = old.schemas["Card"]
+        observable, reason = _removal_is_observable(
+            "Card", view, ops=["GET /charges"], removed={"Card"},
+            incoming={"Card": {"Card"}}, old=old, new=new,
+            old_names={"GET /charges": {"id"}}, new_names={"GET /charges": set()},
+            truncated=set(), reachability_has_signal=True, new_roots={},
+        )
+        self.assertNotEqual("subsumed", reason,
+                            "a schema is not the outer schema that subsumes it")
+
+    def test_a_rename_inside_a_union_arm_is_found_by_what_the_parent_POINTS_AT(self):
+        """OpenAI renamed `Conversation-2` to `ResponseConversation` inside the
+        `anyOf` of `Response.conversation` -- same `{id: string}`, same
+        position, a different name.
+
+        The one-level field map records that property as `anyOf` and nothing
+        typed `->Conversation-2`, so the field comparison has nothing to
+        compare. Comparing the whole parent does not work either: `Response`
+        changed in other ways in the same release, which would call the rename
+        a break. What settles it is comparing what the parent POINTS AT.
+        """
+        old = copy.deepcopy(BASE)
+        new = copy.deepcopy(BASE)
+        for doc in (old, new):
+            doc["components"]["schemas"]["Wrapper"] = {
+                "type": "object",
+                "properties": {"link": {"anyOf": [
+                    {"$ref": "#/components/schemas/Link"}, {"type": "null"}]}},
+            }
+            doc["components"]["schemas"]["Link"] = {
+                "type": "object", "properties": {"id": {"type": "string"}},
+                "required": ["id"]}
+            doc["paths"]["/charges"]["get"]["responses"]["200"]["content"][
+                "application/json"]["schema"]["properties"]["wrapper"] = {
+                    "$ref": "#/components/schemas/Wrapper"}
+        # Renamed, and the parent independently gains an unrelated field so a
+        # whole-parent comparison would refuse.
+        new["components"]["schemas"]["LinkV2"] = new["components"]["schemas"].pop("Link")
+        new["components"]["schemas"]["Wrapper"]["properties"]["link"]["anyOf"][0] = {
+            "$ref": "#/components/schemas/LinkV2"}
+        new["components"]["schemas"]["Wrapper"]["properties"]["note"] = {"type": "string"}
+        removed = {f.subject for f in run(old, new).findings
+                   if f.kind == "schema_removed"}
+        self.assertNotIn("Link", removed)
+
+    def test_a_union_arm_that_changed_shape_is_still_a_break(self):
+        """The control for the test above."""
+        old = copy.deepcopy(BASE)
+        new = copy.deepcopy(BASE)
+        for doc in (old, new):
+            doc["components"]["schemas"]["Wrapper"] = {
+                "type": "object",
+                "properties": {"link": {"anyOf": [
+                    {"$ref": "#/components/schemas/Link"}, {"type": "null"}]}},
+            }
+            doc["components"]["schemas"]["Link"] = {
+                "type": "object", "properties": {"id": {"type": "string"}},
+                "required": ["id"]}
+            doc["paths"]["/charges"]["get"]["responses"]["200"]["content"][
+                "application/json"]["schema"]["properties"]["wrapper"] = {
+                    "$ref": "#/components/schemas/Wrapper"}
+        new["components"]["schemas"]["LinkV2"] = {
+            "type": "object", "properties": {"uuid": {"type": "string"}},
+            "required": ["uuid"]}
+        del new["components"]["schemas"]["Link"]
+        new["components"]["schemas"]["Wrapper"]["properties"]["link"]["anyOf"][0] = {
+            "$ref": "#/components/schemas/LinkV2"}
+        removed = {f.subject for f in run(old, new).findings
+                   if f.kind == "schema_removed"}
+        self.assertIn("Link", removed)
+
+
+class TestRenameMatching(unittest.TestCase):
+    """An operationId is a label the vendor controls, and vendors recycle them.
+
+    Cloudflare renamed the operationId of
+    `POST /accounts/{accountId}/resource-library/applications` and put the
+    freed-up `createApplication` on a brand-new, unrelated endpoint
+    `POST /accounts/{account_id}/containers/applications`. Matching on the id
+    alone paired those two, diffed two different endpoints' response bodies
+    against each other, and attributed every unmatched field to an operation
+    that does not exist in the old spec -- nine fabricated findings.
+    """
+
+    def _cloudflare_shaped(self):
+        old = copy.deepcopy(BASE)
+        new = copy.deepcopy(BASE)
+        body = {"type": "object", "properties": {
+            "human_id": {"type": "string"}, "hostnames": {"type": "string"}}}
+        old["paths"]["/accounts/{accountId}/resource-library/applications"] = {
+            "post": {"operationId": "createApplication",
+                     "parameters": [{"name": "accountId", "in": "path",
+                                     "required": True,
+                                     "schema": {"type": "string"}}],
+                     "responses": {"201": {"content": {
+                         "application/json": {"schema": body}}}}}}
+        # Same URL, parameter renamed, operationId changed.
+        new["paths"]["/accounts/{account_id}/resource-library/applications"] = {
+            "post": {"operationId": "createResourceLibraryApplication",
+                     "parameters": [{"name": "account_id", "in": "path",
+                                     "required": True,
+                                     "schema": {"type": "string"}}],
+                     "responses": {"201": {"content": {
+                         "application/json": {"schema": body}}}}}}
+        # A genuinely new endpoint that inherited the freed-up operationId.
+        new["paths"]["/accounts/{account_id}/containers/applications"] = {
+            "post": {"operationId": "createApplication",
+                     "parameters": [{"name": "account_id", "in": "path",
+                                     "required": True,
+                                     "schema": {"type": "string"}}],
+                     "responses": {"201": {"content": {"application/json": {
+                         "schema": {"type": "object",
+                                    "properties": {"id": {"type": "string"}}}}}}}}}
+        return old, new
+
+    def test_a_recycled_operationId_does_not_pair_two_different_endpoints(self):
+        old, new = self._cloudflare_shaped()
+        result = run(old, new)
+        fabricated = [f for f in result.findings
+                      if "containers/applications" in f.path]
+        self.assertEqual(
+            [], fabricated,
+            "an endpoint absent from the old spec cannot have lost a field")
+
+    def test_the_same_URL_under_a_new_parameter_name_is_still_matched(self):
+        """The control. If the URL pass stops matching, a parameter rename
+        becomes an endpoint_removed plus an endpoint_added, which is the
+        loudest false positive this tool can emit.
+
+        No operationId on either side, deliberately: with one, the id pass
+        could rescue the match and this would pass without the URL pass ever
+        running.
+        """
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        body = {"responses": {"200": {"content": {"application/json": {
+            "schema": {"type": "object", "properties": {"id": {"type": "string"}}}}}}}}
+        old["paths"]["/widgets/{widgetId}"] = {"get": dict(
+            body, parameters=[{"name": "widgetId", "in": "path", "required": True,
+                               "schema": {"type": "string"}}])}
+        new["paths"]["/widgets/{id}"] = {"get": dict(
+            body, parameters=[{"name": "id", "in": "path", "required": True,
+                               "schema": {"type": "string"}}])}
+        found = {f.kind for f in run(old, new).findings if "widgets" in f.path}
+        self.assertNotIn("endpoint_removed", found,
+                         "a byte-identical URL with a renamed parameter is not a removal")
+        self.assertNotIn("endpoint_moved", found,
+                         "nor is it a move -- the URL a caller writes is unchanged")

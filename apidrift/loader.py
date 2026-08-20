@@ -563,6 +563,10 @@ class SchemaView:
     kind: str                      # object | array | enum | primitive | union
     enum: Optional[Tuple[str, ...]] = None
     item: Optional[str] = None     # for an array: what its elements are
+    # `discriminator.mapping` KEYS -- the values a caller actually puts in the
+    # discriminator property. Unlike the schema names they point at, these are
+    # on the wire, so losing one narrows what a caller may send.
+    subtypes: Tuple[str, ...] = ()
 
 
 def _ref_name(node: Any) -> Optional[str]:
@@ -585,6 +589,39 @@ def _ref_name(node: Any) -> Optional[str]:
     return None
 
 
+def _discriminator_targets(node: Any) -> List[str]:
+    """Subtypes named through `discriminator.mapping`.
+
+    The one pointer form in OpenAPI that is a bare STRING rather than a
+    `{"$ref": ...}` object, so a walk that looks for the object form goes
+    straight past it. The word `discriminator` did not appear anywhere in this
+    codebase until now, and Adyen's `Resource` names every one of its subtypes
+    that way -- `BalanceAccountResource` and `MerchantAccountResource` have
+    exactly one reference each in the whole document and it is a mapping value.
+    Blind to it, the reachability graph called them orphans.
+    """
+    if not isinstance(node, dict):
+        return []
+    disc = node.get("discriminator")
+    if not isinstance(disc, dict):
+        return []
+    mapping = disc.get("mapping")
+    if not isinstance(mapping, dict):
+        return []
+    return [str(v).rsplit("/", 1)[-1] for v in mapping.values()
+            if isinstance(v, str) and v.startswith("#/")]
+
+
+def _discriminator_keys(node: Any) -> Tuple[str, ...]:
+    """The discriminator VALUES a caller may send, sorted."""
+    if not isinstance(node, dict):
+        return ()
+    disc = node.get("discriminator")
+    if not isinstance(disc, dict) or not isinstance(disc.get("mapping"), dict):
+        return ()
+    return tuple(sorted(str(k) for k in disc["mapping"]))
+
+
 def _direct_refs(node: Any, depth: int = 0) -> List[str]:
     """Every schema name referenced inside `node`, without following them."""
     out: List[str] = []
@@ -594,6 +631,7 @@ def _direct_refs(node: Any, depth: int = 0) -> List[str]:
         for item in node:
             out.extend(_direct_refs(item, depth + 1))
         return out
+    out.extend(_discriminator_targets(node))
     name = _ref_name(node)
     if name:
         out.append(name)
@@ -720,6 +758,7 @@ def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
             kind=stype,
             enum=_effective_enum(merged, resolver),
             item=_item_type(merged, resolver),
+            subtypes=_discriminator_keys(merged),
         )
     return views
 

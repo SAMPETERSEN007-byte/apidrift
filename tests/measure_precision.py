@@ -173,6 +173,19 @@ def ref_sites(node: Any, target: Optional[str], path: Tuple[Any, ...] = ()) -> L
         if (ref == target if target is not None
                 else isinstance(ref, str) and "/schemas/" in ref):
             found.append(path)
+        # `discriminator.mapping` values are bare pointer STRINGS, the only
+        # reference form in OpenAPI that is not a `{"$ref": ...}` object. Adyen
+        # names `BalanceAccountResource` and `MerchantAccountResource` nowhere
+        # else, so a walk that looks only for the object form calls them
+        # orphans and refutes two real removals.
+        disc = node.get("discriminator")
+        if isinstance(disc, dict) and isinstance(disc.get("mapping"), dict):
+            for slot, pointer in disc["mapping"].items():
+                if not isinstance(pointer, str):
+                    continue
+                if (pointer == target if target is not None
+                        else "/schemas/" in pointer):
+                    found.append(path + ("discriminator", "mapping", slot))
         for key, value in node.items():
             found.extend(ref_sites(value, target, path + (key,)))
     elif isinstance(node, list):

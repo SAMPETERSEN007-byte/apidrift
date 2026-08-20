@@ -590,15 +590,50 @@ def caller_visible_path(op_key: str) -> str:
 def _match_renamed(
     removed: Dict[str, Operation], added: Dict[str, Operation]
 ) -> Dict[str, str]:
-    """Match removed->added ops that share an operationId (a rename, not a removal)."""
-    by_id = {}
+    """Match removed->added ops that are the same operation under another name.
+
+    Two passes, and the ORDER is the whole point.
+
+    An operationId is a label the vendor controls and RECYCLES. Cloudflare
+    renamed the operationId of `POST /accounts/{accountId}/resource-library/
+    applications` to `createResourceLibraryApplication` and put the freed-up
+    `createApplication` on a brand-new, unrelated endpoint,
+    `POST /accounts/{account_id}/containers/applications`. Matching on the id
+    alone paired those two, and `_diff_operation` then diffed two different
+    endpoints' response bodies against each other and attributed every
+    unmatched field to an operation that does not exist in the old spec at
+    all -- nine fabricated `response_field_removed` findings.
+
+    The caller-visible path is not a label; it is the URL. When it matches, the
+    two ARE the same endpoint and only a parameter name moved. So that pass
+    runs first and claims its targets, and the operationId pass only gets what
+    is left -- and only within the same HTTP method, because `GET /x` and
+    `DELETE /x` sharing an id is not a rename either.
+    """
+    matches: Dict[str, str] = {}
+    claimed: Set[str] = set()
+
+    by_visible: Dict[str, List[str]] = {}
+    for key in added:
+        by_visible.setdefault(caller_visible_path(key), []).append(key)
+    for key in removed:
+        candidates = [k for k in by_visible.get(caller_visible_path(key), ())
+                      if k not in claimed]
+        if candidates:
+            matches[key] = candidates[0]
+            claimed.add(candidates[0])
+
+    by_id: Dict[Tuple[str, str], str] = {}
     for key, op in added.items():
         if op.operation_id:
-            by_id.setdefault(op.operation_id, key)
-    matches: Dict[str, str] = {}
+            by_id.setdefault((op.method, op.operation_id), key)
     for key, op in removed.items():
-        if op.operation_id and op.operation_id in by_id:
-            matches[key] = by_id[op.operation_id]
+        if key in matches or not op.operation_id:
+            continue
+        target = by_id.get((op.method, op.operation_id))
+        if target and target not in claimed:
+            matches[key] = target
+            claimed.add(target)
     return matches
 
 
@@ -977,14 +1012,14 @@ def _field_shape(field: Field, spec: Spec) -> Optional[Tuple]:
             # Resolved on both sides or not at all. Answering "array" here
             # while the inline form answered None made the same array compare
             # unequal to itself purely on notation.
-            return ("array", view.item) if view.item else None
+            return ("array", _item_shape(view.item, spec)) if view.item else None
         return ("scalar", view.kind)
     if field.enum:
         return ("enum", field.enum)
     if field.shape:
         return ("object", field.shape)
     if field.type == "array":
-        return ("array", field.item) if field.item else None
+        return ("array", _item_shape(field.item, spec)) if field.item else None
     if field.type in ("object", "any", "oneOf", "anyOf"):
         # Too coarse to call equivalent without more resolution.
         return None
@@ -1097,7 +1132,7 @@ def _schema_leaf_names(view: "SchemaView") -> Set[str]:
     return {_TYPE_ANNOTATION.sub("", f).rsplit(".", 1)[-1] for f in view.fields}
 
 
-def _shape_at_parents(name: str, parents: Set[str],
+def _shape_at_parents(name: str, view, parents: Set[str],
                       old: Spec, new: Spec) -> bool:
     """Does every surviving parent still present the same shape where it
     pointed at `name`?
@@ -1109,6 +1144,7 @@ def _shape_at_parents(name: str, parents: Set[str],
     definition of the same thing are the same thing -- it was just never asked
     about the schema that disappeared.
     """
+    compared = 0
     for parent in parents:
         before, after = old.schemas.get(parent), new.schemas.get(parent)
         if before is None or after is None:
@@ -1116,12 +1152,64 @@ def _shape_at_parents(name: str, parents: Set[str],
         for field_name, field in before.fields.items():
             if field.type != f"->{name}":
                 continue
+            compared += 1
             replacement = after.fields.get(field_name)
             if replacement is None:
                 return False
             if _field_shape(field, old) != _field_shape(replacement, new):
                 return False
-    return True
+    if compared:
+        return True
+    # Nothing was compared: the parent reaches the schema from a place this
+    # one-level field map does not model -- an array's items, a `oneOf` arm, a
+    # `discriminator.mapping`. Returning True here on the strength of a loop
+    # that never ran is the same hole as the orphan rule's dereferenced
+    # document, so ask questions that ARE answerable instead.
+    #
+    # First: does the parent still reference a schema of the identical shape?
+    # OpenAI renamed `Conversation-2` to `ResponseConversation` inside the
+    # `anyOf` of `Response.conversation` -- same `{id: string}`, same position,
+    # a different name. `Response` itself changed in other ways, so comparing
+    # the whole parent would have called that a break; comparing what it points
+    # AT finds the rename.
+    # Every parent references `name` by construction -- `_incoming_refs` is
+    # built from exactly these ref lists -- so there is no "does it?" to guard.
+    want = _view_shape(view, old)
+    for parent in parents:
+        before, after = old.schemas.get(parent), new.schemas.get(parent)
+        if before is None or after is None:
+            return False
+        compared += 1
+        if not any(_view_shape(after_ref, new) == want
+                   for after_ref in (new.schemas[r] for r in after.refs
+                                     if r in new.schemas)):
+            return False
+    if compared:
+        return True
+    # Last: a parent whose whole contract is unchanged cannot be presenting a
+    # different one at the position this schema used to occupy.
+    return all(_view_shape(old.schemas[p], old) == _view_shape(new.schemas[p], new)
+               for p in parents
+               if p in old.schemas and p in new.schemas)
+
+
+def _item_shape(item: Optional[str], spec: Spec) -> Optional[object]:
+    """What an array's elements are, resolved past the element's NAME.
+
+    `("array", "->Card")` versus `("array", "->CardV2")` compares unequal on
+    two names for the same body, which is the very thing this module keeps
+    having to unlearn. Resolve the element to its own shape instead.
+    """
+    if item is None or not item.startswith("->"):
+        return item
+    view = spec.schemas.get(item[2:])
+    if view is None:
+        return item
+    if view.fields:
+        return ("object", tuple(sorted(view.fields)))
+    if view.enum:
+        return ("enum", view.enum)
+    return ("scalar", view.kind)
 
 
 def _view_shape(view, spec: Spec) -> Tuple:
@@ -1132,7 +1220,7 @@ def _view_shape(view, spec: Spec) -> Tuple:
     same enum and the same required set are the same thing on the wire no
     matter what the spec author calls them.
     """
-    return (view.kind, view.enum, tuple(sorted(view.required)),
+    return (view.kind, view.enum, tuple(sorted(view.required)), view.subtypes,
             tuple((f, _field_shape(field, spec))
                   for f, field in sorted(view.fields.items())))
 
@@ -1223,11 +1311,23 @@ def _removal_is_observable(
     # Reached only through other schemas, all of which went in the same
     # change. Nothing can observe this removal except through one of those,
     # and each of those is judged on its own terms.
-    if parents and not direct and parents <= removed:
+    #
+    # `not direct` is load-bearing, not decoration: an operation that names the
+    # schema itself can observe the removal no matter what happened to the
+    # schema's other parents. Without it PayPal's error_400/401/403/404/409/
+    # 422/500 all vanish -- each is the declared body of a status-coded
+    # response on live operations AND an arm of `error_default` -- along with
+    # twenty Cloudflare schemas that are request surfaces in their own right.
+    #
+    # A schema is not its own outer schema either. A self-recursive `oneOf`
+    # satisfies `parents <= removed` with no outer schema in existence, so the
+    # chain would have no root to be reported at.
+    others = parents - {name}
+    if others and not direct and others <= removed:
         return False, "subsumed"
 
     live_parents = parents - removed
-    if live_parents and _shape_at_parents(name, live_parents, old, new):
+    if live_parents and _shape_at_parents(name, view, live_parents, old, new):
         if not direct:
             return False, "relocated"
 

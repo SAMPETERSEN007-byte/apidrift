@@ -181,10 +181,63 @@ def scan_main(argv: List[str]) -> int:
     return 1 if result.breaking else 0
 
 
+def snapshot_main(argv: List[str]) -> int:
+    """`apidrift snapshot` — record the vendors who publish no history.
+
+    Twenty-seven of the surveyed vendors keep their spec in a public git repo,
+    which hands you every past version for free. The rest publish a perfectly
+    good spec at a stable URL and nothing behind it. For those the past is not
+    something you can fetch — it is something you must already have been
+    recording, so the clock has to start before anyone needs it.
+
+    Exit 1 only when a source recorded NOTHING. An unchanged day is the normal
+    case and is not a failure.
+    """
+    from .snapshot import SOURCES, report, run as take_snapshots
+
+    parser = argparse.ArgumentParser(
+        prog="apidrift snapshot",
+        description="Record specs published without history.")
+    parser.add_argument("--store", default=str(ROOT / ".snapshots"))
+    parser.add_argument("--only", default="",
+                        help="comma-separated source keys")
+    parser.add_argument("--asof", default=None,
+                        help="treat this ISO date as 'today'")
+    parser.add_argument("--list", action="store_true",
+                        help="print the registered sources and exit")
+    args = parser.parse_args(argv)
+
+    if args.list:
+        for source in SOURCES:
+            mark = "" if source.liveness == "live" else f"  [{source.liveness}]"
+            print(f"{source.key:14} {source.fmt:10} {source.url}{mark}")
+        return 0
+
+    only = [k.strip() for k in args.only.split(",") if k.strip()] or None
+    known = {s.key for s in SOURCES}
+    unknown = [k for k in (only or []) if k not in known]
+    if unknown:
+        print(f"unknown source(s): {', '.join(unknown)}", file=sys.stderr)
+        return 2
+
+    today = (dt.date.fromisoformat(args.asof) if args.asof
+             else dt.date.today()).isoformat()
+    store_root = Path(args.store)
+    outcomes = take_snapshots(store_root, today, only)
+    print(report(outcomes, store_root, today), end="")
+    # `blocked` is deliberately not a failure of the run. It is a standing
+    # fact about that source, reported every time and actionable only by a
+    # human, and letting it hold the exit status red forever is how a daily
+    # job's red becomes background noise.
+    return 1 if any(o.status in ("invalid", "error") for o in outcomes) else 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw and raw[0] == "scan":
         return scan_main(raw[1:])
+    if raw and raw[0] == "snapshot":
+        return snapshot_main(raw[1:])
 
     parser = argparse.ArgumentParser(prog="apidrift", description=__doc__)
     parser.add_argument("--vendors", default=",".join(DEFAULT_VENDORS),
