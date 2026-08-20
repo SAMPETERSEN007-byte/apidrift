@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import re
 import random
 import subprocess
 import sys
@@ -157,6 +158,17 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
         # `old` and `new` hold the two op keys; the path itself is what moved.
         old_path = finding["old"].partition(" ")[2]
         new_path = finding["new"].partition(" ")[2]
+        # Ask the CALLER's question, not the spec author's. A path parameter's
+        # name never reaches the wire, so renaming one moves no endpoint. This
+        # check is deliberately written here rather than imported: the engine
+        # sharing its resolver with its checker is how the security defect and
+        # the schema-relocation defect both survived a "100%" measurement.
+        erased = re.compile(r"\{[^}]*\}")
+        if erased.sub("{}", old_path) == erased.sub("{}", new_path):
+            return REFUTED, (
+                f"`{old_path}` and `{new_path}` differ only in parameter "
+                f"NAMES — every concrete URL is byte-identical, so no caller "
+                f"moved")
         old_paths, new_paths = (old.get("paths") or {}), (new.get("paths") or {})
         if old_path in old_paths and old_path not in new_paths \
                 and new_path in new_paths:
@@ -497,8 +509,54 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
             return REFUTED, f"same effective shape {before}"
         return UNDECIDABLE, f"no independent check for `{kind}`"
 
-    if kind in ("request_field_added_required", "request_field_now_required",
-                "param_added_required", "param_now_required"):
+    if kind in ("param_removed", "param_added_required", "param_now_required",
+                "param_type_changed", "param_deprecated"):
+        # Parameters live in `parameters`, not the request body, and the
+        # existing body-shaped check below cannot decide them. Written here
+        # against the raw document rather than importing anything from the
+        # engine, because the engine agreeing with its own checker is how the
+        # security defect and the schema-relocation defect both survived.
+        name = finding.get("subject") or root
+
+        def _params(doc, op_key):
+            method, _, path = op_key.partition(" ")
+            item = (doc.get("paths") or {}).get(path) or {}
+            op = item.get(method.lower()) or {}
+            merged = {}
+            for entry in list(item.get("parameters") or []) + list(op.get("parameters") or []):
+                if isinstance(entry, dict) and "$ref" in entry:
+                    ref = str(entry["$ref"]).rsplit("/", 1)[-1]
+                    entry = ((doc.get("components") or {}).get("parameters")
+                             or {}).get(ref) or {}
+                if isinstance(entry, dict) and entry.get("name"):
+                    merged[entry["name"]] = entry
+            return merged
+
+        old_params = _params(old, finding["op_key"])
+        new_params = _params(new, finding["op_key"])
+        if not old_params and not new_params:
+            return UNDECIDABLE, f"no parameters resolvable on `{finding['op_key']}`"
+        entry = new_params.get(name) or old_params.get(name) or {}
+        # A path parameter is POSITIONAL: its name is substituted into the URL
+        # and never sent, so nothing a caller wrote depends on it.
+        if entry.get("in") == "path":
+            return REFUTED, (
+                f"`{name}` is a PATH parameter — positional in the URL and "
+                f"never sent by name, so no caller can depend on its name")
+        if kind == "param_removed":
+            if name in old_params and name not in new_params:
+                return CONFIRMED, f"`{name}` present at old, absent at new"
+            return REFUTED, (f"`{name}` old={name in old_params} "
+                             f"new={name in new_params}")
+        if kind in ("param_added_required", "param_now_required"):
+            was = bool((old_params.get(name) or {}).get("required"))
+            now = bool((new_params.get(name) or {}).get("required"))
+            if now and not was:
+                return CONFIRMED, f"`{name}` newly required"
+            return REFUTED, f"`{name}` required old={was} new={now}"
+        return UNDECIDABLE, f"no independent check for `{kind}`"
+
+    if kind in ("request_field_added_required", "request_field_now_required"):
         # Operation-level: the body is inline, so walk it directly.
         leaf = root.split(".")[-1].replace("[]", "")
         old_schema = _body_schema(old, finding["op_key"], "request")

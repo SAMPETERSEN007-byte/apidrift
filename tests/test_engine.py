@@ -103,11 +103,41 @@ class TestBreakingDetection(unittest.TestCase):
         del self.new["paths"]["/refunds/{id}"]
         self.assertIn("endpoint_removed", kinds(run(self.old, self.new)))
 
-    def test_endpoint_moved_is_not_reported_as_removed(self):
-        self.new["paths"]["/refunds/{refund_id}"] = self.new["paths"].pop("/refunds/{id}")
+    def test_a_real_move_is_reported_and_is_not_a_removal(self):
+        """A STATIC segment changed, so every caller's URL changed with it."""
+        self.new["paths"]["/credits/{id}"] = self.new["paths"].pop("/refunds/{id}")
         found = kinds(run(self.old, self.new))
         self.assertIn("endpoint_moved", found)
         self.assertNotIn("endpoint_removed", found)
+
+    def test_renaming_a_path_parameter_moves_nothing(self):
+        """`/refunds/{id}` and `/refunds/{refund_id}` are the same URL.
+
+        A path parameter's name is OpenAPI-internal, exactly like a schema
+        name, and never reaches the wire. `dependence.paths_match()` has
+        always known this while PROVING; the diff did not know it while
+        DIFFING, and Twilio's `{Sid}` -> `{id}` rename produced 15 of 79
+        breaking findings that break nobody.
+        """
+        self.new["paths"]["/refunds/{refund_id}"] = self.new["paths"].pop("/refunds/{id}")
+        found = kinds(run(self.old, self.new))
+        self.assertNotIn("endpoint_moved", found)
+        self.assertNotIn("endpoint_removed", found)
+
+    def test_a_renamed_operation_is_still_compared_body_to_body(self):
+        """Renaming the parameter must not hide a real change to the same op.
+
+        The rename branch used to `continue` before the operation pair was
+        diffed, so a vendor renaming a parameter AND tightening the operation
+        in one release had the second change go entirely unreported.
+        """
+        moved = self.new["paths"].pop("/refunds/{id}")
+        moved["get"]["parameters"] = [
+            {"name": "reason", "in": "query", "required": True,
+             "schema": {"type": "string"}}]
+        self.new["paths"]["/refunds/{refund_id}"] = moved
+        found = kinds(run(self.old, self.new))
+        self.assertIn("param_added_required", found)
 
     def test_param_now_required(self):
         self.new["paths"]["/charges"]["get"]["parameters"][0]["required"] = True
@@ -788,3 +818,49 @@ class TestFieldRelocation(unittest.TestCase):
         del new["components"]["schemas"]["Orphan"]["properties"]["mode"]
         subjects = [f.subject for f in run(old, new).findings]
         self.assertIn("Orphan.mode", subjects)
+
+
+class TestPositionalParameters(unittest.TestCase):
+    """A path parameter's name is substituted into the URL and never sent.
+
+    So its name appearing or disappearing is either a rename -- the URL is
+    unchanged -- or a real change of path SHAPE, which comparing the templates
+    already reports. Twilio renaming `{ConversationSid}` to `{ConversationId}`
+    produced a `param_removed` and a `param_added_required` for one edit that
+    breaks nobody. Query parameters are the opposite: their names go on the
+    wire, so losing one is a real event.
+    """
+
+    def _op(self, param_name: str, location: str = "path") -> dict:
+        return {
+            "openapi": "3.0.3",
+            "info": {"title": "T", "version": "1"},
+            "servers": [{"url": "https://api.test.com"}],
+            "paths": {"/thing/{id}": {"get": {
+                "operationId": "getThing",
+                "parameters": [
+                    {"name": "id", "in": "path", "required": True,
+                     "schema": {"type": "string"}},
+                    {"name": param_name, "in": location, "required": True,
+                     "schema": {"type": "string"}},
+                ],
+                "responses": {"200": {"content": {"application/json": {
+                    "schema": {"type": "object",
+                               "properties": {"ok": {"type": "boolean"}}}}}}},
+            }}},
+        }
+
+    def test_renaming_a_path_parameter_reports_nothing(self):
+        # Every severity, not just breaking: a downgraded false positive is
+        # still a false positive, and `kinds()` filters to breaking by default.
+        result = run(self._op("Sid"), self._op("Ident"))
+        found = {f.kind for f in result.findings}
+        self.assertNotIn("param_removed", found)
+        self.assertNotIn("param_added_required", found)
+
+    def test_renaming_a_query_parameter_is_still_reported(self):
+        """The control. Query names go on the wire; losing one is real."""
+        result = run(self._op("Sid", "query"), self._op("Ident", "query"))
+        found = {f.kind for f in result.findings}
+        self.assertIn("param_removed", found)
+        self.assertIn("param_added_required", found)

@@ -222,14 +222,25 @@ def _mk(op: Operation, kind: str, severity: str, detail: str, **kw) -> Finding:
     )
 
 
+# A path parameter is POSITIONAL: its name is substituted into the URL and
+# never sent. So a path parameter appearing or disappearing by NAME is either
+# a rename (the URL is unchanged) or a genuine change of path shape -- and the
+# second is already reported by comparing the path templates themselves. Twilio
+# renaming `{ConversationSid}` to `{ConversationId}` produced a `param_removed`
+# and a `param_added_required` for one edit that breaks nobody.
+def _is_positional(param: Param) -> bool:
+    return param.location == "path"
+
+
 def _diff_params(old: Operation, new: Operation) -> List[Finding]:
     out: List[Finding] = []
     for key, p_old in old.params.items():
         p_new = new.params.get(key)
         if p_new is None:
-            sev = BREAKING if p_old.location == "path" else POTENTIALLY_BREAKING
+            if _is_positional(p_old):
+                continue      # renamed, or already reported as a moved path
             out.append(_mk(
-                new, "param_removed", sev,
+                new, "param_removed", POTENTIALLY_BREAKING,
                 f"{p_old.location} parameter `{p_old.name}` was removed",
                 subject=p_old.name, old=p_old.type, new="<removed>",
             ))
@@ -264,6 +275,8 @@ def _diff_params(old: Operation, new: Operation) -> List[Finding]:
     for key, p_new in new.params.items():
         if key in old.params:
             continue
+        if _is_positional(p_new):
+            continue          # the other half of the same rename
         if p_new.required:
             out.append(_mk(
                 new, "param_added_required", BREAKING,
@@ -523,6 +536,26 @@ def _diff_operation(old: Operation, new: Operation) -> List[Finding]:
     return out
 
 
+_PATH_PARAM = re.compile(r"\{[^}]*\}")
+
+
+def caller_visible_path(op_key: str) -> str:
+    """An operation key as a CALLER sees it, with parameter NAMES erased.
+
+    A path parameter's name is OpenAPI-internal, exactly like a schema name.
+    `/v2/Conversations/{Sid}` and `/v2/Conversations/{id}` produce byte-
+    identical URLs for every concrete value, so renaming one moves nothing.
+
+    `dependence.paths_match()` has always normalised this away when matching a
+    caller's literal against a template -- the engine knew parameter names did
+    not matter while it was PROVING, and did not know it while it was DIFFING.
+    Twilio renamed `{Sid}` to `{id}` across Conversations and ControlPlane and
+    that produced 15 of 79 breaking findings, none of which breaks anybody.
+    """
+    method, _, path = op_key.partition(" ")
+    return f"{method} {_PATH_PARAM.sub('{}', path)}"
+
+
 def _match_renamed(
     removed: Dict[str, Operation], added: Dict[str, Operation]
 ) -> Dict[str, str]:
@@ -560,6 +593,13 @@ def diff_specs(vendor: str, old: Spec, new: Spec, meta: Dict[str, str]) -> DiffR
     for key, op in removed.items():
         if key in renames:
             new_op = new.operations[renames[key]]
+            # A renamed operation still has to be compared body-to-body.
+            # Skipping it meant a vendor who renamed a path parameter AND
+            # dropped a required field in the same release had the field
+            # removal go unreported entirely.
+            findings.extend(_diff_operation(op, new_op))
+            if caller_visible_path(key) == caller_visible_path(new_op.key):
+                continue      # a parameter was renamed; the URL is unchanged
             findings.append(_mk(
                 op, "endpoint_moved", BREAKING,
                 f"operation `{op.operation_id}` moved to `{new_op.key}`",

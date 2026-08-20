@@ -18,6 +18,41 @@ PY_BIN = str(ROOT / ".venv" / "bin" / "python")
 
 MUTATIONS = [
     (
+        "a renamed path parameter reported as removed again",
+        "apidrift/diff.py",
+        "            if _is_positional(p_old):\n                continue",
+        "            if False:\n                continue",
+        ["test_renaming_a_path_parameter_reports_nothing"],
+    ),
+    (
+        "positional test widened to swallow query parameters too",
+        "apidrift/diff.py",
+        '    return param.location == "path"',
+        "    return True",
+        ["test_renaming_a_query_parameter_is_still_reported"],
+    ),
+    (
+        "a path parameter rename reported as a move again",
+        "apidrift/diff.py",
+        "            if caller_visible_path(key) == caller_visible_path(new_op.key):",
+        "            if False:",
+        ["test_renaming_a_path_parameter_moves_nothing"],
+    ),
+    (
+        "caller-visible path stops erasing parameter names",
+        "apidrift/diff.py",
+        '    return f"{method} {_PATH_PARAM.sub(\'{}\', path)}"',
+        '    return f"{method} {path}"',
+        ["test_renaming_a_path_parameter_moves_nothing"],
+    ),
+    (
+        "a renamed operation is no longer diffed body-to-body",
+        "apidrift/diff.py",
+        "            findings.extend(_diff_operation(op, new_op))",
+        "            pass",
+        ["test_a_renamed_operation_is_still_compared_body_to_body"],
+    ),
+    (
         "a field moving between schemas reported as a removal again",
         "apidrift/diff.py",
         "                if _field_survived_where_it_was_visible(",
