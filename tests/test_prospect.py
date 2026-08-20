@@ -126,10 +126,13 @@ class TestPseudoPaths(unittest.TestCase):
         self.assertNotIn("#/components", query)
 
     def test_a_real_affected_operation_is_preferred(self):
+        # The route is used rather than the JSON pointer, and specifically its
+        # distinctive segment run rather than the generic `/guilds` head.
         query = build_query(
             self._schema_finding(["GET /guilds/{id}/auto-moderation/rules"]),
             get("discord"), "python")
-        self.assertIn("/guilds", query)
+        self.assertIn("/auto-moderation/rules", query)
+        self.assertNotIn("#/components", query)
 
     def test_schema_name_is_the_fallback_when_no_endpoint_exists(self):
         f = self._schema_finding()
@@ -209,3 +212,37 @@ class TestLabels(unittest.TestCase):
                    for f in entry["findings"]}
         missing = emitted - set(KIND_LABEL)
         self.assertEqual(missing, set(), f"kinds with no reader-facing label: {sorted(missing)}")
+
+
+class TestStaticRun(unittest.TestCase):
+    """Truncating a templated path at the first `{` discards the specific half."""
+
+    def test_the_specific_tail_is_preferred_over_a_generic_head(self):
+        from apidrift.prospect import static_run
+        self.assertEqual(
+            static_run("/guilds/{guild_id}/auto-moderation/rules"),
+            "/auto-moderation/rules")
+
+    def test_a_longer_head_still_wins(self):
+        from apidrift.prospect import static_run
+        self.assertEqual(
+            static_run("/v1/customers/{customer}/cards"), "/v1/customers")
+
+    def test_a_path_with_no_parameters_is_returned_whole(self):
+        from apidrift.prospect import static_run
+        self.assertEqual(static_run("/chat/completions"), "/chat/completions")
+
+    def test_pseudo_and_empty_paths_yield_nothing(self):
+        from apidrift.prospect import static_run
+        self.assertEqual(static_run("#/components/schemas/Foo"), "")
+        self.assertEqual(static_run("/"), "")
+        self.assertEqual(static_run(""), "")
+
+    def test_the_query_uses_the_distinctive_run(self):
+        f = finding(kind="schema_field_removed",
+                    subject="SpamLinkRuleResponse.creator_id",
+                    path="/guilds/{guild_id}/auto-moderation/rules")
+        f.affected_ops = ["GET /guilds/{guild_id}/auto-moderation/rules"]
+        query = build_query(f, get("discord"), "python")
+        self.assertIn("/auto-moderation/rules", query)
+        self.assertNotIn('"/guilds"', query)

@@ -110,7 +110,7 @@ def main() -> int:
             print(f"  {lead['vendor']:8s} {lead['repo'][:34]:36s} "
                   f"{lead['file'].rsplit('/', 1)[-1][:22]:24s} :{site['line']}")
             print(f"           breaks on {lead['breaks_on']} -> {site['text'][:78]}")
-    print(f"\nwritten to {ROOT / 'out' / 'leads.json'}")
+    print(f"\nwritten to {out_path}")
     return 0
 
 

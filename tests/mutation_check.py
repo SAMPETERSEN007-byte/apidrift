@@ -306,6 +306,13 @@ MUTATIONS = [
         ["test_pseudo_path_is_never_searched_as_a_url"],
     ),
     (
+        "path truncated at the first parameter again",
+        "apidrift/prospect.py",
+        "    best = max(runs, key=lambda run: (len(\"/\".join(run)), runs.index(run)))",
+        "    best = runs[0]",
+        ["test_the_specific_tail_is_preferred_over_a_generic_head"],
+    ),
+    (
         "signature builder drops the field name",
         "apidrift/signatures.py",
         "        if leaf and not leaf.startswith(\"<\"):",

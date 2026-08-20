@@ -112,6 +112,36 @@ def canonical_path(finding: Finding) -> str:
                key=lambda p: (p.count("/"), p.count("{"), len(p)))
 
 
+def static_run(path: str) -> str:
+    """The most distinctive literal substring of a templated path.
+
+    Truncating at the first `{` throws away the specific half. For
+    `/guilds/{guild_id}/auto-moderation/rules` it leaves `/guilds`, which
+    matches every guild call in every Discord bot and attributes an
+    auto-moderation change to a delete-member route. The longest contiguous run
+    of static segments is what a caller's code actually contains.
+    """
+    if not path or path == "/" or path.startswith("#"):
+        return ""
+    runs, current = [], []
+    for segment in path.split("/"):
+        if not segment:
+            continue
+        if segment.startswith("{"):
+            if current:
+                runs.append(current)
+                current = []
+        else:
+            current.append(segment)
+    if current:
+        runs.append(current)
+    if not runs:
+        return ""
+    # Longest by characters; on a tie prefer the later, more specific run.
+    best = max(runs, key=lambda run: (len("/".join(run)), runs.index(run)))
+    return "/" + "/".join(best)
+
+
 def build_query(finding: Finding, vendor: Vendor, language: str = "") -> str:
     """Build the most discriminating code-search query for one finding.
 
@@ -122,11 +152,8 @@ def build_query(finding: Finding, vendor: Vendor, language: str = "") -> str:
     `"iin" "/v1/customers"` returns 155 files where `"iin" stripe` returns 5,632.
     """
     terms: List[str] = []
-    path_literal = ""
     best_path = canonical_path(finding)
-    if best_path and best_path != "/":
-        path_literal = (best_path.split("{", 1)[0].rstrip("/")
-                        if "{" in best_path else best_path)
+    path_literal = static_run(best_path)
 
     leaf = _leaf(finding)
     # A newly-required field is verified by its ABSENCE, so searching for it
