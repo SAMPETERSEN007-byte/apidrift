@@ -44,6 +44,9 @@ class Field:
     # inline definition cannot be compared against a named one describing the
     # same thing, and extracting a schema reads as a type change.
     shape: Optional[Tuple[str, ...]] = None
+    # For an array field, what its elements are. "array" alone is too coarse to
+    # compare -- it makes an array-of-string look like an array-of-object.
+    item: Optional[str] = None
     # The vendor's own sentence about what this field is for. Never compared:
     # a reworded description is an edit to prose, not to the API. It exists so
     # a SUGGESTION can say what the thing does instead of only naming it --
@@ -393,10 +396,18 @@ def _collect_params(
         schema = resolved.get("schema")
         stype, enum = "any", None
         if isinstance(schema, dict):
+            # `{"allOf": [{"$ref": X}]}` is how a vendor attaches a sibling
+            # keyword to a `$ref`, because `$ref` siblings are ignored in
+            # OpenAPI 3.0. It is the same X. `_ref_name` has always known that
+            # for schema PROPERTIES and the parameter path never learned it,
+            # so Cloudflare unwrapping ten of its own sorting enums read as
+            # `object -> string` ten times.
+            if "allOf" in schema:
+                schema = _merge_all_of(schema, resolver, set())
             rs, _ = resolver.resolve(schema, seen)
             if isinstance(rs, dict):
                 stype = _type_of(rs)
-                enum = _enum_of(rs)
+                enum = _effective_enum(rs, resolver)
         elif resolved.get("type"):  # Swagger 2.0 style
             stype = str(resolved["type"])
             enum = _enum_of(resolved)
@@ -551,6 +562,7 @@ class SchemaView:
     refs: Tuple[str, ...]          # schemas this one references, directly
     kind: str                      # object | array | enum | primitive | union
     enum: Optional[Tuple[str, ...]] = None
+    item: Optional[str] = None     # for an array: what its elements are
 
 
 def _ref_name(node: Any) -> Optional[str]:
@@ -615,6 +627,39 @@ def _effective_enum(schema: Dict[str, Any], resolver: "Resolver") -> Optional[Tu
     return None
 
 
+def _follow_alias(schema: Dict[str, Any], resolver: "Resolver",
+                  budget: int = 6) -> Dict[str, Any]:
+    """Resolve a schema whose entire body is a `$ref` to what it points at."""
+    while (isinstance(schema, dict) and "$ref" in schema
+           and len(schema) == 1 and budget > 0):
+        resolved, _ = resolver.resolve(schema, None)
+        if not isinstance(resolved, dict) or resolved is schema:
+            return schema
+        schema, budget = resolved, budget - 1
+    return schema
+
+
+def _item_type(node: Any, resolver: "Resolver") -> Optional[str]:
+    """For an array, what its elements are -- `string`, `object`, `->Name`.
+
+    Without this an array is just "array", so an inline `array of string` and a
+    named schema holding an `array of string` compared unequal purely on
+    notation, while an `array of string` and an `array of object` compared
+    equal once both were called coarse. Cloudflare inlined and named the same
+    array-of-string in eleven places.
+    """
+    if not isinstance(node, dict) or _type_of(node) != "array":
+        return None
+    items = node.get("items")
+    if not isinstance(items, dict):
+        return None
+    target = _ref_name(items)
+    if target:
+        return f"->{target}"
+    resolved, _ = resolver.resolve(items, None)
+    return _type_of(resolved if isinstance(resolved, dict) else items)
+
+
 def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
     """One entry per named schema, with its own properties resolved one level."""
     raw = ((doc.get("components") or {}).get("schemas")
@@ -627,6 +672,14 @@ def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
     for name, schema in raw.items():
         if not isinstance(schema, dict):
             continue
+        # A schema whose whole body is `{"$ref": ...}` is an ALIAS for its
+        # target and describes exactly what the target describes. Left
+        # unresolved it came out as kind `any` with no fields, so a caller's
+        # field that switched from the alias to the target read as a type
+        # change -- Cloudflare's `magic_interconnect_health_check` is
+        # `{"$ref": ".../magic_health_check_base"}` in BOTH versions, and the
+        # only thing that moved was which of the two names a property spelled.
+        schema = _follow_alias(schema, resolver)
         merged = _merge_all_of(schema, resolver, set()) if "allOf" in schema else schema
         stype = _type_of(merged)
         required = tuple(sorted(str(r) for r in (merged.get("required") or [])))
@@ -649,6 +702,7 @@ def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
                         break
                 fields[str(prop_name)] = Field(
                     type=(f"->{target}" if target else _type_of(node)),
+                    item=_item_type(node, resolver) if not target else None,
                     required=str(prop_name) in required,
                     nullable=_is_nullable(node) if isinstance(node, dict) else False,
                     enum=(_effective_enum(node, resolver)
@@ -665,6 +719,7 @@ def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
             refs=tuple(sorted(set(_direct_refs(schema)))),
             kind=stype,
             enum=_effective_enum(merged, resolver),
+            item=_item_type(merged, resolver),
         )
     return views
 

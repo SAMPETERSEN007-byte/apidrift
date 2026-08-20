@@ -973,12 +973,19 @@ def _field_shape(field: Field, spec: Spec) -> Optional[Tuple]:
             return ("object", tuple(sorted(view.fields)))
         if view.enum:
             return ("enum", view.enum)
+        if view.kind == "array":
+            # Resolved on both sides or not at all. Answering "array" here
+            # while the inline form answered None made the same array compare
+            # unequal to itself purely on notation.
+            return ("array", view.item) if view.item else None
         return ("scalar", view.kind)
     if field.enum:
         return ("enum", field.enum)
     if field.shape:
         return ("object", field.shape)
-    if field.type in ("object", "array", "any", "oneOf", "anyOf"):
+    if field.type == "array":
+        return ("array", field.item) if field.item else None
+    if field.type in ("object", "any", "oneOf", "anyOf"):
         # Too coarse to call equivalent without more resolution.
         return None
     return ("scalar", field.type)

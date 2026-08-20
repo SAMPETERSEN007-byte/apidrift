@@ -1087,3 +1087,91 @@ class TestSchemaRemovalIsObservable(unittest.TestCase):
                         f"pseudo-operation leaked into {card.affected_ops}")
         self.assertEqual(0, card.affected_op_count,
                          "a schema no operation reaches affects zero operations")
+
+
+class TestNotationIsNotSemantics(unittest.TestCase):
+    """Three ways of writing the same thing that read as three changes.
+
+    All of the same family as `c97be9d`: a caller sees a contract, not the
+    spelling a generator happened to emit this quarter. Each of these produced
+    findings on Cloudflare in the 180-day window and none of them moved a byte.
+    """
+
+    def setUp(self):
+        self.old = copy.deepcopy(BASE)
+        self.new = copy.deepcopy(BASE)
+
+    def test_a_bare_ref_schema_is_an_alias_for_its_target(self):
+        """`magic_interconnect_health_check` is `{"$ref": ".../health_check_base"}`
+        in BOTH versions. Only which of the two names a property spelled moved."""
+        for doc in (self.old, self.new):
+            doc["components"]["schemas"]["CardAlias"] = {
+                "$ref": "#/components/schemas/Card"}
+        self.old["components"]["schemas"]["Bank"]["properties"]["card"] = {
+            "$ref": "#/components/schemas/CardAlias"}
+        self.new["components"]["schemas"]["Bank"]["properties"]["card"] = {
+            "$ref": "#/components/schemas/Card"}
+        self.assertNotIn("schema_field_type_changed", kinds(run(self.old, self.new)))
+
+    def test_an_inline_array_and_a_named_array_of_the_same_item_agree(self):
+        """Cloudflare extracted `{"type": "array", "items": {"type": "string"}}`
+        into `builds_path_excludes`, which is the same array."""
+        self.old["components"]["schemas"]["Card"]["properties"]["tags"] = {
+            "type": "array", "items": {"type": "string"}}
+        self.new["components"]["schemas"]["Tags"] = {
+            "type": "array", "items": {"type": "string"}}
+        self.new["components"]["schemas"]["Card"]["properties"]["tags"] = {
+            "$ref": "#/components/schemas/Tags"}
+        self.assertNotIn("schema_field_type_changed", kinds(run(self.old, self.new)))
+
+    def test_an_array_whose_ITEM_type_changed_is_NOT_the_same_shape(self):
+        """The mirror, asserted where the behaviour actually lives.
+
+        The first version of this went through the whole pipeline and passed
+        with the item type deleted, because the ROUTE diff catches it
+        independently -- so it killed neither mutation and proved nothing about
+        `_field_shape`. Calling both sides "array" and stopping there is how an
+        array-of-string and an array-of-object would compare equal, and this is
+        the comparison that has to refuse them.
+        """
+        from apidrift.diff import _field_shape
+        old_spec = spec(self.old)
+        strings = spec({**self.old, "components": {**self.old["components"], "schemas": {
+            **self.old["components"]["schemas"],
+            "Card": {"type": "object", "properties": {
+                "tags": {"type": "array", "items": {"type": "string"}}}}}}})
+        integers = spec({**self.new, "components": {**self.new["components"], "schemas": {
+            **self.new["components"]["schemas"],
+            "Card": {"type": "object", "properties": {
+                "tags": {"type": "array", "items": {"type": "integer"}}}}}}})
+        of_string = _field_shape(strings.schemas["Card"].fields["tags"], strings)
+        of_integer = _field_shape(integers.schemas["Card"].fields["tags"], integers)
+        self.assertIsNotNone(of_string, "an array of a known item type is comparable")
+        self.assertNotEqual(of_string, of_integer,
+                            "an array of string is not an array of integer")
+        del old_spec
+
+    def test_a_single_arm_allOf_around_a_parameter_ref_is_that_ref(self):
+        """A vendor wraps `$ref` in `allOf` to attach a sibling keyword, which
+        OpenAPI 3.0 would otherwise ignore. Cloudflare unwrapping ten of its own
+        sorting enums read as `object -> string` ten times."""
+        for doc in (self.old, self.new):
+            doc["components"]["schemas"]["SortDir"] = {
+                "type": "string", "enum": ["asc", "desc"]}
+        self.old["paths"]["/charges"]["get"]["parameters"].append(
+            {"name": "direction", "in": "query", "required": False,
+             "schema": {"allOf": [{"$ref": "#/components/schemas/SortDir"}]}})
+        self.new["paths"]["/charges"]["get"]["parameters"].append(
+            {"name": "direction", "in": "query", "required": False,
+             "schema": {"type": "string", "enum": ["asc", "desc"]}})
+        self.assertNotIn("param_type_changed", kinds(run(self.old, self.new)))
+
+    def test_a_parameter_whose_type_really_changed_is_still_a_break(self):
+        """The control for the test above."""
+        self.old["paths"]["/charges"]["get"]["parameters"].append(
+            {"name": "cursor", "in": "query", "required": False,
+             "schema": {"type": "string"}})
+        self.new["paths"]["/charges"]["get"]["parameters"].append(
+            {"name": "cursor", "in": "query", "required": False,
+             "schema": {"type": "integer"}})
+        self.assertIn("param_type_changed", kinds(run(self.old, self.new)))

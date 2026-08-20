@@ -746,6 +746,42 @@ MUTATIONS = [
         "        distinct_ops = {m.op_key for m in members}",
         ["test_a_schema_carrier_is_never_counted_as_an_affected_operation"],
     ),
+    (
+        "a bare-$ref schema is no longer resolved to its target",
+        "apidrift/loader.py",
+        "        schema = _follow_alias(schema, resolver)",
+        "        pass",
+        ["test_a_bare_ref_schema_is_an_alias_for_its_target"],
+    ),
+    (
+        "an array forgets what its items are",
+        "apidrift/loader.py",
+        "    items = node.get(\"items\")",
+        "    items = None",
+        ["test_an_inline_array_and_a_named_array_of_the_same_item_agree",
+         "test_an_array_whose_ITEM_type_changed_is_NOT_the_same_shape"],
+    ),
+    (
+        "every array compares equal regardless of item type",
+        "apidrift/diff.py",
+        "    if field.type == \"array\":\n        return (\"array\", field.item) if field.item else None",
+        "    if field.type == \"array\":\n        return (\"array\", None)",
+        ["test_an_array_whose_ITEM_type_changed_is_NOT_the_same_shape"],
+    ),
+    (
+        "a parameter's single-arm allOf is no longer unwrapped",
+        "apidrift/loader.py",
+        "            if \"allOf\" in schema:\n                schema = _merge_all_of(schema, resolver, set())",
+        "            if False:\n                schema = _merge_all_of(schema, resolver, set())",
+        ["test_a_single_arm_allOf_around_a_parameter_ref_is_that_ref"],
+    ),
+    (
+        "parameter types are never compared",
+        "apidrift/diff.py",
+        "        if p_old.type != p_new.type:",
+        "        if False:",
+        ["test_a_parameter_whose_type_really_changed_is_still_a_break"],
+    ),
 ]
 
 
