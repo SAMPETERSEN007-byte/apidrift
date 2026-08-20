@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .diff import ABSENCE_KINDS, ENDPOINT_KINDS, FIELD_KINDS, Finding
 from .classify import classify
+from .prospect import static_run
 from .signatures import build_signatures
 from .vendors import Vendor
 
@@ -337,6 +338,11 @@ def _named_identifier(finding: Finding) -> str:
     leaf = subject.split(".")[-1].replace("[]", "").strip("<>")
     if not leaf or leaf.startswith("<") or len(leaf) < 3:
         return ""
+    # Only a name a caller could plausibly write. A status code, a version
+    # string or a path fragment is not something to demand appear in the
+    # source: a caller of `/bulk-ban` never writes "204".
+    if not leaf[0].isalpha() or not leaf.replace("_", "").isalnum():
+        return ""
     if leaf.lower() in {"id", "type", "name", "url", "data", "status"}:
         return ""
     return leaf
@@ -358,9 +364,10 @@ def target_symbol(finding: Finding) -> Tuple[str, str]:
     subject = finding.root_cause or finding.subject
     leaf = subject.split(".")[-1].replace("[]", "").strip("<>")
     if finding.kind in _ENDPOINT_KINDS:
-        literal = finding.path.split("{", 1)[0].rstrip("/") if "{" in finding.path \
-            else finding.path
-        return literal, "endpoint"
+        # The same rule prospecting uses. Truncating at the first parameter
+        # left `/guilds` standing for `/guilds/{guild_id}/bulk-ban`, so a
+        # removed 204 on bulk-ban "matched" a GET of /users/@me/guilds.
+        return static_run(finding.path), "endpoint"
     if finding.kind in _ABSENCE_KINDS:
         return leaf, "absence"
     if finding.kind in _FIELD_KINDS:

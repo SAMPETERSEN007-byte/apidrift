@@ -343,6 +343,21 @@ MUTATIONS = [
          "test_vendored_dependency_path_is_rejected_without_fetching"],
     ),
     (
+        "verification falls back to the truncated path prefix",
+        "apidrift/verify.py",
+        "        return static_run(finding.path), \"endpoint\"",
+        "        return finding.path.split(\"{\", 1)[0].rstrip(\"/\"), \"endpoint\"",
+        ["test_a_different_guild_route_is_not_a_match",
+         "test_verification_uses_the_distinctive_run"],
+    ),
+    (
+        "identifier gate demands status codes and path fragments too",
+        "apidrift/verify.py",
+        "    if not leaf[0].isalpha() or not leaf.replace(\"_\", \"\").isalnum():\n        return \"\"",
+        "    if False:\n        return \"\"",
+        ["test_a_status_code_is_not_demanded", "test_the_actual_route_still_matches"],
+    ),
+    (
         "signature builder drops the field name",
         "apidrift/signatures.py",
         "        if leaf and not leaf.startswith(\"<\"):",

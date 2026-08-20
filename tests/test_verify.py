@@ -394,3 +394,64 @@ class TestProvenanceAtLeadTime(unittest.TestCase):
         self.assertTrue(
             classify("caesar4321/Confio", "twilio",
                      "backend/twilio_verify.py").is_outreach_target)
+
+
+class TestPathRuleIsShared(unittest.TestCase):
+    """Prospecting and verification must agree on what path to look for.
+
+    They did not: prospecting searched `/bulk-ban` while verification accepted
+    any file containing `/guilds`, so a removed 204 on bulk-ban was confirmed
+    against a GET of /users/@me/guilds.
+    """
+
+    def test_verification_uses_the_distinctive_run(self):
+        f = finding(kind="response_status_removed", subject="204",
+                    path="/guilds/{guild_id}/bulk-ban")
+        f.root_cause = "204"
+        symbol, mode = target_symbol(f)
+        self.assertEqual(mode, "endpoint")
+        self.assertEqual(symbol, "/bulk-ban")
+
+    def test_a_different_guild_route_is_not_a_match(self):
+        source = ('import discord\n'
+                  'async def guilds(self):\n'
+                  '    return await self._request("GET", "/users/@me/guilds")\n')
+        f = finding(kind="response_status_removed", subject="204",
+                    path="/guilds/{guild_id}/bulk-ban")
+        f.root_cause = "204"
+        verdict, _, _, _ = verify_source(source, "rest_client.py", f,
+                                         get("discord"))
+        self.assertEqual(verdict, NO_SITE)
+
+    def test_the_actual_route_still_matches(self):
+        source = ('import discord\n'
+                  'async def bulk_ban(self, gid):\n'
+                  '    return await self._request("POST", f"/guilds/{gid}/bulk-ban")\n')
+        f = finding(kind="response_status_removed", subject="204",
+                    path="/guilds/{guild_id}/bulk-ban")
+        f.root_cause = "204"
+        verdict, _, _, _ = verify_source(source, "rest_client.py", f,
+                                         get("discord"))
+        self.assertEqual(verdict, CONFIRMED)
+
+
+class TestIdentifierGateScope(unittest.TestCase):
+    """Demand an identifier only when the caller could plausibly write it."""
+
+    def test_a_status_code_is_not_demanded(self):
+        from apidrift.verify import _named_identifier
+        f = finding(kind="response_status_removed", subject="204")
+        f.root_cause = "204"
+        self.assertEqual(_named_identifier(f), "")
+
+    def test_a_path_fragment_is_not_demanded(self):
+        from apidrift.verify import _named_identifier
+        f = finding(kind="endpoint_removed", subject="/v1/old_thing")
+        f.root_cause = "/v1/old_thing"
+        self.assertEqual(_named_identifier(f), "")
+
+    def test_a_field_name_is_demanded(self):
+        from apidrift.verify import _named_identifier
+        f = finding(subject="GuildChannelResponse.icon_emoji")
+        f.root_cause = "GuildChannelResponse.icon_emoji"
+        self.assertEqual(_named_identifier(f), "icon_emoji")
