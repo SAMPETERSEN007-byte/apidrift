@@ -4,3 +4,5 @@ out/
 __pycache__/
 *.pyc
 .snapshots/
+.claude/.fast-suite-last
+.serena/
