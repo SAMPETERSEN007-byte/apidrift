@@ -136,6 +136,28 @@ MUTATIONS = [
          "test_already_migrated_caller_is_not_a_lead"],
     ),
     (
+        "classifier: vendor's own repos treated as leads",
+        "apidrift/classify.py",
+        "    if owner_l in VENDOR_ORGS.get(vendor_key, ()):",
+        "    if False:",
+        ["test_vendor_own_sdk_is_excluded",
+         "test_only_ecosystem_and_integrators_are_outreach_targets"],
+    ),
+    (
+        "classifier: dataset dumps counted as customers",
+        "apidrift/classify.py",
+        "    hit = _matches(_CORPUS_PATTERNS, name_l)\n    if hit:",
+        "    hit = None\n    if hit:",
+        ["test_dataset_dump_is_corpus"],
+    ),
+    (
+        "classifier: dedupe keeps the first row instead of the richest",
+        "apidrift/classify.py",
+        "        if existing is None or len(lead.get(\"sites\") or []) > len(existing.get(\"sites\") or []):",
+        "        if existing is None:",
+        ["test_dedupe_keeps_the_richest_row_per_repo"],
+    ),
+    (
         "signature builder drops the field name",
         "apidrift/signatures.py",
         "        if leaf and not leaf.startswith(\"<\"):",

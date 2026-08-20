@@ -137,19 +137,26 @@ def build_query(finding: Finding, vendor: Vendor, language: str = "") -> str:
 
 def prospect(
     findings: Sequence[Finding], vendor: Vendor, limit: int = 5,
-    language: str = "python", verbose: bool = True,
+    language: str = "python", verbose: bool = True, max_attempts: int = 14,
 ) -> List[Prospect]:
     out: List[Prospect] = []
     ranked = sorted(findings, key=lambda f: -f.occurrences)
     seen_queries: set = set()
     index = 0
+    usable = 0
+    attempts = 0
     for finding in ranked:
-        if len(out) >= limit:
+        # Fan-out ranks how much of the spec a change touches, not how many
+        # customers it reaches. Stopping at the top N findings left three of
+        # five vendors with no leads at all, so keep going until enough queries
+        # actually return a workable result.
+        if usable >= limit or attempts >= max_attempts:
             break
         query = build_query(finding, vendor, language)
         if not query or query in seen_queries:
             continue
         seen_queries.add(query)
+        attempts += 1
         result = Prospect(finding_kind=finding.kind,
                           root_cause=finding.root_cause or finding.subject,
                           query=query)
@@ -170,6 +177,8 @@ def prospect(
                     file_path=item.get("path", ""),
                     url=item.get("html_url", ""),
                 ))
+        if result.precision == "usable":
+            usable += 1
         if verbose:
             status = result.error or f"{result.total_count:>7,} files  [{result.precision}]"
             print(f"    {query[:64]:66s} {status}")
