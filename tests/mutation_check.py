@@ -174,8 +174,8 @@ MUTATIONS = [
     (
         "classifier: vendor-package SDK modules counted as author code",
         "apidrift/classify.py",
-        "        if package in (d.lower() for d in directories) and basename.startswith(\"_\"):",
-        "        if False:",
+        "            if basename.startswith(\"_\"):\n                return True",
+        "            if False:\n                return True",
         ["test_sdk_internal_modules_are_vendored"],
     ),
     (
