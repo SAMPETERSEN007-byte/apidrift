@@ -299,6 +299,13 @@ MUTATIONS = [
         ["test_enum_change_behind_a_ref_is_an_enum_finding"],
     ),
     (
+        "pseudo-paths searched as if they were URLs",
+        "apidrift/prospect.py",
+        "        return \"\" if finding.path.startswith(\"#\") else finding.path",
+        "        return finding.path",
+        ["test_pseudo_path_is_never_searched_as_a_url"],
+    ),
+    (
         "signature builder drops the field name",
         "apidrift/signatures.py",
         "        if leaf and not leaf.startswith(\"<\"):",

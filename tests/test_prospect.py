@@ -106,3 +106,33 @@ class TestKindCoverage(unittest.TestCase):
         self.assertEqual(ENDPOINT_KINDS & ABSENCE_KINDS, set())
         self.assertEqual(ENDPOINT_KINDS & FIELD_KINDS, set())
         self.assertEqual(ABSENCE_KINDS & FIELD_KINDS, set())
+
+
+class TestPseudoPaths(unittest.TestCase):
+    """A schema finding's carrier path is not a URL."""
+
+    def _schema_finding(self, ops=()):
+        return Finding(
+            kind="schema_field_removed", severity=BREAKING,
+            op_key="GET #/components/schemas/SpamLinkRuleResponse",
+            path="#/components/schemas/SpamLinkRuleResponse", method="get",
+            detail="", subject="SpamLinkRuleResponse.creator_id",
+            root_cause="SpamLinkRuleResponse.creator_id",
+            affected_ops=list(ops),
+        )
+
+    def test_pseudo_path_is_never_searched_as_a_url(self):
+        query = build_query(self._schema_finding(), get("discord"), "python")
+        self.assertNotIn("#/components", query)
+
+    def test_a_real_affected_operation_is_preferred(self):
+        query = build_query(
+            self._schema_finding(["GET /guilds/{id}/auto-moderation/rules"]),
+            get("discord"), "python")
+        self.assertIn("/guilds", query)
+
+    def test_schema_name_is_the_fallback_when_no_endpoint_exists(self):
+        f = self._schema_finding()
+        f.subject = f.root_cause = "SpamLinkRuleResponse.id"   # weak leaf
+        query = build_query(f, get("discord"), "python")
+        self.assertIn("SpamLinkRuleResponse", query)

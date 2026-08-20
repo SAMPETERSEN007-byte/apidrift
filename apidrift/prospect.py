@@ -101,10 +101,12 @@ def canonical_path(finding: Finding) -> str:
     candidates = []
     for op_key in finding.affected_ops or []:
         _, _, path = op_key.partition(" ")
-        if path:
+        if path and not path.startswith("#"):
             candidates.append(path)
     if not candidates:
-        return finding.path
+        # A schema finding with no reachable operation carries a pseudo-path
+        # (`#/components/schemas/X`), which is not a URL and matches nothing.
+        return "" if finding.path.startswith("#") else finding.path
     # Fewest segments wins, then fewest path parameters, then shortest.
     return min(candidates,
                key=lambda p: (p.count("/"), p.count("{"), len(p)))
@@ -137,6 +139,12 @@ def build_query(finding: Finding, vendor: Vendor, language: str = "") -> str:
         terms.append(f'"{leaf}"')
     if len(path_literal) > 6:
         terms.append(f'"{path_literal}"')
+    elif not terms:
+        # No usable endpoint: fall back to the schema name, which generated
+        # clients carry verbatim as a class or type name.
+        schema = (finding.root_cause or finding.subject).split(".")[0]
+        if len(schema) > 8 and schema.lower() not in _WEAK_TOKENS:
+            terms.append(f'"{schema}"')
 
     if not terms:
         for candidate in finding.signatures:
