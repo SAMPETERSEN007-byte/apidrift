@@ -229,18 +229,20 @@ class TestAnonymousArmReshape(unittest.TestCase):
         return doc["components"]["schemas"]["Card"]["properties"]["tier"]["anyOf"][0]
 
     def test_enum_widening_is_not_a_field_removal(self):
+        from apidrift.diff import _kind_class
         self._tier(self.new)["enum"] = ["auto", "flex", "fast"]
         result = run(self.old, self.new)
-        found = {f.kind for f in result.findings}
-        self.assertIn("response_enum_value_added", found)
-        self.assertNotIn("response_field_removed", found)
+        classes = {_kind_class(f.kind) for f in result.findings}
+        self.assertIn("enum_value_added", classes)
+        self.assertNotIn("field_removed", classes)
         self.assertEqual(result.breaking, [], "widening an enum is not breaking")
 
     def test_enum_narrowing_is_reported(self):
+        from apidrift.diff import _kind_class
         self._tier(self.new)["enum"] = ["auto"]
-        found = {f.kind for f in run(self.old, self.new).findings}
-        self.assertIn("response_enum_value_removed", found)
-        self.assertNotIn("response_field_removed", found)
+        classes = {_kind_class(f.kind) for f in run(self.old, self.new).findings}
+        self.assertIn("enum_value_removed", classes)
+        self.assertNotIn("field_removed", classes)
 
     def test_arm_type_change_is_breaking_not_removal(self):
         self._tier(self.new).clear()
@@ -380,6 +382,41 @@ class TestRefEquivalence(unittest.TestCase):
         kinds_found = {f.kind for f in run(old, new).findings}
         self.assertNotIn("schema_field_type_changed", kinds_found,
                          "a rename with an unchanged shape is not a break")
+
+    def test_extracting_an_inline_object_is_not_a_type_change(self):
+        """Naming an inline definition changes notation, not the payload."""
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        inline = {"type": "object",
+                  "properties": {"completed": {"type": "integer"},
+                                 "failed": {"type": "integer"}}}
+        old["components"]["schemas"]["Card"]["properties"]["counts"] = \
+            copy.deepcopy(inline)
+        new["components"]["schemas"]["Counts"] = copy.deepcopy(inline)
+        new["components"]["schemas"]["Card"]["properties"]["counts"] = {
+            "$ref": "#/components/schemas/Counts"}
+        self.assertNotIn("schema_field_type_changed",
+                         {f.kind for f in run(old, new).findings})
+
+    def test_enum_change_behind_a_ref_is_an_enum_finding(self):
+        """OpenAI moved service_tier from ServiceTier to ServiceTierResponses.
+
+        The values widened. That is a fall-through risk on a response, not a
+        type break, and it was being reported as both.
+        """
+        from apidrift.diff import _kind_class
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        old["components"]["schemas"]["Tier"] = {
+            "type": "string", "enum": ["auto", "flex"]}
+        new["components"]["schemas"]["TierV2"] = {
+            "type": "string", "enum": ["auto", "flex", "fast"]}
+        old["components"]["schemas"]["Card"]["properties"]["tier"] = {
+            "$ref": "#/components/schemas/Tier"}
+        new["components"]["schemas"]["Card"]["properties"]["tier"] = {
+            "$ref": "#/components/schemas/TierV2"}
+        result = run(old, new)
+        classes = {_kind_class(f.kind) for f in result.findings}
+        self.assertIn("enum_value_added", classes)
+        self.assertNotIn("field_type_changed", classes)
 
     def test_retargeting_a_ref_to_a_different_shape_is_breaking(self):
         old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)

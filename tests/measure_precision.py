@@ -87,6 +87,41 @@ def walk_properties(schema: Any, parts: List[str], doc: Dict[str, Any],
     return False, None
 
 
+def effective_shape(prop: Any, doc: Dict[str, Any], depth: int = 0) -> Any:
+    """What a consumer actually sees for this property.
+
+    Written independently of the engine, and deliberately so: it answers the
+    same question by resolving to a concrete shape rather than by comparing
+    type labels. A single-arm `allOf` is transparent, and a reference resolves
+    to the sorted field names of its target so that a rename is invisible.
+    """
+    if not isinstance(prop, dict) or depth > 3:
+        return "opaque"
+    arms = prop.get("allOf")
+    if isinstance(arms, list) and len(arms) == 1 and "properties" not in prop:
+        return effective_shape(arms[0], doc, depth + 1)
+    ref = prop.get("$ref")
+    if isinstance(ref, str):
+        target = schemas_of(doc).get(ref.rsplit("/", 1)[-1])
+        if not isinstance(target, dict):
+            return ("ref-unresolved",)
+        # Resolve the target the same way as anything else, so an enum behind a
+        # reference is not silently discarded. Dropping it made the OpenAI
+        # ServiceTier widening (which gained `fast` and `ultrafast`) compare
+        # equal to its predecessor.
+        return effective_shape(target, doc, depth + 1)
+    if "properties" in prop:
+        return ("object", tuple(sorted(prop["properties"].keys())))
+    if prop.get("type") == "array":
+        return ("array", effective_shape(prop.get("items") or {}, doc, depth + 1))
+    for key in ("oneOf", "anyOf"):
+        if key in prop:
+            return (key, tuple(sorted(
+                str(effective_shape(a, doc, depth + 1)) for a in prop[key])))
+    enum = prop.get("enum")
+    return ("scalar", prop.get("type"), tuple(sorted(map(str, enum))) if enum else None)
+
+
 def resolve_root(doc: Dict[str, Any], root_cause: str) -> Optional[Tuple[Any, List[str]]]:
     """Split `Schema.a.b` into (schema object, ['a','b']). None if no schema."""
     segments = [s for s in root_cause.replace("[]", ".[].").split(".") if s]
@@ -212,9 +247,13 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
             o, n = old_props.get(field_name), new_props.get(field_name)
             if o is None or n is None:
                 return REFUTED, "field missing on one side"
-            if json.dumps(o, sort_keys=True) != json.dumps(n, sort_keys=True):
-                return CONFIRMED, "property definition differs"
-            return REFUTED, "property definition is identical"
+            # "The definition differs" is too weak: a description edit or a
+            # notation change satisfies it. Ask the consumer's question -- does
+            # the shape they receive or send actually differ?
+            before, after = effective_shape(o, old), effective_shape(n, new)
+            if before != after:
+                return CONFIRMED, f"shape {before} -> {after}"
+            return REFUTED, f"same effective shape {before}"
         return UNDECIDABLE, f"no independent check for `{kind}`"
 
     def _body_schema(doc, op_key, where):

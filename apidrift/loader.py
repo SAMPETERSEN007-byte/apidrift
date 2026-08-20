@@ -40,6 +40,10 @@ class Field:
     required: bool
     nullable: bool
     enum: Optional[Tuple[str, ...]] = None
+    # Property names when this field is an inline object. Without them an
+    # inline definition cannot be compared against a named one describing the
+    # same thing, and extracting a schema reads as a type change.
+    shape: Optional[Tuple[str, ...]] = None
 
     def signature(self) -> str:
         parts = [self.type]
@@ -518,6 +522,7 @@ class SchemaView:
     required: Tuple[str, ...]
     refs: Tuple[str, ...]          # schemas this one references, directly
     kind: str                      # object | array | enum | primitive | union
+    enum: Optional[Tuple[str, ...]] = None
 
 
 def _ref_name(node: Any) -> Optional[str]:
@@ -558,6 +563,30 @@ def _direct_refs(node: Any, depth: int = 0) -> List[str]:
     return out
 
 
+def _effective_enum(schema: Dict[str, Any], resolver: "Resolver") -> Optional[Tuple[str, ...]]:
+    """The enum a consumer actually sees, through a nullable union wrapper.
+
+    `anyOf: [{enum: [...]}, {type: null}]` is how a nullable enum is written.
+    Reading only the top level finds no enum there, so widening the values
+    inside looks like no change at all.
+    """
+    direct = _enum_of(schema)
+    if direct:
+        return direct
+    for key in ("oneOf", "anyOf"):
+        arms = schema.get(key)
+        if not isinstance(arms, list):
+            continue
+        meaningful = []
+        for arm in arms:
+            resolved, _ = resolver.resolve(arm, None)
+            if isinstance(resolved, dict) and _type_of(resolved) != "null":
+                meaningful.append(resolved)
+        if len(meaningful) == 1:
+            return _enum_of(meaningful[0])
+    return None
+
+
 def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
     """One entry per named schema, with its own properties resolved one level."""
     raw = ((doc.get("components") or {}).get("schemas")
@@ -583,11 +612,16 @@ def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
                 target = _ref_name(prop)
                 resolved, _ = resolver.resolve(prop, None) if not target else (prop, None)
                 node = prop if target else (resolved if isinstance(resolved, dict) else {})
+                inline_props = (node.get("properties")
+                                if isinstance(node, dict) else None)
                 fields[str(prop_name)] = Field(
                     type=(f"->{target}" if target else _type_of(node)),
                     required=str(prop_name) in required,
                     nullable=_is_nullable(node) if isinstance(node, dict) else False,
-                    enum=_enum_of(node) if isinstance(node, dict) else None,
+                    enum=(_effective_enum(node, resolver)
+                          if isinstance(node, dict) and not target else None),
+                    shape=(tuple(sorted(inline_props))
+                           if isinstance(inline_props, dict) else None),
                 )
 
         views[str(name)] = SchemaView(
@@ -596,6 +630,7 @@ def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
             required=required,
             refs=tuple(sorted(set(_direct_refs(schema)))),
             kind=stype,
+            enum=_effective_enum(merged, resolver),
         )
     return views
 

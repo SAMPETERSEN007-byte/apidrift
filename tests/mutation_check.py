@@ -280,9 +280,23 @@ MUTATIONS = [
     (
         "schema rename reported as a type change",
         "apidrift/diff.py",
-        "            if was.type != now.type and not _same_shape(was.type, now.type,",
-        "            if was.type != now.type or _same_shape(was.type, now.type,",
+        "            if was.type != now.type and not _same_shape(was, now, old, new):",
+        "            if was.type != now.type:",
         ["test_retargeting_a_ref_to_an_identical_shape_is_not_breaking"],
+    ),
+    (
+        "inline object shape discarded (extraction reads as a type change)",
+        "apidrift/loader.py",
+        "                    shape=(tuple(sorted(inline_props))\n                           if isinstance(inline_props, dict) else None),",
+        "                    shape=None,",
+        ["test_extracting_an_inline_object_is_not_a_type_change"],
+    ),
+    (
+        "enum change behind a ref reported as a type break",
+        "apidrift/diff.py",
+        "                if (was_shape and now_shape\n                        and was_shape[0] == \"enum\" == now_shape[0]):",
+        "                if False:",
+        ["test_enum_change_behind_a_ref_is_an_enum_finding"],
     ),
     (
         "signature builder drops the field name",

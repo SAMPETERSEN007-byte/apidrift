@@ -644,27 +644,43 @@ def _schema_op(name: str) -> Operation:
                      operation_id=name, summary="", deprecated=False)
 
 
-def _shape_of(spec: Spec, name: str, depth: int = 0) -> Optional[Tuple]:
-    """A comparable fingerprint of a schema: its field names and their types."""
-    view = spec.schemas.get(name)
-    if view is None or depth > 1:
-        return None
-    return tuple(sorted((field, meta.type) for field, meta in view.fields.items()))
+def _field_shape(field: Field, spec: Spec) -> Optional[Tuple]:
+    """What a consumer sees for this field, regardless of how it is written.
 
-
-def _same_shape(old_type: str, new_type: str, old: Spec, new: Spec) -> bool:
-    """True when a `$ref` was retargeted to a schema of identical shape.
-
-    Renaming a schema and repointing every reference at the new name is not a
-    breaking change for a consumer, who never sees the name. Plaid renamed
-    `CraCheckReportCashflowInsightsGetOptions` to
-    `CraCheckReportCreateCashflowInsightsOptions` without altering a field.
+    A named schema and an inline definition of the same thing are the same
+    thing. Twilio extracted its enums into named schemas without touching a
+    value, which read as a type change on twelve fields.
     """
-    if not (old_type.startswith("->") and new_type.startswith("->")):
-        return False
-    before = _shape_of(old, old_type[2:])
-    after = _shape_of(new, new_type[2:])
-    return before is not None and before == after and len(before) > 0
+    if field.type.startswith("->"):
+        view = spec.schemas.get(field.type[2:])
+        if view is None:
+            return None
+        if view.fields:
+            return ("object", tuple(sorted(view.fields)))
+        if view.enum:
+            return ("enum", view.enum)
+        return ("scalar", view.kind)
+    if field.enum:
+        return ("enum", field.enum)
+    if field.shape:
+        return ("object", field.shape)
+    if field.type in ("object", "array", "any", "oneOf", "anyOf"):
+        # Too coarse to call equivalent without more resolution.
+        return None
+    return ("scalar", field.type)
+
+
+def _same_shape(was: Field, now: Field, old: Spec, new: Spec) -> bool:
+    """True when the two notations describe the same thing.
+
+    Covers a schema rename (Plaid renamed
+    `CraCheckReportCashflowInsightsGetOptions` to
+    `CraCheckReportCreateCashflowInsightsOptions` without altering a field) and
+    extraction of an inline definition into a named one, in either direction.
+    """
+    before = _field_shape(was, old)
+    after = _field_shape(now, new)
+    return before is not None and before == after
 
 
 def _diff_schema_views(old: Spec, new: Spec) -> List[Finding]:
@@ -727,10 +743,29 @@ def _diff_schema_views(old: Spec, new: Spec) -> List[Finding]:
                      f"`{subject}` was removed from the schema",
                      subject, was.signature(), "<removed>")
                 continue
-            if was.type != now.type and not _same_shape(was.type, now.type,
-                                                          old, new):
-                emit("schema_field_type_changed", BREAKING,
-                     f"`{subject}` changed type", subject, was.type, now.type)
+            if was.type != now.type and not _same_shape(was, now, old, new):
+                was_shape = _field_shape(was, old)
+                now_shape = _field_shape(now, new)
+                if (was_shape and now_shape
+                        and was_shape[0] == "enum" == now_shape[0]):
+                    # Both sides are enums, so the change is in the VALUES.
+                    # Report it as such: widening a response enum is a
+                    # fall-through risk, not a type break.
+                    dropped = sorted(set(was_shape[1]) - set(now_shape[1]))
+                    gained = sorted(set(now_shape[1]) - set(was_shape[1]))
+                    if dropped:
+                        emit("schema_enum_value_removed",
+                             BREAKING if in_request else POTENTIALLY_BREAKING,
+                             f"`{subject}` no longer allows: {', '.join(dropped)}",
+                             subject, "|".join(was_shape[1]), "|".join(now_shape[1]))
+                    if gained and in_response:
+                        emit("schema_enum_value_added", POTENTIALLY_BREAKING,
+                             f"`{subject}` gained values: {', '.join(gained)} "
+                             f"(exhaustive switches will fall through)",
+                             subject, "|".join(was_shape[1]), "|".join(now_shape[1]))
+                else:
+                    emit("schema_field_type_changed", BREAKING,
+                         f"`{subject}` changed type", subject, was.type, now.type)
             if not was.required and now.required and in_request:
                 emit("schema_field_now_required", BREAKING,
                      f"`{subject}` became required in a request schema",
