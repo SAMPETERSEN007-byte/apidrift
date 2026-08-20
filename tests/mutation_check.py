@@ -243,6 +243,20 @@ MUTATIONS = [
         ["test_field_removed_from_an_inline_response"],
     ),
     (
+        "provenance ignored: response schemas scored as request schemas",
+        "apidrift/diff.py",
+        "            if not was.required and now.required and in_request:",
+        "            if not was.required and now.required:",
+        ["test_newly_required_in_a_response_schema_is_not_breaking"],
+    ),
+    (
+        "request-only field removal scored as breaking",
+        "apidrift/diff.py",
+        "                emit(\"schema_field_removed\",\n                     BREAKING if in_response else POTENTIALLY_BREAKING,",
+        "                emit(\"schema_field_removed\",\n                     BREAKING,",
+        ["test_removing_a_request_only_field_is_downgraded"],
+    ),
+    (
         "signature builder drops the field name",
         "apidrift/signatures.py",
         "        if leaf and not leaf.startswith(\"<\"):",

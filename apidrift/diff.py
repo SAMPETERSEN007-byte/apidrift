@@ -630,6 +630,13 @@ def _diff_schema_views(old: Spec, new: Spec) -> List[Finding]:
     for name in sorted(set(old.schemas) & set(new.schemas)):
         before, after = old.schemas[name], new.schemas[name]
         ops = new.reachable.get(name, []) or old.reachable.get(name, [])
+        # Severity depends on which direction the schema travels. Tightening
+        # what a caller must SEND breaks them; tightening what they RECEIVE
+        # does not. Stripe's request bodies are inline form schemas, so every
+        # named schema there is response-side, and scoring "now required" as
+        # breaking across all of them would be wrong 36 times over.
+        in_request = new.used_in_requests(name) or old.used_in_requests(name)
+        in_response = new.used_in_responses(name) or old.used_in_responses(name)
         carrier = _schema_op(name)
         if ops:
             carrier.path = ops[0].partition(" ")[2] or carrier.path
@@ -649,24 +656,31 @@ def _diff_schema_views(old: Spec, new: Spec) -> List[Finding]:
             now = after.fields.get(field_name)
             subject = f"{name}.{field_name}"
             if now is None:
-                emit("schema_field_removed", BREAKING,
+                # Losing a field a caller READS breaks them. Losing one they
+                # merely send is usually ignored by the server.
+                emit("schema_field_removed",
+                     BREAKING if in_response else POTENTIALLY_BREAKING,
                      f"`{subject}` was removed from the schema",
                      subject, was.signature(), "<removed>")
                 continue
             if was.type != now.type:
                 emit("schema_field_type_changed", BREAKING,
                      f"`{subject}` changed type", subject, was.type, now.type)
-            if not was.required and now.required:
+            if not was.required and now.required and in_request:
                 emit("schema_field_now_required", BREAKING,
-                     f"`{subject}` became required", subject, "optional", "required")
+                     f"`{subject}` became required in a request schema",
+                     subject, "optional", "required")
             if was.enum and now.enum:
                 dropped = sorted(set(was.enum) - set(now.enum))
                 added = sorted(set(now.enum) - set(was.enum))
                 if dropped:
-                    emit("schema_enum_value_removed", BREAKING,
+                    # Unsendable if it is a request value; merely unexpected if
+                    # it is one you used to receive.
+                    emit("schema_enum_value_removed",
+                         BREAKING if in_request else POTENTIALLY_BREAKING,
                          f"`{subject}` no longer allows: {', '.join(dropped)}",
                          subject, "|".join(was.enum), "|".join(now.enum))
-                if added:
+                if added and in_response:
                     emit("schema_enum_value_added", POTENTIALLY_BREAKING,
                          f"`{subject}` gained values: {', '.join(added)} "
                          f"(exhaustive switches will fall through)",
@@ -678,9 +692,10 @@ def _diff_schema_views(old: Spec, new: Spec) -> List[Finding]:
         for field_name, now in after.fields.items():
             if field_name in before.fields:
                 continue
-            if now.required:
+            if now.required and in_request:
                 subject = f"{name}.{field_name}"
                 emit("schema_field_added_required", BREAKING,
-                     f"schema `{name}` gained required field `{field_name}`",
+                     f"request schema `{name}` gained required field "
+                     f"`{field_name}`",
                      subject, "<absent>", now.signature())
     return out

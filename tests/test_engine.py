@@ -348,6 +348,55 @@ class TestDepthTruncation(unittest.TestCase):
                              "a truncation marker leaked into a finding")
 
 
+class TestProvenanceSeverity(unittest.TestCase):
+    """Tightening what a caller SENDS breaks them; what they RECEIVE does not."""
+
+    def _with_request_schema(self):
+        doc = copy.deepcopy(BASE)
+        doc["components"]["schemas"]["ChargeRequest"] = {
+            "type": "object",
+            "properties": {"amount": {"type": "integer"},
+                           "note": {"type": "string"}},
+            "required": ["amount"],
+        }
+        doc["paths"]["/charges"]["post"]["requestBody"]["content"][
+            "application/json"]["schema"] = {
+                "$ref": "#/components/schemas/ChargeRequest"}
+        return doc
+
+    def test_newly_required_in_a_request_schema_is_breaking(self):
+        old = self._with_request_schema()
+        new = copy.deepcopy(old)
+        new["components"]["schemas"]["ChargeRequest"]["required"] = ["amount", "note"]
+        found = {f.kind for f in run(old, new).breaking}
+        self.assertIn("schema_field_now_required", found)
+
+    def test_newly_required_in_a_response_schema_is_not_breaking(self):
+        # `Card` is response-only in the fixture.
+        old = copy.deepcopy(BASE)
+        new = copy.deepcopy(BASE)
+        new["components"]["schemas"]["Card"]["required"] = ["id", "iin"]
+        kinds_found = {f.kind for f in run(old, new).findings}
+        self.assertNotIn("schema_field_now_required", kinds_found,
+                         "receiving a guaranteed field does not break a caller")
+
+    def test_removing_a_response_field_stays_breaking(self):
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        del new["components"]["schemas"]["Card"]["properties"]["iin"]
+        self.assertIn("schema_field_removed",
+                      {f.kind for f in run(old, new).breaking})
+
+    def test_removing_a_request_only_field_is_downgraded(self):
+        old = self._with_request_schema()
+        new = copy.deepcopy(old)
+        del new["components"]["schemas"]["ChargeRequest"]["properties"]["note"]
+        result = run(old, new)
+        self.assertNotIn("schema_field_removed",
+                         {f.kind for f in result.breaking})
+        self.assertIn("schema_field_removed",
+                      {f.kind for f in result.potentially_breaking})
+
+
 class TestReachability(unittest.TestCase):
     """A schema is visible from an operation that reaches it indirectly."""
 

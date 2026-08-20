@@ -91,6 +91,14 @@ class Spec:
     security_schemes: Dict[str, str]
     schemas: Dict[str, "SchemaView"] = field(default_factory=dict)
     reachable: Dict[str, List[str]] = field(default_factory=dict)
+    request_schemas: frozenset = frozenset()
+    response_schemas: frozenset = frozenset()
+
+    def used_in_requests(self, name: str) -> bool:
+        return name in self.request_schemas
+
+    def used_in_responses(self, name: str) -> bool:
+        return name in self.response_schemas
 
     @property
     def op_count(self) -> int:
@@ -467,6 +475,7 @@ def load_spec(raw: bytes, filename: str) -> Spec:
             operations[op.key] = op
 
     views = build_schema_views(doc)
+    every, request_roots, response_roots = operation_schema_roots(doc)
     return Spec(
         version=version,
         title=title,
@@ -474,7 +483,9 @@ def load_spec(raw: bytes, filename: str) -> Spec:
         operations=operations,
         security_schemes=security_schemes,
         schemas=views,
-        reachable=reachable_operations(views, operation_schema_roots(doc)),
+        reachable=reachable_operations(views, every),
+        request_schemas=frozenset(reachable_operations(views, request_roots)),
+        response_schemas=frozenset(reachable_operations(views, response_roots)),
     )
 
 
@@ -572,12 +583,21 @@ def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
     return views
 
 
-def operation_schema_roots(doc: Dict[str, Any]) -> Dict[str, List[str]]:
-    """op_key -> schema names its request or responses reference directly."""
-    out: Dict[str, List[str]] = {}
+def operation_schema_roots(
+    doc: Dict[str, Any],
+) -> Tuple[Dict[str, List[str]], Dict[str, List[str]], Dict[str, List[str]]]:
+    """op_key -> schema names referenced (all, request-side, response-side).
+
+    The split matters for severity. A field becoming required breaks callers
+    only if they have to SEND it; on a response-only schema the caller simply
+    receives more. Without provenance every such change is scored as breaking.
+    """
+    every: Dict[str, List[str]] = {}
+    request: Dict[str, List[str]] = {}
+    response: Dict[str, List[str]] = {}
     paths = doc.get("paths")
     if not isinstance(paths, dict):
-        return out
+        return every, request, response
     for path, item in paths.items():
         if not isinstance(item, dict):
             continue
@@ -585,12 +605,17 @@ def operation_schema_roots(doc: Dict[str, Any]) -> Dict[str, List[str]]:
             op = item.get(method)
             if not isinstance(op, dict):
                 continue
-            names = set(_direct_refs(op.get("requestBody")))
-            names |= set(_direct_refs(op.get("responses")))
-            names |= set(_direct_refs(op.get("parameters")))
-            if names:
-                out[f"{method.upper()} {path}"] = sorted(names)
-    return out
+            key = f"{method.upper()} {path}"
+            req = set(_direct_refs(op.get("requestBody")))
+            req |= set(_direct_refs(op.get("parameters")))
+            resp = set(_direct_refs(op.get("responses")))
+            if req:
+                request[key] = sorted(req)
+            if resp:
+                response[key] = sorted(resp)
+            if req or resp:
+                every[key] = sorted(req | resp)
+    return every, request, response
 
 
 def reachable_operations(
