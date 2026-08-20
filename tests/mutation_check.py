@@ -313,6 +313,28 @@ MUTATIONS = [
         ["test_the_specific_tail_is_preferred_over_a_generic_head"],
     ),
     (
+        "generated-code provenance gate removed",
+        "apidrift/verify.py",
+        "    marker = looks_generated(source)\n    if marker:",
+        "    marker = \"\"\n    if marker:",
+        ["test_vendor_generated_sdk_is_rejected",
+         "test_openapi_generator_header_is_rejected"],
+    ),
+    (
+        "declarations counted as reads of a response field",
+        "apidrift/verify.py",
+        "        directed = _sites_matching_direction(sites, finding)",
+        "        directed = sites",
+        ["test_a_defaults_table_is_not_a_read_of_a_response_field"],
+    ),
+    (
+        "endpoint match no longer requires the changed field to appear",
+        "apidrift/verify.py",
+        "        if named and not _identifier_present(source, named):",
+        "        if False:",
+        ["test_calling_a_shared_prefix_without_the_field_is_rejected"],
+    ),
+    (
         "signature builder drops the field name",
         "apidrift/signatures.py",
         "        if leaf and not leaf.startswith(\"<\"):",
