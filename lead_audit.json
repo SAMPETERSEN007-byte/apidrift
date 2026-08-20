@@ -36,7 +36,7 @@
     "lead_precision": "0/10",
     "sendable": false,
     "blocker": "Operation reachability is accepted as proof for a whole-schema removal. A caller who reaches the operation but never reads any field of the removed schema is not affected, and seven of ten audited leads were exactly that. The fix is to resolve the removed schema to its leaf field names in the OLD spec and require a read of one of them, rejecting calls whose response is discarded.",
-    "findings_precision": "64/64, zero undecidable. The 84/84 claimed on 2026-08-20 morning was really 64/84 = 76% at the consumer level: 5 schema relocations, 15 path-parameter renames, 4 path-parameter add/remove artifacts. Mutation-verified end to end \u2014 with all four suppressions disabled the engine emits 86 and the independent checker refutes 22 unaided (64/86 = 74.4%).",
+    "findings_precision": "5-vendor gate population: 49/49 breaking, zero undecidable. ALL 21 registered vendors, measured for the first time 2026-08-20: 1492/1583 = 94.3% on independently decidable findings, 335 undecidable. The earlier 64/64 was a statement about five vendors, not about the engine.",
     "also_open": [
       "operation_reached() stops at the first affected operation with a hit, in list order, so an alphabetically earlier DELETE whose response is discarded wins over a GET whose response is deserialized. Rank by whether the response is consumed.",
       "A lead's breaks_on names the finding's representative operation while its proof names the operation the file actually calls, with nothing stating the two are related. This misled three auditors who had the repo, the spec and the source in front of them."
@@ -71,6 +71,38 @@
       "_Assignments is one flat module-level dict, so def-use tracing is scope-blind and flow-insensitive across function boundaries."
     ],
     "pr_enabled": false,
-    "pr_blocker": "No write path exists and none should be added before a fourth adversarial audit samples IMPACTS from scan.py against real repos. Opening a pull request into someone else's repository is a larger outward-facing act than sending an email, and gate.sh already refuses to let the email ship."
+    "pr_blocker": "No write path exists and none should be added before a fourth adversarial audit samples IMPACTS from scan.py against real repos. Opening a pull request into someone else's repository is a larger outward-facing act than sending an email, and gate.sh already refuses to let the email ship.",
+    "vendor_coverage": {
+      "measured": "2026-08-20",
+      "note": "tools/vendor_check.py could not import until this session -- it was moved into tools/ and its sys.path and cache paths still pointed at the repo root, so every run died on line 12. The '20/22 working' number came from a copy that no longer exists.",
+      "diffed": 21,
+      "history_shorter_than_window": [
+        "column (history begins 2026-05-11)"
+      ],
+      "failed": 0,
+      "unmeasured_precision": [
+        "auth0",
+        "cohere",
+        "intercom",
+        "mistral",
+        "openai",
+        "resend",
+        "sendgrid"
+      ],
+      "unmeasured_reason": "zero breaking findings in the window, so there is nothing to audit. Not a pass -- the report prints them as UNMEASURED rather than clean.",
+      "window_caveats": "14 of 21 carry one: an observed range shorter OR LONGER than requested (the old side is the last commit BEFORE the window, which for a quiet repo can be a year earlier -- openai 429d of 180d), or specs with no history behind them. sendgrid's HEAD is 2026-03-24, so its window ends five months before `asof`."
+    }
+  },
+  "findings_defect_found_and_fixed_5": {
+    "what": "A schema NAME never reaches the wire. `schema_removed` was 1007 of the 2766 breaking findings across all 21 vendors -- 36% of the population -- and the precision checker confirmed 1007 of 1007.",
+    "evidence": "The checker's test was `name in schemas_of(old) and name not in schemas_of(new)`, the same question the engine asks and the SPEC AUTHOR's question. Asked the caller's way -- find every $ref to it in the OLD document and look at the same place in the NEW one -- 694 of the 1007 are refuted. Klaviyo inlined 208 single-value enums at the identical property; Cloudflare renamed 191 response envelopes in bulk; PayPal's error_409 lived only inside error_default, one restructure reported 92 times; Sentry's whole components table is vestigial because it publishes a DEREFERENCED spec.",
+    "why_it_survived": "Fifth instance of the checker sharing the engine's question, and the largest by an order of magnitude. All-vendor precision was never 96.3%; it was 67.8%.",
+    "status": "Fixed in engine and checker independently, four suppression classes (unreachable / relocated / renamed / subsumed), each decided by a different question. Every one has a mutation in BOTH directions."
+  },
+  "findings_defect_found_and_fixed_6": {
+    "what": "A refuter whose precondition holds for 100% of inputs is a broken instrument, not a result.",
+    "evidence": "The first version of the `unreachable` rule refuted any schema with no $ref pointing at it. Sentry's openapi-derefed.json contains ZERO occurrences of `\"$ref\"` in 3.2 MB, so the test was vacuously true for all 157 of its schemas. An adversarial audit showed it would have deleted a real break: DetailedOrganizationSerializerWithProjectsAndTeams is verbatim the 200 body of a PUT that still exists and lost seven required response properties.",
+    "why_it_survived": "It did not -- it was killed before shipping, by an audit run specifically to attack the new rules. Recorded because the shape recurs: this is the same failure as 'zero results is a failed measurement until a control says otherwise', applied to a suppressor instead of a search.",
+    "status": "Both engine and checker now count the document's linking constructs first and ABSTAIN when there are none, in their own separate states (`unreachable_unmeasurable` / UNDECIDABLE). Measured: Sentry is the only fully-dereferenced vendor in the corpus; every other carries 502-17,807 refs."
   }
 }

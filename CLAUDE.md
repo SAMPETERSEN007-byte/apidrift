@@ -7,7 +7,9 @@ proves — per file, per line — which of them land on real code.
 Two vantage points, and the difference is the whole product:
 
 - `apidrift` (the report) — what changed across the tracked vendors. A claim
-  about a **spec diff**. Verified at 64/64.
+  about a **spec diff**. 49/49 on the five default vendors; **94.3% across all
+  21**, measured for the first time 2026-08-20. The two numbers are not in
+  conflict — the first was never a statement about the engine.
 - `apidrift scan PATH` (the CI gate) — which of those changes break code in a
   repository you have a checkout of. A claim about a **repo**. Zero impacts
   across 22 real repos, which is a measurement, not an absence.
@@ -18,9 +20,12 @@ Stripe response is intractable from one file of a repo you cannot see, and
 tractable when you have the checkout. `scan` is that pivot, and it is where the
 product now lives.
 
-**State:** branch `scan-your-own-repo`, no remote, one dependency (PyYAML),
-9.8k lines. 22 vendors registered, 20 verified working. `main` is behind — do
-not merge to it casually, the branch is the work.
+**State:** branch `scan-your-own-repo`, no remote, one dependency (PyYAML).
+22 vendors registered; measured 2026-08-20 by `tools/vendor_check.py`: **21
+diff, 1 (column) has history shorter than the window, 0 fail.** The old "20
+verified working" came from a copy of that tool that no longer exists — the
+in-repo one could not import at all. `main` is behind — do not merge to it
+casually, the branch is the work.
 
 ---
 
@@ -31,9 +36,9 @@ layers, each asking a question none of the others asks:
 
 | # | Layer | Question | Baseline (2026-08-20) |
 |---|-------|----------|----------------------|
-| 1 | unit tests | does the code do what it says? | 212 tests |
-| 2 | mutation testing | do the tests fail when the code is wrong? | 93/93 killed |
-| 3 | precision audit | are the FINDINGS real, per the RAW specs? | 64/64 breaking, 67/67 potentially |
+| 1 | unit tests | does the code do what it says? | 252 tests |
+| 2 | mutation testing | do the tests fail when the code is wrong? | 126/126 killed |
+| 3 | precision audit | are the FINDINGS real, per the RAW specs? | 49/49 breaking, 67/67 potentially |
 | 4 | end-to-end | does the pipeline still produce output? | `out/report.md` |
 | 5 | lead standing | are the LEADS real, per the last audit? | 0/10 — NOT sendable |
 
@@ -69,8 +74,10 @@ Three rules. Every one was bought with a defect that shipped.
 **1. Every finding must be independently decidable.** A finding you cannot
 confirm or refute against the raw spec is not a weaker finding — it is not a
 finding. `measure_precision.py` reports UNDECIDABLE as its own bucket and
-excludes it from the ratio rather than counting it as a pass. 64/64 means
-sixty-four decided and sixty-four confirmed, not "64 of the ones we liked".
+excludes it from the ratio rather than counting it as a pass. 49/49 means
+forty-nine decided and forty-nine confirmed, not "49 of the ones we liked".
+Across all 21 vendors 335 findings are still UNDECIDABLE, and that number is
+the honest measure of how much of the engine is unaudited.
 
 **2. A test is worthless until you have watched it fail.** Every new test gets
 a mutation in `tests/mutation_check.py`. Three times a test was written that
@@ -80,7 +87,7 @@ invariant had to move to `_field_shape`, where the comparison actually happens.
 If you cannot make the mutation kill the test, the test is testing nothing.
 
 **3. The checker must never ask the same question as the engine.** This has
-been the recurring defect — **four separate times**, each reported as 100%
+been the recurring defect — **five separate times**, each reported as 100%
 precision:
 
 - *security* — OpenAPI `security` is a list of ALTERNATIVES; both engine and
@@ -96,6 +103,25 @@ precision:
   byte-identical URLs. 19 of 84.
 - *`scan` impacts* — the checker shared the engine's notion of a request-side
   change. 4 classes, all gated.
+- *schema removal* — **the big one, 2026-08-20.** `schema_removed` was 1007 of
+  the 2766 breaking findings across all 21 vendors, 36% of the population, and
+  the checker confirmed 1007 of 1007. Its test was `name in schemas_of(old) and
+  name not in schemas_of(new)` — literally the engine's own question. Asked the
+  caller's way, **694 of 1007 are refuted.** All-vendor precision was never
+  96.3%; it was 67.8%.
+
+**3b. A refuter whose precondition holds for 100% of inputs is a broken
+instrument, not a result.** The first version of the new `unreachable` rule
+refuted any schema with no `$ref` pointing at it. Sentry's
+`openapi-derefed.json` contains **zero** occurrences of `"$ref"` in 3.2 MB, so
+that was vacuously true of all 157 of its schemas, and it would have deleted a
+real break — `DetailedOrganizationSerializerWithProjectsAndTeams` is verbatim
+the 200 body of a PUT that still exists and lost seven required response
+properties. Engine and checker now **count the linking constructs first and
+abstain when there are none**, in their own separate states. Same shape as
+"zero results is a failed measurement", applied to a suppressor instead of a
+search — and it is why a new suppressor gets an adversarial audit, not just a
+test.
 
 The morning of 2026-08-20 claimed 84/84 = 100%. It was really **64/84 = 76%**.
 Mutation-verified end to end: with all four suppressions disabled the engine
@@ -152,6 +178,31 @@ exactly that, because nobody can depend on something that did not exist yet.
 For an addition, reach is not a weak substitute for proof; it IS the proof.
 **Do not merge them.** Sharing one function puts the two one edit away from
 collapsing into each other.
+
+### The `schema_removed` suppressors — four questions, never one
+
+A schema NAME never reaches the wire, the same fact that made a field moving
+between schemas a non-event and a path-parameter rename a non-event. It was
+never applied to the schema itself. Each class is decided by a **different**
+question so no two can collapse into one opinion:
+
+| Reason | Question | Measured |
+|---|---|---|
+| `unreachable` | does any operation reach it? | Sentry 25/25 — but only where the document links schemas at all |
+| `relocated` | does every place that pointed at it still present the same shape? | Klaviyo 208 inlined enums |
+| `renamed` | does every operation that named it now name a schema of identical shape? | Cloudflare 191 bulk-renamed envelopes |
+| `subsumed` | is every route in through another schema removed in the same change? | PayPal `error_409`, one restructure reported 92 times |
+
+🚨 **`not direct` on the subsumption rule is load-bearing.** An operation that
+names a schema itself can observe its removal whatever happened to the schema's
+other parents. Without it PayPal's `error_400/401/403/404/409/422/500` all
+vanish — each is a status-coded response body on live operations *and* an arm
+of `error_default` — along with 20 Cloudflare request-surface schemas.
+
+🚨 **Every suppressor has a mutation in BOTH directions.** Disable it and the
+"not a break" test goes red; make it fire unconditionally and the "still a
+break" test goes red. A suppressor with only the first half is a deletion
+nobody is checking.
 
 ### And four more on the `scan` side
 All refuted by hand against source + raw spec, all gated: a read proving a
@@ -217,6 +268,11 @@ Do not add a PR path, an auto-commit, or an email send. Do not flip
 ./.venv/bin/python tests/mutation_check.py         # layer 2 — 21.7s (93 mutations)
 ./.venv/bin/python tests/measure_precision.py --sample 1000 --severity breaking
                                                    # layer 3 — 12.6s per severity
+./.venv/bin/python tests/measure_precision.py --findings out_all/findings.json \
+    --sample 5000 --severity breaking --by-vendor   # ALL vendors, per-vendor
+./.venv/bin/python tools/vendor_check.py --days 180 --asof 2026-08-20
+./.venv/bin/python -m apidrift.cli --vendors all --days 180 --asof 2026-08-20 --out out_all
+./.venv/bin/python -m apidrift.cli snapshot        # the URL-only cohort
 ./.venv/bin/python -m apidrift.cli --days 90 --quiet
                                                    # layer 4 — 18.2s
 ./.venv/bin/python -m apidrift.cli scan ~/somerepo --days 30
@@ -266,12 +322,23 @@ defaults to **all** vendors, the report to the five.
   and must not be believed until `measure_precision.py` has run against it.
   They regenerate several times a day — exactly the shape that produced phantom
   findings before.
-- **`apidrift/snapshot.py` has NEVER BEEN RUN.** It records the 14 vendors who
-  publish a spec but no history. Two hazards are already encoded from the
-  survey: Google randomises JSON key order per response (raw-byte hashing would
-  report a change every day forever), and four vendors return HTTP 200 with an
-  HTML error page (every body is validated before storage). A gap in the
-  archive is visible; a bad record is not.
+- **`apidrift snapshot` runs daily** (launchd `com.claudebot.apidrift-snapshot`,
+  05:17, log `~/Library/Logs/apidrift-snapshot.log`). 11 sources registered, 10
+  fetch and store, 1 (Salesforce) is `blocked` — 403 with or without a Referer,
+  its own state and deliberately not a run failure.
+  🚨 **The change detector is deliberately insensitive to three things and must
+  stay sensitive to everything else**: key order (Gemini randomises it per
+  response), `example` values, and UUIDs/ISO timestamps anywhere (Avalara
+  regenerates every example GUID *and* embeds a fresh OAuth `nonce`, so it would
+  have stored 4 MB every day forever). Four controls hold this together and all
+  four must pass: two fetches of Avalara agree; two of Gemini agree while their
+  raw bytes differ; an example-only change does NOT move the digest; a dropped
+  endpoint DOES. The fourth is not optional — a detector made insensitive to
+  everything reports a clean archive forever.
+  🚨 **Slack and Postmark are labelled `stale` and `dead` with the measurement
+  attached** (1 change in 2.6y; 0 in 5y7m). An unchanged day from either carries
+  no information and the report says so under its own heading. Never let their
+  silence read as an all-clear.
 - **Commit messages carry the reasoning.** They are the design record for this
   project and several were the only place a defect was ever explained. Keep
   writing them that way: what was wrong, what it looked like, why the previous
