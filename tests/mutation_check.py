@@ -18,6 +18,48 @@ PY_BIN = str(ROOT / ".venv" / "bin" / "python")
 
 MUTATIONS = [
     (
+        "scan: prefilter rejects a path with nothing distinctive to search for",
+        "apidrift/scan.py",
+        "            if not segments:\n                return True",
+        "            if not segments:\n                continue",
+        ["test_a_path_with_nothing_distinctive_is_never_filtered_out"],
+    ),
+    (
+        "scan: prefilter ignores SDK idioms and demands a path literal",
+        "apidrift/scan.py",
+        "        if any(idiom in source for idiom in idioms):\n            return True",
+        "        if False:\n            return True",
+        ["test_an_sdk_idiom_alone_is_enough_for_an_endpoint_change"],
+    ),
+    (
+        "scan: dependency copies walked as if the repo author wrote them",
+        "apidrift/scan.py",
+        "        dirnames[:] = [d for d in dirnames\n                       if d not in SKIP_DIRS and not d.startswith(\".\")]",
+        "        dirnames[:] = list(dirnames)",
+        ["test_dependency_copies_are_not_this_repos_code"],
+    ),
+    (
+        "whole-schema deletion accepts operation reach alone (the third-audit defect)",
+        "apidrift/dependence.py",
+        '        if finding.kind == "schema_removed":',
+        "        if False:",
+        ["test_reaching_the_operation_alone_is_not_enough"],
+    ),
+    (
+        "generic field names accepted as proof of a schema read",
+        "apidrift/dependence.py",
+        "    if len(name) < 4 or name.lower() in _GENERIC_FIELDS:\n        return False",
+        "    if len(name) < 4:\n        return False",
+        ["test_a_schema_of_only_generic_fields_cannot_be_proven"],
+    ),
+    (
+        "deleted schema's field names never recorded",
+        "apidrift/diff.py",
+        "        finding.leaf_fields = sorted(view.fields)",
+        "        finding.leaf_fields = []",
+        ["test_deleted_schema_findings_carry_their_field_names"],
+    ),
+    (
         "union arms keyed positionally again",
         "apidrift/loader.py",
         'for name, member in _named_arms(list(resolved.get(stype) or []), resolver, seen):\n            child_prefix = f"{prefix}<{name}>" if prefix else f"<{name}>"',
@@ -359,9 +401,10 @@ MUTATIONS = [
     (
         "dependence: whole-schema changes demand the schema name in the code",
         "apidrift/dependence.py",
-        "    if finding.kind in ENDPOINT_KINDS:\n        # Operation-level and whole-schema",
-        "    if finding.kind in ENDPOINT_KINDS and not leaf:\n        # Operation-level and whole-schema",
-        ["test_a_deleted_schema_is_proven_by_reaching_its_operation"],
+        "    if finding.kind in ENDPOINT_KINDS:\n        # Operation-level changes",
+        "    if finding.kind in ENDPOINT_KINDS and not leaf:\n        # Operation-level changes",
+        ["test_a_deleted_schema_is_proven_by_reading_one_of_its_fields",
+         "test_reaching_the_operation_alone_is_not_enough"],
     ),
     (
         "verify: a path treated as self-identifying (no vendor evidence needed)",
@@ -390,7 +433,7 @@ MUTATIONS = [
         "    if not found and any(kw.arg in _BODY_ARGS for kw in node.keywords):",
         "    if False:",
         ["test_a_body_argument_stands_in_for_an_unstated_verb",
-         "test_a_deleted_schema_is_proven_by_reaching_its_operation"],
+         "test_reaching_the_operation_alone_is_not_enough"],
     ),
     (
         "dependence: a concatenation prefix accepted as a complete path",

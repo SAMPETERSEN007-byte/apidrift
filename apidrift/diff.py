@@ -103,6 +103,10 @@ class Finding:
     affected_op_count: int = 0
     direct_op_count: int = 0
     affected_ops: List[str] = field(default_factory=list)
+    # For a whole-schema deletion: the schema's own property names. A caller
+    # who reaches the operation but never reads one of these is unaffected,
+    # which was seven of ten refutations in the third adversarial audit.
+    leaf_fields: List[str] = field(default_factory=list)
     root_cause: str = ""
 
     def as_dict(self) -> Dict[str, object]:
@@ -788,6 +792,7 @@ def _diff_schema_views(old: Spec, new: Spec) -> List[Finding]:
             subject=name, old=f"{len(view.fields)} fields", new="<removed>",
         )
         finding.root_cause = name
+        finding.leaf_fields = sorted(view.fields)
         finding.affected_ops = ops[:200]
         finding.affected_op_count = len(ops)
         finding.direct_op_count = len(old.nearby.get(name, []))

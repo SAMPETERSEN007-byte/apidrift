@@ -130,6 +130,19 @@ class TestBreakingDetection(unittest.TestCase):
         del self.new["components"]["schemas"]["Card"]["properties"]["iin"]
         self.assertIn("schema_field_removed", kinds(run(self.old, self.new)))
 
+    def test_deleted_schema_findings_carry_their_field_names(self):
+        """A caller never writes the schema name, only its fields.
+
+        Without these the verifier can only show the caller reached the
+        operation, which is what refuted seven of ten leads in the third
+        adversarial audit.
+        """
+        del self.new["components"]["schemas"]["Card"]
+        removed = [f for f in run(self.old, self.new).findings
+                   if f.kind == "schema_removed" and f.subject == "Card"]
+        self.assertTrue(removed, "deleting a named schema must be reported")
+        self.assertIn("iin", removed[0].leaf_fields)
+
     def test_field_removed_from_an_inline_response(self):
         """No named schema exists here, so only the route pass can catch it."""
         body = self.new["paths"]["/charges"]["get"]["responses"]["200"][

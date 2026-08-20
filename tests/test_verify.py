@@ -23,11 +23,11 @@ STRIPE = get("stripe")
 
 
 def finding(kind="schema_field_removed", subject="card.iin",
-            path="/v1/customers", method="get", ops=(), sigs=()):
+            path="/v1/customers", method="get", ops=(), sigs=(), leaves=()):
     return Finding(kind=kind, severity=BREAKING, op_key=f"{method.upper()} {path}",
                    path=path, method=method, detail="", subject=subject,
                    root_cause=subject, affected_ops=list(ops),
-                   signatures=list(sigs))
+                   signatures=list(sigs), leaf_fields=list(leaves))
 
 
 def verdict_of(source, finding_obj, vendor=STRIPE, path="app.py"):
@@ -312,17 +312,73 @@ class TestWholeSchemaVersusField(unittest.TestCase):
     """Deleting a schema and deleting a field are different claims.
 
     A caller never writes `LinkSessionProtectResult` -- schema names are
-    OpenAPI-internal -- but if that schema is deleted the payload they receive
-    changes. Demanding they name it rejected every genuine caller. A FIELD
-    change is the opposite: only code that touches the field is affected.
+    OpenAPI-internal -- so demanding they name it rejected every genuine
+    caller. But reaching the operation is not enough either: the third
+    adversarial audit refuted seven of ten leads that reached the operation
+    and never touched the deleted schema. What a caller DOES write is the
+    schema's field names, so those carry the proof.
     """
 
     PLAID_CALLER = ('import plaid\n'
                     'def check(self, d):\n'
                     '    return self.api(path="/link/token/get", data=d)\n')
 
-    def test_a_deleted_schema_is_proven_by_reaching_its_operation(self):
+    READS_A_FIELD = ('import plaid\n'
+                     'def check(self, d):\n'
+                     '    r = self.api(path="/link/token/get", data=d)\n'
+                     '    return r["protect_decision"]\n')
+
+    LEAVES = ("protect_decision", "risk_reasons")
+
+    def test_reaching_the_operation_alone_is_not_enough(self):
+        """The exact shape of seven of ten third-audit refutations."""
         f = finding(kind="schema_removed", subject="LinkSessionProtectResult",
+                    path="/link/token/get", method="post",
+                    ops=["POST /link/token/get"], leaves=self.LEAVES)
+        verdict, reason, _, _ = verify_source(
+            self.PLAID_CALLER, "app.py", f, get("plaid"))
+        self.assertEqual(verdict, NO_DEPENDENCE)
+        self.assertIn("reads no field of the deleted schema", reason)
+
+    def test_a_deleted_schema_is_proven_by_reading_one_of_its_fields(self):
+        f = finding(kind="schema_removed", subject="LinkSessionProtectResult",
+                    path="/link/token/get", method="post",
+                    ops=["POST /link/token/get"], leaves=self.LEAVES)
+        verdict, _, _, sites = verify_source(
+            self.READS_A_FIELD, "app.py", f, get("plaid"))
+        self.assertEqual(verdict, CONFIRMED)
+        self.assertEqual(sites[0].line, 4)
+
+    def test_a_read_without_a_call_to_the_operation_is_not_enough(self):
+        """Symmetry: the field read has to sit with a call that carried it."""
+        source = ('import plaid\n'
+                  'def show(r):\n'
+                  '    return r["protect_decision"]\n')
+        f = finding(kind="schema_removed", subject="LinkSessionProtectResult",
+                    path="/link/token/get", method="post",
+                    ops=["POST /link/token/get"], leaves=self.LEAVES)
+        self.assertEqual(verdict_of(source, f, get("plaid")), NO_DEPENDENCE)
+
+    def test_a_schema_of_only_generic_fields_cannot_be_proven(self):
+        """`d.get("status")` is written by code that never heard of the schema.
+
+        Rejecting is the honest answer: an unprovable lead is an unmeasured
+        claim, not a weaker one.
+        """
+        source = ('import plaid\n'
+                  'def check(self, d):\n'
+                  '    r = self.api(path="/link/token/get", data=d)\n'
+                  '    return r["status"]\n')
+        f = finding(kind="schema_removed", subject="Anon",
+                    path="/link/token/get", method="post",
+                    ops=["POST /link/token/get"], leaves=("id", "status"))
+        verdict, reason, _, _ = verify_source(source, "app.py", f, get("plaid"))
+        self.assertEqual(verdict, NO_DEPENDENCE)
+        self.assertIn("no field distinctive enough", reason)
+
+    def test_an_operation_level_change_still_needs_only_the_call(self):
+        """The new rule is scoped to schema_removed, not to every endpoint kind."""
+        f = finding(kind="endpoint_removed", subject="/link/token/get",
                     path="/link/token/get", method="post",
                     ops=["POST /link/token/get"])
         self.assertEqual(verdict_of(self.PLAID_CALLER, f, get("plaid")), CONFIRMED)

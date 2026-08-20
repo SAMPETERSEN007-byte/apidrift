@@ -514,6 +514,23 @@ def find_missing_required(tree: ast.AST, field_name: str, method: str,
 # entry point
 # ---------------------------------------------------------------------------
 
+# Field names too generic to carry a proof. `d.get("status")` appears in code
+# that has never heard of the schema in question.
+_GENERIC_FIELDS = frozenset({
+    "id", "type", "name", "url", "data", "status", "code", "key", "value",
+    "object", "message", "error", "text", "size", "count", "index", "state",
+})
+
+
+def _is_distinctive(name: str) -> bool:
+    """Is this field name specific enough that reading it means something?"""
+    if len(name) < 4 or name.lower() in _GENERIC_FIELDS:
+        return False
+    if not name[0].isalpha():
+        return False
+    return name.replace("_", "").replace("-", "").isalnum()
+
+
 def _leaf_of(finding: Finding) -> str:
     """The field or schema the change names, or empty if it names none.
 
@@ -600,14 +617,45 @@ def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], s
                  for c in calls], "")
 
     if finding.kind in ENDPOINT_KINDS:
-        # Operation-level and whole-schema changes are proven by reaching the
-        # operation. A caller does not name `LinkSessionProtectResult` anywhere
-        # -- schema names are OpenAPI-internal -- but if that schema is deleted
-        # the payload they receive changes. Requiring them to write the name
-        # rejected every genuine caller of every such change.
+        # Operation-level changes are proven by reaching the operation. A
+        # caller does not name `LinkSessionProtectResult` anywhere -- schema
+        # names are OpenAPI-internal -- so requiring them to write the name
+        # rejected every genuine caller.
         calls = operation_reached()
-        return calls, ("" if calls else
-                       f"no call reaching `{method.upper()} {path or '?'}`")
+        if not calls:
+            return [], f"no call reaching `{method.upper()} {path or '?'}`"
+
+        # ...but a WHOLE-SCHEMA deletion needs one more step, and skipping it
+        # was the single largest source of false leads: seven of ten in the
+        # third adversarial audit reached the operation and were still
+        # unaffected. Deleting `..._alipay_details` does not break a script
+        # that DELETEs a subscription and reads `id` and `status` off the
+        # reply. The schema name is invisible to callers, but its FIELDS are
+        # not, so that is what has to be shown.
+        if finding.kind == "schema_removed":
+            leaves = [name for name in (finding.leaf_fields or [])
+                      if _is_distinctive(name)]
+            if not leaves:
+                return [], (f"schema `{finding.subject}` names no field "
+                            f"distinctive enough to prove a read; reaching the "
+                            f"operation is not evidence of using the schema")
+            touched: List[Proof] = []
+            for leaf_name in leaves:
+                touched.extend(find_field_uses(tree, leaf_name, lines))
+            if not touched:
+                shown = ", ".join(f"`{n}`" for n in leaves[:4])
+                return [], (f"calls the operation but reads no field of the "
+                            f"deleted schema `{finding.subject}` ({shown}"
+                            f"{', …' if len(leaves) > 4 else ''})")
+            anchor = calls[0].text[:60]
+            return ([Proof(kind=FIELD_READ, line=t.line, text=t.text,
+                           chain=t.chain + [
+                               f"a field of the deleted schema "
+                               f"`{finding.subject}`",
+                               f"and this file calls `{anchor}`, an operation "
+                               f"that carried it"])
+                     for t in touched[:5]], "")
+        return calls, ""
 
     if not leaf:
         return [], "the change names nothing a caller could reference"
