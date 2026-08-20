@@ -303,7 +303,7 @@ MUTATIONS = [
         "apidrift/prospect.py",
         "    if not path or path == \"/\" or path.startswith(\"#\"):\n        return \"\"",
         "    if not path or path == \"/\":\n        return \"\"",
-        ["test_pseudo_path_is_never_searched_as_a_url"],
+        ["test_pseudo_and_empty_paths_yield_nothing"],
     ),
     (
         "path truncated at the first parameter again",
