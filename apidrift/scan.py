@@ -51,6 +51,20 @@ MAX_FILE_BYTES = 512 * 1024
 
 PY_SUFFIX = ".py"
 
+# Dependence is provable only in Python. Everything else is UNMEASURED, which is
+# not the same as unaffected, and the difference is the whole safety of the
+# tool: a repo whose only Stripe caller is `src/pay.ts` was told
+# "clean — 0 breaking changes checked", exit 0, while a sibling TypeScript file
+# called a Plaid endpoint that had been deleted. Zero results is a failed
+# measurement until something says otherwise.
+OTHER_SOURCE_SUFFIXES = {
+    ".ts": "TypeScript", ".tsx": "TypeScript", ".js": "JavaScript",
+    ".jsx": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript",
+    ".go": "Go", ".rb": "Ruby", ".java": "Java", ".kt": "Kotlin",
+    ".php": "PHP", ".cs": "C#", ".rs": "Rust", ".swift": "Swift",
+    ".scala": "Scala", ".ex": "Elixir", ".exs": "Elixir",
+}
+
 # A suggestion should point at the code someone would actually change. Anchoring
 # 65 OpenAI additions to the same line of `test_llm.py` is technically a true
 # statement about where the API is called and useless as advice.
@@ -128,6 +142,13 @@ class ScanResult:
     # Never a silent truncation. A capped list that does not say it was capped
     # reads as a census.
     opportunities_dropped: int = 0
+    # {vendor_key: {language: file_count}} — files that call a vendor in a
+    # language this tool cannot parse. Reported, never counted as clean.
+    unmeasured: Dict[str, Dict[str, int]] = field(default_factory=dict)
+
+    @property
+    def unmeasured_files(self) -> int:
+        return sum(sum(langs.values()) for langs in self.unmeasured.values())
     window_days: int = 90
     asof: str = ""
 
@@ -150,6 +171,8 @@ class ScanResult:
             "breaking_count": len(self.breaking),
             "opportunity_count": len(self.opportunities),
             "opportunities_dropped": self.opportunities_dropped,
+            "unmeasured": self.unmeasured,
+            "unmeasured_files": self.unmeasured_files,
             "impacts": [i.as_dict() for i in self.impacts],
             "opportunities": [o.as_dict() for o in self.opportunities],
         }
@@ -191,6 +214,45 @@ def candidate_files(root: Path, vendor_keys: Sequence[str] = ()) -> List[Path]:
             found.append(path)
     found.sort()
     return found
+
+
+def unmeasurable_callers(
+    root: Path, vendor_keys: Sequence[str],
+) -> Dict[str, Dict[str, int]]:
+    """Files that call a vendor in a language dependence cannot be proven in.
+
+    Counted from the same walk rules as the Python pass so the two numbers are
+    comparable, and reported separately so an all-clear can never be printed
+    over a language that was simply never opened.
+    """
+    out: Dict[str, Dict[str, int]] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in SKIP_DIRS and not d.startswith(".")]
+        for name in filenames:
+            suffix = Path(name).suffix.lower()
+            language = OTHER_SOURCE_SUFFIXES.get(suffix)
+            if not language:
+                continue
+            path = Path(dirpath) / name
+            rel = _relative(root, path)
+            if is_generated_path(rel):
+                continue
+            try:
+                if path.stat().st_size > MAX_FILE_BYTES:
+                    continue
+            except OSError:
+                continue
+            source = _read(path)
+            if source is None:
+                continue
+            for key in vendor_keys:
+                if is_vendored_path(rel, key):
+                    continue
+                if find_vendor_evidence(source, get(key)):
+                    out.setdefault(key, {})
+                    out[key][language] = out[key].get(language, 0) + 1
+    return out
 
 
 def _read(path: Path) -> Optional[str]:
@@ -296,6 +358,7 @@ def scan_repo(
     result.python_files = len(paths)
     by_vendor, read = detect_vendors(root, paths, vendor_keys)
     result.files_scanned = read
+    result.unmeasured = unmeasurable_callers(root, vendor_keys)
     result.vendors_detected = {k: len(v) for k, v in by_vendor.items()}
 
     for key, files in sorted(by_vendor.items()):
@@ -411,12 +474,25 @@ def to_markdown(result: ScanResult) -> str:
         lines.append("")
 
     if not result.impacts:
-        lines.append(
-            f"**No breaking change in the window lands on this repository.** "
-            f"{result.findings_considered} breaking changes were checked "
-            f"against every calling file; none could be proven to reach code "
-            f"here."
-        )
+        if result.unmeasured:
+            lines.append(
+                f"**No breaking change was proven against this repository's "
+                f"Python.** {result.findings_considered} breaking changes were "
+                f"checked. This is not an all-clear — see the unmeasured "
+                f"languages below."
+            )
+        elif not result.vendors_detected:
+            lines.append("**Nothing was checked.** No file in this repository "
+                         "carries an import, host or key for any vendor this "
+                         "tool knows about.")
+        else:
+            lines.append(
+                f"**No breaking change in the window lands on this "
+                f"repository.** {result.findings_considered} breaking changes "
+                f"were checked against every calling file; none could be "
+                f"proven to reach code here."
+            )
+        lines.extend(_unmeasured_markdown(result))
         lines.extend(_opportunity_markdown(result))
         return "\n".join(lines) + "\n"
 
@@ -460,8 +536,25 @@ def to_markdown(result: ScanResult) -> str:
                 f"{impact.spec_window}"
             )
             lines.append("")
+    lines.extend(_unmeasured_markdown(result))
     lines.extend(_opportunity_markdown(result))
     return "\n".join(lines) + "\n"
+
+
+def _unmeasured_markdown(result: ScanResult) -> List[str]:
+    if not result.unmeasured:
+        return []
+    out = ["", f"## ⚠️ {result.unmeasured_files} caller"
+               f"{'' if result.unmeasured_files == 1 else 's'} could not be "
+               f"checked", "",
+           "Dependence is proven with Python's `ast` module. These files call "
+           "the same APIs in a language this tool does not parse, so they were "
+           "not examined at all. **Unmeasured is not unaffected.**", "",
+           "| Vendor | Language | Files |", "|---|---|---:|"]
+    for key, langs in sorted(result.unmeasured.items()):
+        for lang, n in sorted(langs.items()):
+            out.append(f"| {get(key).name} | {lang} | {n} |")
+    return out
 
 
 def _opportunity_markdown(result: ScanResult) -> List[str]:
@@ -493,6 +586,24 @@ def _opportunity_markdown(result: ScanResult) -> List[str]:
     return out
 
 
+def _unmeasured_lines(result: ScanResult) -> List[str]:
+    """Say what was not looked at. An all-clear that hides a blind spot is
+    worse than no answer, because it is acted on."""
+    if not result.unmeasured:
+        return []
+    parts = []
+    for key, langs in sorted(result.unmeasured.items()):
+        detail = ", ".join(f"{n} {lang}" for lang, n in sorted(langs.items()))
+        parts.append(f"{get(key).name}: {detail}")
+    n = result.unmeasured_files
+    return ["", f"UNMEASURED — {n} file{'' if n == 1 else 's'} "
+                f"{'calls' if n == 1 else 'call'} these APIs in a language "
+                f"this tool cannot parse:",
+            *[f"  {p}" for p in parts],
+            "  Dependence is proven in Python only. These files were not "
+            "checked, which is not the same as unaffected."]
+
+
 def _opportunity_lines(result: ScanResult) -> List[str]:
     if not result.opportunities:
         return []
@@ -513,9 +624,18 @@ def to_text(result: ScanResult) -> str:
     """Terminal/CI output: one line per impact, in the file:line:message form
     every editor and log scraper already knows how to jump to."""
     if not result.impacts:
-        head = (f"apidrift: clean — {result.findings_considered} breaking "
-                f"changes checked, none reach this repo")
-        return "\n".join([head] + _opportunity_lines(result)) + "\n"
+        if result.unmeasured:
+            head = (f"apidrift: no impact found in Python "
+                    f"({result.findings_considered} breaking changes checked) "
+                    f"— but this repo is NOT clean-checked, see below")
+        elif not result.vendors_detected:
+            head = ("apidrift: no calls to any known vendor found in this repo "
+                    "— nothing was checked")
+        else:
+            head = (f"apidrift: clean — {result.findings_considered} breaking "
+                    f"changes checked, none reach this repo")
+        return "\n".join([head] + _unmeasured_lines(result)
+                          + _opportunity_lines(result)) + "\n"
     out = []
     for impact in result.impacts:
         out.append(
@@ -526,6 +646,7 @@ def to_text(result: ScanResult) -> str:
     out.append("")
     out.append(f"apidrift: {len(result.breaking)} breaking change(s) land on "
                f"this repository")
+    out.extend(_unmeasured_lines(result))
     out.extend(_opportunity_lines(result))
     return "\n".join(out) + "\n"
 

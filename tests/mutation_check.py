@@ -18,6 +18,27 @@ PY_BIN = str(ROOT / ".venv" / "bin" / "python")
 
 MUTATIONS = [
     (
+        "an unmeasured language reported as clean again",
+        "apidrift/scan.py",
+        "        if result.unmeasured:\n            head = (f\"apidrift: no impact found in Python \"",
+        "        if False:\n            head = (f\"apidrift: no impact found in Python \"",
+        ["test_the_word_clean_is_never_printed_over_an_unmeasured_language"],
+    ),
+    (
+        "callers in other languages stop being counted at all",
+        "apidrift/scan.py",
+        "                if find_vendor_evidence(source, get(key)):",
+        "                if False:",
+        ["test_a_typescript_caller_is_counted_as_unmeasured"],
+    ),
+    (
+        "a repo calling nobody claims a clean bill of health",
+        "apidrift/scan.py",
+        "        elif not result.vendors_detected:\n            head = (\"apidrift: no calls to any known vendor found in this repo \"",
+        "        elif False:\n            head = (\"apidrift: no calls to any known vendor found in this repo \"",
+        ["test_a_repo_calling_no_known_vendor_says_nothing_was_checked"],
+    ),
+    (
         "a query variant counted as a new endpoint again",
         "apidrift/diff.py",
         '    path = path.partition("?")[0]',

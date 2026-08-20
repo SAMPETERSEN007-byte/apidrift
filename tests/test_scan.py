@@ -12,8 +12,10 @@ import unittest
 from pathlib import Path
 
 from apidrift.diff import BREAKING, Finding
-from apidrift.scan import (SKIP_DIRS, ScanResult, can_possibly_match,
-                           candidate_files, detect_vendors, to_text)
+from apidrift.scan import (SKIP_DIRS, Impact, ScanResult,
+                           can_possibly_match, candidate_files,
+                           detect_vendors, to_text,
+                           unmeasurable_callers)
 from apidrift.vendors import get
 
 
@@ -115,7 +117,8 @@ class TestOutput(unittest.TestCase):
 
     def test_a_clean_scan_says_how_much_was_checked(self):
         """"No impacts" is only meaningful next to the size of the search."""
-        result = ScanResult(root="/r", findings_considered=84)
+        result = ScanResult(root="/r", findings_considered=84,
+                            vendors_detected={"stripe": 3})
         text = to_text(result)
         self.assertIn("84 breaking changes checked", text)
         self.assertIn("clean", text)
@@ -123,3 +126,68 @@ class TestOutput(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestUnmeasuredIsNotClean(unittest.TestCase):
+    """Zero results is a failed measurement until something says otherwise.
+
+    A repo whose only Stripe caller was `src/pay.ts` was told
+    "clean — 0 breaking changes checked", exit 0, while a sibling TypeScript
+    file called a Plaid endpoint that had been deleted in the same window.
+    Dependence is provable in Python only; every other language is UNMEASURED,
+    and the word "clean" must never be printed over one.
+    """
+
+    def _repo(self, tmp: str, python: bool, typescript: bool) -> Path:
+        root = Path(tmp)
+        (root / "src").mkdir()
+        if python:
+            (root / "src" / "billing.py").write_text(
+                "import stripe\nc = stripe.Customer.retrieve(i)\n")
+        if typescript:
+            (root / "src" / "pay.ts").write_text(
+                'import Stripe from "stripe";\n'
+                'stripe.subscriptions.update(id, { cancel_at: t });\n')
+        return root
+
+    def test_a_typescript_caller_is_counted_as_unmeasured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp, python=False, typescript=True)
+            found = unmeasurable_callers(root, ["stripe", "plaid"])
+            self.assertEqual(found, {"stripe": {"TypeScript": 1}})
+
+    def test_the_word_clean_is_never_printed_over_an_unmeasured_language(self):
+        result = ScanResult(root="/r", findings_considered=64,
+                            vendors_detected={"stripe": 1},
+                            unmeasured={"stripe": {"TypeScript": 1}})
+        text = to_text(result)
+        # The bare all-clear, not the substring: "NOT clean-checked" is fine.
+        self.assertNotIn("apidrift: clean", text)
+        self.assertIn("NOT clean-checked", text)
+        self.assertIn("UNMEASURED", text)
+        self.assertIn("not the same as unaffected", text)
+
+    def test_a_python_only_repo_with_no_impact_is_still_allowed_to_be_clean(self):
+        """The control. Over-warning makes the warning worthless."""
+        result = ScanResult(root="/r", findings_considered=64,
+                            vendors_detected={"stripe": 1})
+        self.assertIn("apidrift: clean", to_text(result))
+
+    def test_a_repo_calling_no_known_vendor_says_nothing_was_checked(self):
+        """Distinct from clean: there was no measurement to pass."""
+        text = to_text(ScanResult(root="/r", findings_considered=64))
+        self.assertIn("nothing was checked", text)
+        self.assertNotIn("apidrift: clean", text)
+
+    def test_an_unmeasured_language_is_reported_alongside_a_real_impact(self):
+        result = ScanResult(root="/r", findings_considered=64,
+                            vendors_detected={"stripe": 1},
+                            unmeasured={"stripe": {"Go": 2}})
+        result.impacts.append(Impact(
+            vendor="stripe", vendor_name="Stripe", file="a.py", line=1,
+            kind="endpoint_removed", label="endpoint removed",
+            severity=BREAKING, subject="/v1/x", detail="", old="", new="",
+            operation="POST /v1/x"))
+        text = to_text(result)
+        self.assertIn("1 breaking change(s) land", text)
+        self.assertIn("2 Go", text)

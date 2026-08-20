@@ -36,7 +36,7 @@
     "lead_precision": "0/10",
     "sendable": false,
     "blocker": "Operation reachability is accepted as proof for a whole-schema removal. A caller who reaches the operation but never reads any field of the removed schema is not affected, and seven of ten audited leads were exactly that. The fix is to resolve the removed schema to its leaf field names in the OLD spec and require a read of one of them, rejecting calls whose response is discarded.",
-    "findings_precision": "64/64, zero undecidable. The 84/84 claimed on 2026-08-20 morning was really 64/84 = 76% at the consumer level: 5 schema relocations, 15 path-parameter renames. Mutation-verified end to end \u2014 with all four suppressions disabled the engine emits 86 and the independent checker refutes 22 of them unaided (64/86 = 74.4%).",
+    "findings_precision": "64/64, zero undecidable. The 84/84 claimed on 2026-08-20 morning was really 64/84 = 76% at the consumer level: 5 schema relocations, 15 path-parameter renames, 4 path-parameter add/remove artifacts. Mutation-verified end to end \u2014 with all four suppressions disabled the engine emits 86 and the independent checker refutes 22 unaided (64/86 = 74.4%).",
     "also_open": [
       "operation_reached() stops at the first affected operation with a hit, in list order, so an alphabetically earlier DELETE whose response is discarded wins over a GET whose response is deserialized. Rank by whether the response is consumed.",
       "A lead's breaks_on names the finding's representative operation while its proof names the operation the file actually calls, with nothing stating the two are related. This misled three auditors who had the repo, the spec and the source in front of them."
@@ -55,5 +55,22 @@
     "evidence": "Twilio renamed {Sid}->{id} and {ConversationSid}->{ConversationId} across Conversations and ControlPlane. That produced 15 of 79 breaking findings, plus 4 more param-level findings once renamed operations began being diffed body-to-body. Zero of the 19 break anybody.",
     "why_it_survived": "dependence.paths_match() has ALWAYS normalised parameter names away when matching a caller's literal to a template \u2014 the engine knew names did not matter while PROVING and did not know it while DIFFING. measure_precision.py asked the spec author's question ('did the path string change?'), which is true for a rename. Third instance of a checker sharing the engine's assumption.",
     "status": "Fixed in engine and checker independently. Also fixed a false NEGATIVE found alongside it: a renamed operation was never diffed body-to-body, so a vendor renaming a parameter and tightening the operation in one release had the second change go entirely unreported."
+  },
+  "scan_standing": {
+    "_comment": "The scan is a different vantage point from the leads and needs its own record. An Impact is a claim about a REPO; a finding is a claim about a SPEC diff. They are measured separately.",
+    "measured": "2026-08-20",
+    "corpus": "22 public repositories that genuinely call these five vendors, full checkouts",
+    "impacts_found": 0,
+    "false_positives_found_and_fixed": 4,
+    "note": "All four initial impacts were refuted by hand against the source and the raw spec, and all four classes are now gated: a read proving a request-side change (phasehq/console), a keyword argument on the repo's OWN constructor counted as a request body (phasehq/console), and two of the same in autoevals/agentops. Zero impacts across 22 repos is a MEASUREMENT, not an absence \u2014 the Plaid fixture control still fires at the right line with exit 1.",
+    "known_blind_spots": [
+      "Dependence is provable in Python only. Callers in other languages are now COUNTED and reported as UNMEASURED rather than silently passing as clean \u2014 a TypeScript-only repo calling a deleted Plaid endpoint previously reported 'clean, exit 0'.",
+      "API version pinning is not modelled at all. A caller pinned to an older Stripe/Plaid version is not affected by a change to the latest, and nothing in the engine looks for a pin.",
+      "The relocation suppressor consults a field map flattened at MAX_DEPTH=2, so it cannot see a name nested deeper and abstains silently rather than marking the finding unchecked.",
+      "The spec cache is not fetched by default, so a scan can be run against a stale clone.",
+      "_Assignments is one flat module-level dict, so def-use tracing is scope-blind and flow-insensitive across function boundaries."
+    ],
+    "pr_enabled": false,
+    "pr_blocker": "No write path exists and none should be added before a fourth adversarial audit samples IMPACTS from scan.py against real repos. Opening a pull request into someone else's repository is a larger outward-facing act than sending an email, and gate.sh already refuses to let the email ship."
   }
 }
