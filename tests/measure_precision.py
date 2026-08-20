@@ -232,6 +232,34 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
             return effective_enum(node.get("items"), doc, depth + 1)
         return None
 
+    if kind == "response_status_removed":
+        status = str(finding["subject"])
+        op_old = find_operation(old, finding["op_key"])
+        op_new = find_operation(new, finding["op_key"])
+        if op_old is None or op_new is None:
+            return UNDECIDABLE, "operation missing on one side"
+        in_old = status in (op_old.get("responses") or {})
+        in_new = status in (op_new.get("responses") or {})
+        if in_old and not in_new:
+            return CONFIRMED, f"response `{status}` present at old, absent at new"
+        return REFUTED, f"response `{status}` old={in_old} new={in_new}"
+
+    if kind in ("request_field_type_changed", "response_field_type_changed"):
+        where = "request" if kind.startswith("request") else "response"
+        old_body = _body_schema(old, finding["op_key"], where)
+        new_body = _body_schema(new, finding["op_key"], where)
+        if old_body is None or new_body is None:
+            return UNDECIDABLE, f"no {where} body on one side"
+        parts = [p for p in root.replace("[]", ".[].").split(".") if p]
+        found_old, node_old = walk_properties(old_body, parts, old)
+        found_new, node_new = walk_properties(new_body, parts, new)
+        if not (found_old and found_new):
+            return UNDECIDABLE, f"field not resolvable (old={found_old}, new={found_new})"
+        before, after = effective_shape(node_old, old), effective_shape(node_new, new)
+        if before != after:
+            return CONFIRMED, f"shape {before} -> {after}"
+        return REFUTED, f"same effective shape {before}"
+
     if kind == "endpoint_deprecated":
         op_old = find_operation(old, finding["op_key"])
         op_new = find_operation(new, finding["op_key"])
