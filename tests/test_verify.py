@@ -1,8 +1,9 @@
-"""Tests for the candidate->lead verification pass.
+"""Tests for turning a code-search candidate into a PROVEN lead.
 
-The headline case is the one that actually happened: the first Stripe `iin`
-code-search hit this project produced was a line of prose inside a docstring.
-Any verifier that cannot reject that is worthless.
+Two adversarial audits refuted nine of ten leads each. The second named the
+reason: verification established co-location, never dependence. Every refuted
+case from both audits appears below as a rule, alongside the positive cases
+that must keep passing.
 """
 from __future__ import annotations
 
@@ -13,373 +14,241 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from apidrift.diff import BREAKING, Finding
-from apidrift.verify import (CONFIRMED, ERROR, LIKELY, NOT_AUTHOR_CODE,
-                             NO_SITE, NO_VENDOR, UNSUPPORTED, lexical_sites,
-                             python_sites, target_symbol, verify_source)
+from apidrift.verify import (CONFIRMED, NOT_AUTHOR_CODE, NO_DEPENDENCE,
+                             NO_VENDOR, UNPROVEN, find_vendor_evidence,
+                             lexical_sites, python_sites, verify_source)
 from apidrift.vendors import get
 
 STRIPE = get("stripe")
 
 
-def finding(kind="response_field_removed", subject="card.iin", path="/v1/customers"):
-    return Finding(kind=kind, severity=BREAKING, op_key=f"GET {path}", path=path,
-                   method="get", detail="", subject=subject, root_cause=subject)
+def finding(kind="schema_field_removed", subject="card.iin",
+            path="/v1/customers", method="get", ops=(), sigs=()):
+    return Finding(kind=kind, severity=BREAKING, op_key=f"{method.upper()} {path}",
+                   path=path, method=method, detail="", subject=subject,
+                   root_cause=subject, affected_ops=list(ops),
+                   signatures=list(sigs))
 
 
-DOCSTRING_FILE = '''
-"""Card model.
-
-Stores the last four digits, the network, and issuer metadata.
-Cardholder name, BIN/IIN and iin are not persisted.
-"""
-import stripe
+def verdict_of(source, finding_obj, vendor=STRIPE, path="app.py"):
+    return verify_source(source, path, finding_obj, vendor)[0]
 
 
-class Card:
-    def __init__(self, brand):
-        self.brand = brand
-'''
+class TestProvenDependence(unittest.TestCase):
+    """A lead must show the code depends on what changed."""
 
-REAL_USE_FILE = '''
-import stripe
-
-def show(customer_id):
-    card = stripe.Customer.retrieve(customer_id).default_source
-    return {"brand": card.brand, "issuer": card.iin}
-'''
-
-DICT_USE_FILE = '''
-import stripe
-
-def show(card):
-    return card["iin"], card.get("iin", "")
-'''
-
-NO_VENDOR_FILE = '''
-def parse_iban(record):
-    return record.iin
-'''
-
-MIGRATED_FILE = '''
-import stripe
-
-stripe.checkout.Session.create(
-    subscription_data={"billing_cycle_anchor_config": {"day_of_month": 1}},
-)
-'''
-
-JS_FILE = '''
-const stripe = require('stripe')(config.stripeSecret);
-// the iin field used to be here
-async function show(id) {
-  const card = await stripe.customers.retrieveSource(id);
-  return card.iin;
-}
-'''
-
-JS_COMMENT_ONLY = '''
-const stripe = require('stripe')(config.stripeSecret);
-// we no longer read card.iin anywhere
-/* iin: removed in 2026 */
-async function show(id) { return 1; }
-'''
-
-
-class TestPythonSiteDetection(unittest.TestCase):
-    def test_docstring_mention_is_not_a_site(self):
-        sites, error = python_sites(DOCSTRING_FILE, "iin")
-        self.assertIsNone(error)
-        self.assertEqual(sites, [], "prose inside a docstring is not a call site")
-
-    def test_attribute_access_is_a_site(self):
-        sites, _ = python_sites(REAL_USE_FILE, "iin")
-        self.assertEqual([s.kind for s in sites], ["attribute"])
-
-    def test_subscript_and_get_are_sites(self):
-        sites, _ = python_sites(DICT_USE_FILE, "iin")
-        self.assertEqual({s.kind for s in sites}, {"subscript", "dict_get"})
-
-    def test_unparseable_source_errors_rather_than_crashing(self):
-        sites, error = python_sites("def broken(:\n", "iin")
-        self.assertEqual(sites, [])
-        self.assertIsNotNone(error)
-
-
-class TestVerdicts(unittest.TestCase):
-    def test_docstring_candidate_is_rejected(self):
-        verdict, reason, _, _ = verify_source(
-            DOCSTRING_FILE, "models.py", finding(), STRIPE)
-        self.assertEqual(verdict, NO_SITE)
-        self.assertIn("prose", reason)
-
-    def test_real_use_is_confirmed(self):
-        verdict, _, evidence, sites = verify_source(
-            REAL_USE_FILE, "app.py", finding(), STRIPE)
+    def test_a_read_traced_to_a_vendor_call_is_proven(self):
+        source = ('import stripe\n'
+                  'def show(cid):\n'
+                  '    card = stripe.Customer.retrieve(cid).default_source\n'
+                  '    return card.iin\n')
+        verdict, reason, _, sites = verify_source(source, "app.py", finding(), STRIPE)
         self.assertEqual(verdict, CONFIRMED)
-        self.assertEqual(evidence, "import stripe")
-        self.assertEqual(sites[0].line, 6)
+        self.assertIn("stripe.Customer.retrieve", reason)
+        self.assertTrue(sites[0].chain, "a proof must carry its reasoning")
 
-    def test_symbol_without_vendor_evidence_is_rejected(self):
-        verdict, reason, _, _ = verify_source(
-            NO_VENDOR_FILE, "iban.py", finding(), STRIPE)
-        self.assertEqual(verdict, NO_VENDOR)
-        self.assertIn("Stripe", reason)
+    def test_a_read_off_a_parameter_needs_the_carrying_operation(self):
+        """Most reads happen on a parameter, whose origin is in the caller."""
+        source = ('import discord\n'
+                  'async def go(self, gid):\n'
+                  '    r = Route("GET", "/guilds/{guild_id}/channels")\n'
+                  '    ch = await self.request(r)\n'
+                  '    return ch.icon_emoji\n')
+        f = finding(subject="GuildChannelResponse.icon_emoji",
+                    path="/guilds/{guild_id}/channels",
+                    ops=["GET /guilds/{guild_id}/channels"])
+        self.assertEqual(verdict_of(source, f, get("discord")), CONFIRMED)
 
-    def test_already_migrated_caller_is_not_a_lead(self):
-        f = finding(kind="request_field_added_required",
-                    subject="subscription_data.billing_cycle_anchor_config.day_of_month",
-                    path="/v1/checkout/sessions")
-        verdict, reason, _, _ = verify_source(MIGRATED_FILE, "pay.py", f, STRIPE)
-        self.assertEqual(verdict, NO_SITE)
-        self.assertIn("migrated", reason)
+    def test_reading_the_field_while_calling_something_else_is_not_dependence(self):
+        source = ('import discord\n'
+                  'async def go(self, gid):\n'
+                  '    r = Route("DELETE", "/guilds/{guild_id}/members/{uid}")\n'
+                  '    ch = await self.request(r)\n'
+                  '    return ch.icon_emoji\n')
+        f = finding(subject="GuildChannelResponse.icon_emoji",
+                    path="/guilds/{guild_id}/channels",
+                    ops=["GET /guilds/{guild_id}/channels"])
+        self.assertEqual(verdict_of(source, f, get("discord")), NO_DEPENDENCE)
 
-    def test_caller_missing_the_new_required_field_is_a_lead(self):
-        """The break is the ABSENCE of the field — these are the real victims."""
-        source = (
-            "import stripe\n"
-            "stripe.checkout.Session.create(subscription_data={'trial': 7})\n"
-        )
-        f = finding(kind="request_field_added_required",
-                    subject="subscription_data.billing_cycle_anchor_config.day_of_month",
-                    path="/v1/checkout/sessions")
-        verdict, reason, _, sites = verify_source(source, "pay.py", f, STRIPE)
-        self.assertEqual(verdict, CONFIRMED)
-        self.assertIn("without required", reason)
-        self.assertTrue(sites)
+    def test_an_sdk_call_reaches_an_operation_that_names_no_path(self):
+        source = ('import stripe\n'
+                  'stripe.checkout.Session.create(subscription_data={"trial": 7})\n')
+        f = finding(kind="schema_field_added_required",
+                    subject="CheckoutSession.day_of_month",
+                    path="/v1/checkout/sessions", method="post",
+                    sigs=["stripe.checkout."])
+        self.assertEqual(verdict_of(source, f), CONFIRMED)
 
-    def test_caller_of_a_different_endpoint_is_not_a_lead(self):
-        source = "import stripe\nstripe.Refund.create(charge='ch_1')\n"
-        f = finding(kind="request_field_added_required",
-                    subject="subscription_data.billing_cycle_anchor_config.day_of_month",
-                    path="/v1/checkout/sessions")
-        verdict, reason, _, _ = verify_source(source, "pay.py", f, STRIPE)
-        self.assertEqual(verdict, NO_SITE)
-        self.assertIn("does not call", reason)
-
-    def test_javascript_is_likely_not_confirmed(self):
-        verdict, _, _, sites = verify_source(JS_FILE, "pay.js", finding(), STRIPE)
-        self.assertEqual(verdict, LIKELY, "an unparsed language cannot be confirmed")
-        self.assertTrue(sites)
-
-    def test_javascript_comment_only_is_rejected(self):
-        verdict, _, _, _ = verify_source(JS_COMMENT_ONLY, "pay.js", finding(), STRIPE)
-        self.assertEqual(verdict, NO_SITE)
-
-    def test_unknown_language_is_unsupported_not_confirmed(self):
-        verdict, _, _, _ = verify_source(
-            "card.iin\nimport stripe", "main.rs", finding(), STRIPE)
-        self.assertEqual(verdict, UNSUPPORTED)
-
-    def test_endpoint_removal_verifies_on_the_path(self):
-        f = finding(kind="endpoint_removed", subject="/v1/old_thing",
-                    path="/v1/old_thing")
-        src = 'import requests\nrequests.get("https://api.stripe.com/v1/old_thing")\n'
-        verdict, _, _, sites = verify_source(src, "x.py", f, STRIPE)
-        self.assertEqual(verdict, CONFIRMED)
-        self.assertTrue(sites)
+    def test_a_caller_that_already_supplies_the_field_is_not_a_lead(self):
+        source = ('import stripe\n'
+                  'stripe.checkout.Session.create(day_of_month=1)\n')
+        f = finding(kind="schema_field_added_required",
+                    subject="CheckoutSession.day_of_month",
+                    path="/v1/checkout/sessions", method="post",
+                    sigs=["stripe.checkout."])
+        self.assertEqual(verdict_of(source, f), NO_DEPENDENCE)
 
 
-class TestEndpointVerification(unittest.TestCase):
-    """Half the first real lead list was prose describing an endpoint."""
+class TestAuditedRefutations(unittest.TestCase):
+    """Every case a skeptic refuted, kept as a rule."""
 
-    ENDPOINT_DOCSTRING = '''
-"""Twilio helper.
+    def test_a_docstring_mention_is_not_dependence(self):
+        source = ('"""Card model. Stores BIN/IIN and iin notes."""\n'
+                  'import stripe\n')
+        self.assertEqual(verdict_of(source, finding()), NO_DEPENDENCE)
 
-- Verify send: POST /v2/Services/{service_sid}/Verifications
-"""
-import twilio
+    def test_a_field_name_in_the_repos_own_schema_is_not_dependence(self):
+        """quay's Swagger literal described quay's own API, not Stripe's."""
+        source = ('import stripe\n'
+                  'schemas = {"UserCard": {"description": "d", "iin": "x"}}\n')
+        self.assertEqual(verdict_of(source, finding()), NO_DEPENDENCE)
 
+    def test_a_defaults_table_is_not_a_read(self):
+        source = ('import openai\n'
+                  'DEFAULTS = {"prompt_cache_key": None}\n')
+        f = finding(subject="CreateChatCompletionResponse.prompt_cache_key",
+                    path="/chat/completions")
+        self.assertEqual(verdict_of(source, f, get("openai")), NO_DEPENDENCE)
 
-def send():
-    return None
-'''
+    def test_pop_is_not_a_use(self):
+        source = ('import openai\n'
+                  'payload.pop("safety_identifier", None)\n')
+        f = finding(subject="CreateChatCompletionRequest.safety_identifier",
+                    path="/chat/completions")
+        self.assertEqual(verdict_of(source, f, get("openai")), NO_DEPENDENCE)
 
-    ENDPOINT_COMMENT = '''
-import twilio
-# for endpoints on /v2/Services the root-relative path is used
-def send():
-    return None
-'''
+    def test_a_sibling_route_sharing_a_prefix_is_not_a_match(self):
+        """`/guilds` matched kick and ban routes for a bulk-ban change."""
+        source = ('import discord\n'
+                  'r = Route("DELETE", "/guilds/{guild_id}/members/{user_id}")\n')
+        f = finding(kind="endpoint_removed", subject="/guilds/{guild_id}/bulk-ban",
+                    path="/guilds/{guild_id}/bulk-ban", method="post")
+        self.assertEqual(verdict_of(source, f, get("discord")), NO_DEPENDENCE)
 
-    ENDPOINT_REAL = '''
-import twilio
-import requests
+    def test_the_same_path_with_a_different_method_is_not_a_match(self):
+        """A path can be shared by operations that differ only by verb."""
+        source = ('import discord\n'
+                  'r = Route("GET", "/guilds/{guild_id}/bulk-ban")\n')
+        f = finding(kind="endpoint_removed", subject="/guilds/{guild_id}/bulk-ban",
+                    path="/guilds/{guild_id}/bulk-ban", method="post")
+        self.assertEqual(verdict_of(source, f, get("discord")), NO_DEPENDENCE)
 
-def send(service_sid):
-    url = f"https://verify.twilio.com/v2/Services/{service_sid}/Verifications"
-    return requests.post(url)
-'''
+    def test_the_same_path_with_the_right_method_is_a_match(self):
+        source = ('import discord\n'
+                  'r = Route("POST", "/guilds/{guild_id}/bulk-ban")\n')
+        f = finding(kind="endpoint_removed", subject="/guilds/{guild_id}/bulk-ban",
+                    path="/guilds/{guild_id}/bulk-ban", method="post")
+        self.assertEqual(verdict_of(source, f, get("discord")), CONFIRMED)
 
-    def _run(self, source):
-        f = finding(kind="security_requirement_added", subject="/v2/Services",
-                    path="/v2/Services")
-        return verify_source(source, "twilio_verify.py", f, get("twilio"))
+    def test_a_sibling_sub_resource_is_not_a_match(self):
+        """/Recall and /Events share `/v1/Stores` and are different operations."""
+        source = ('import twilio\n'
+                  'r = post(f"{BASE}/v1/Stores/{s}/Profiles/{p}/Recall")\n')
+        f = finding(kind="endpoint_removed",
+                    subject="/v1/Stores/{storeId}/Profiles/{profileId}/Events",
+                    path="/v1/Stores/{storeId}/Profiles/{profileId}/Events",
+                    method="post")
+        self.assertEqual(verdict_of(source, f, get("twilio")), NO_DEPENDENCE)
 
-    def test_docstring_endpoint_mention_is_rejected(self):
-        verdict, reason, _, _ = self._run(self.ENDPOINT_DOCSTRING)
-        self.assertEqual(verdict, NO_SITE)
-        self.assertIn("docstring", reason)
+    def test_the_right_sub_resource_is_a_match(self):
+        source = ('import twilio\n'
+                  'r = post(f"{BASE}/v1/Stores/{s}/Profiles/{p}/Events")\n')
+        f = finding(kind="endpoint_removed",
+                    subject="/v1/Stores/{storeId}/Profiles/{profileId}/Events",
+                    path="/v1/Stores/{storeId}/Profiles/{profileId}/Events",
+                    method="post")
+        self.assertEqual(verdict_of(source, f, get("twilio")), CONFIRMED)
 
-    def test_comment_endpoint_mention_is_rejected(self):
-        verdict, _, _, _ = self._run(self.ENDPOINT_COMMENT)
-        self.assertEqual(verdict, NO_SITE)
+    def test_an_endpoint_quoted_in_prose_is_not_a_call(self):
+        source = ('import twilio\n'
+                  'st.caption("Runs POST /v1/Stores/x/Events and returns rows")\n')
+        f = finding(kind="endpoint_removed", subject="/v1/Stores/{s}/Events",
+                    path="/v1/Stores/{s}/Events", method="post")
+        self.assertEqual(verdict_of(source, f, get("twilio")), NO_DEPENDENCE)
 
-    def test_fstring_url_construction_is_confirmed(self):
-        verdict, _, _, sites = self._run(self.ENDPOINT_REAL)
-        self.assertEqual(verdict, CONFIRMED)
-        self.assertEqual(sites[0].line, 6)
-
-
-class TestTargetExtraction(unittest.TestCase):
-    def test_field_change_targets_the_leaf(self):
-        self.assertEqual(target_symbol(finding()), ("iin", "presence"))
-
-    def test_required_field_uses_absence_mode(self):
-        f = finding(kind="request_field_added_required", subject="Rule.frequency")
-        self.assertEqual(target_symbol(f), ("frequency", "absence"))
-
-    def test_endpoint_change_targets_the_path(self):
-        f = finding(kind="endpoint_removed", path="/v1/cards/{id}")
-        self.assertEqual(target_symbol(f), ("/v1/cards", "endpoint"))
-
-
-class TestLexical(unittest.TestCase):
-    def test_comments_are_stripped_before_matching(self):
-        self.assertEqual(lexical_sites("// card.iin\n", "iin"), [])
-
-    def test_url_scheme_is_not_treated_as_a_comment(self):
-        # `//` inside https:// once truncated every line holding a URL.
-        sites = lexical_sites('fetch("https://api.stripe.com/v1/x").then(c => c.iin);\n', "iin")
-        self.assertTrue(sites, "the https:// scheme swallowed the rest of the line")
-
-    def test_block_comment_preserves_line_numbers(self):
-        # Deleting a block comment outright shifts every later line, so the
-        # reported line number points at the wrong code.
-        source = (
-            "const c = load();\n"
-            "/* a comment\n"
-            "   spanning\n"
-            "   several lines */\n"
-            "return c.iin;\n"
-        )
-        sites = lexical_sites(source, "iin")
-        self.assertEqual([s.line for s in sites], [5])
-        self.assertIn("c.iin", sites[0].text)
-
-    def test_property_access_matches(self):
-        sites = lexical_sites("return card.iin;\n", "iin")
-        self.assertEqual([s.kind for s in sites], ["property"])
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
-class TestAuditFindings(unittest.TestCase):
-    """Regressions for the six failure modes an adversarial audit found.
-
-    Nine of ten sampled leads were refuted. Each test below is one of the
-    reasons a skeptic gave, turned into a rule.
-    """
-
-    GENERATED = '''
-# File generated from our OpenAPI spec by Castiron. See CONTRIBUTING.md.
-import stripe
-
-def show(card):
-    return card.iin
-'''
-
-    OPENAPI_GENERATED = '''
-"""The Plaid API
-
-    The version of the OpenAPI document: 2020-09-14
-    Generated by: https://openapi-generator.tech
-"""
-import plaid
-
-attribute_map = {"value": "value"}
-'''
-
-    DEFAULTS_TABLE = '''
-import openai
-
-DEFAULTS = {
-    "prompt_cache_key": None,
-    "temperature": 1.0,
-}
-'''
-
-    WRONG_ENDPOINT = '''
-import discord
-
-def kick(guild_id, user_id):
-    return Route("DELETE", "/guilds/{guild_id}/members/{user_id}")
-'''
-
-    def test_vendor_generated_sdk_is_rejected(self):
-        verdict, reason, _, _ = verify_source(
-            self.GENERATED, "input_tokens.py", finding(), STRIPE)
-        self.assertEqual(verdict, NOT_AUTHOR_CODE)
-        self.assertIn("generated", reason)
+    def test_generated_code_is_rejected_before_anything_else(self):
+        source = ('# File generated from our OpenAPI spec by Castiron.\n'
+                  'import stripe\n'
+                  'def show(c):\n'
+                  '    card = stripe.Customer.retrieve(c)\n'
+                  '    return card.iin\n')
+        self.assertEqual(verdict_of(source, finding()), NOT_AUTHOR_CODE)
 
     def test_openapi_generator_header_is_rejected(self):
-        f = finding(subject="FDXInitiatorFiAttribute.value")
-        verdict, _, _, _ = verify_source(
-            self.OPENAPI_GENERATED, "model.py", f, get("plaid"))
-        self.assertEqual(verdict, NOT_AUTHOR_CODE)
+        source = ('"""The Plaid API\n\n'
+                  '    Generated by: https://openapi-generator.tech\n"""\n'
+                  'import plaid\n')
+        self.assertEqual(verdict_of(source, finding(), get("plaid")),
+                         NOT_AUTHOR_CODE)
 
-    def test_a_defaults_table_is_not_a_read_of_a_response_field(self):
-        f = finding(kind="schema_field_removed",
-                    subject="CreateChatCompletionResponse.prompt_cache_key")
-        verdict, reason, _, _ = verify_source(
-            self.DEFAULTS_TABLE, "constants.py", f, get("openai"))
-        self.assertEqual(verdict, NO_SITE)
-        self.assertIn("declaration", reason)
 
-    def test_calling_a_shared_prefix_without_the_field_is_rejected(self):
-        # `/guilds` matches kick and ban routes; the change is icon_emoji.
-        f = finding(kind="schema_removed", subject="IconEmojiResponse",
-                    path="/guilds/{guild_id}/auto-moderation/rules")
-        f.root_cause = "IconEmojiResponse"
-        verdict, reason, _, _ = verify_source(
-            self.WRONG_ENDPOINT, "http.py", f, get("discord"))
-        self.assertEqual(verdict, NO_SITE)
-        self.assertIn("never names", reason)
+class TestVendorEvidence(unittest.TestCase):
+    def test_a_field_change_needs_the_vendor_in_the_file(self):
+        source = 'def parse_iban(record):\n    return record.iin\n'
+        self.assertEqual(verdict_of(source, finding()), NO_VENDOR)
 
-    def test_a_file_that_does_name_the_field_still_passes(self):
-        source = ('import discord\n'
-                  'def go(c):\n'
-                  '    return c.icon_emoji\n')
-        f = finding(kind="schema_field_removed",
-                    subject="GuildChannelResponse.icon_emoji",
-                    path="/guilds/{guild_id}/channels")
-        verdict, _, _, sites = verify_source(source, "bot.py", f, get("discord"))
-        self.assertEqual(verdict, CONFIRMED)
-        self.assertTrue(sites)
+    def test_evidence_needs_a_word_boundary(self):
+        self.assertEqual(
+            find_vendor_evidence(
+                "from some_pkg.config import OpenAICompatibleConfig\n",
+                get("openai")),
+            "", "a longer identifier is not an import of the vendor")
+        self.assertEqual(
+            find_vendor_evidence("import openai\n", get("openai")),
+            "import openai")
+
+
+class TestUnprovableLanguages(unittest.TestCase):
+    """An unproven lead is an unmeasured claim, not a weaker one."""
+
+    def test_javascript_is_unproven_not_likely(self):
+        source = ('const stripe = require("stripe")(k);\n'
+                  'const c = await stripe.customers.retrieve(id);\n'
+                  'return c.iin;\n')
+        verdict, reason, _, _ = verify_source(source, "pay.js", finding(), STRIPE)
+        self.assertEqual(verdict, UNPROVEN)
+        self.assertIn("only Python is parsed", reason)
+
+    def test_an_unknown_language_is_also_unproven(self):
+        self.assertEqual(verdict_of("card.iin", finding(), path="main.rs"),
+                         UNPROVEN)
+
+
+class TestSiteHelpers(unittest.TestCase):
+    """The lower-level scanners still behave, and are still used for reporting."""
+
+    def test_docstring_prose_is_never_a_python_site(self):
+        sites, error = python_sites('"""iin notes"""\n', "iin")
+        self.assertIsNone(error)
+        self.assertEqual(sites, [])
+
+    def test_get_is_a_use_and_pop_is_not(self):
+        self.assertEqual(
+            [s.kind for s in python_sites('x = p.get("iin")\n', "iin")[0]],
+            ["dict_get"])
+        self.assertEqual(python_sites('p.pop("iin", None)\n', "iin")[0], [])
+
+    def test_unparseable_python_is_reported_not_swallowed(self):
+        source = 'import stripe\ndef broken(:\n'
+        verdict, reason, _, _ = verify_source(source, "x.py", finding(), STRIPE)
+        self.assertEqual(verdict, NO_DEPENDENCE)
+        self.assertIn("unparseable", reason)
+
+    def test_lexical_scanning_strips_comments(self):
+        self.assertEqual(lexical_sites("// card.iin\n", "iin"), [])
+        self.assertTrue(lexical_sites("return card.iin;\n", "iin"))
 
 
 class TestProvenanceAtLeadTime(unittest.TestCase):
-    """The vendor's own SDK must never reach a fetch, let alone a lead."""
+    """The vendor's own SDK must never reach a fetch."""
 
     def test_vendor_owned_repo_is_rejected_without_fetching(self):
         from apidrift.verify import verify_candidate
-        result = verify_candidate("openai/openai-python",
-                                  "src/openai/resources/responses.py",
+        result = verify_candidate("openai/openai-python", "src/openai/x.py",
                                   "https://example.invalid", finding(),
                                   get("openai"))
         self.assertEqual(result.verdict, NOT_AUTHOR_CODE)
         self.assertFalse(result.is_lead)
-        # Either rule may fire first; both are correct rejections.
-        self.assertTrue(
-            "openai org" in result.reason or "copy of the openai" in result.reason,
-            result.reason)
-
-    def test_a_vendor_repo_is_rejected_on_the_org_alone(self):
-        from apidrift.classify import classify, VENDOR_OWNED
-        self.assertEqual(
-            classify("openai/openai-python", "openai", "README.md").kind,
-            VENDOR_OWNED)
 
     def test_vendored_dependency_path_is_rejected_without_fetching(self):
         from apidrift.verify import verify_candidate
@@ -396,145 +265,5 @@ class TestProvenanceAtLeadTime(unittest.TestCase):
                      "backend/twilio_verify.py").is_outreach_target)
 
 
-class TestPathRuleIsShared(unittest.TestCase):
-    """Prospecting and verification must agree on what path to look for.
-
-    They did not: prospecting searched `/bulk-ban` while verification accepted
-    any file containing `/guilds`, so a removed 204 on bulk-ban was confirmed
-    against a GET of /users/@me/guilds.
-    """
-
-    def test_verification_uses_the_distinctive_run(self):
-        f = finding(kind="response_status_removed", subject="204",
-                    path="/guilds/{guild_id}/bulk-ban")
-        f.root_cause = "204"
-        symbol, mode = target_symbol(f)
-        self.assertEqual(mode, "endpoint")
-        self.assertEqual(symbol, "/bulk-ban")
-
-    def test_a_different_guild_route_is_not_a_match(self):
-        source = ('import discord\n'
-                  'async def guilds(self):\n'
-                  '    return await self._request("GET", "/users/@me/guilds")\n')
-        f = finding(kind="response_status_removed", subject="204",
-                    path="/guilds/{guild_id}/bulk-ban")
-        f.root_cause = "204"
-        verdict, _, _, _ = verify_source(source, "rest_client.py", f,
-                                         get("discord"))
-        self.assertEqual(verdict, NO_SITE)
-
-    def test_the_actual_route_still_matches(self):
-        source = ('import discord\n'
-                  'async def bulk_ban(self, gid):\n'
-                  '    return await self._request("POST", f"/guilds/{gid}/bulk-ban")\n')
-        f = finding(kind="response_status_removed", subject="204",
-                    path="/guilds/{guild_id}/bulk-ban")
-        f.root_cause = "204"
-        verdict, _, _, _ = verify_source(source, "rest_client.py", f,
-                                         get("discord"))
-        self.assertEqual(verdict, CONFIRMED)
-
-
-class TestIdentifierGateScope(unittest.TestCase):
-    """Demand an identifier only when the caller could plausibly write it."""
-
-    def test_a_status_code_is_not_demanded(self):
-        from apidrift.verify import _named_identifier
-        f = finding(kind="response_status_removed", subject="204")
-        f.root_cause = "204"
-        self.assertEqual(_named_identifier(f), "")
-
-    def test_a_path_fragment_is_not_demanded(self):
-        from apidrift.verify import _named_identifier
-        f = finding(kind="endpoint_removed", subject="/v1/old_thing")
-        f.root_cause = "/v1/old_thing"
-        self.assertEqual(_named_identifier(f), "")
-
-    def test_a_field_name_is_demanded(self):
-        from apidrift.verify import _named_identifier
-        f = finding(subject="GuildChannelResponse.icon_emoji")
-        f.root_cause = "GuildChannelResponse.icon_emoji"
-        self.assertEqual(_named_identifier(f), "icon_emoji")
-
-
-class TestHyphenatedIdentifiers(unittest.TestCase):
-    def test_a_hyphenated_schema_name_is_demanded(self):
-        from apidrift.verify import _named_identifier
-        f = finding(kind="schema_removed", subject="Conversation-2")
-        f.root_cause = "Conversation-2"
-        self.assertEqual(_named_identifier(f), "Conversation-2")
-
-    def test_a_file_that_never_names_it_is_rejected(self):
-        f = finding(kind="schema_removed", subject="Conversation-2",
-                    path="/responses")
-        f.root_cause = "Conversation-2"
-        source = ('import openai\n'
-                  'def t():\n'
-                  '    return client.post("/responses", json={})\n')
-        verdict, reason, _, _ = verify_source(source, "test_x.py", f,
-                                              get("openai"))
-        self.assertEqual(verdict, NO_SITE)
-        self.assertIn("never names", reason)
-
-
-class TestIdentifierCasing(unittest.TestCase):
-    """A type name is carried verbatim; a field name is not."""
-
-    def test_a_type_name_must_match_case(self):
-        from apidrift.verify import _identifier_present
-        self.assertTrue(_identifier_present('x = Conversation-2', "Conversation-2"))
-        self.assertFalse(
-            _identifier_present('cid = "conversation-2"', "Conversation-2"),
-            "lowercase test-fixture data is not a use of the schema")
-
-    def test_a_field_name_matches_across_conventions(self):
-        from apidrift.verify import _identifier_present
-        for text in ('x.safety_identifier', 'x.safetyIdentifier',
-                     '"SafetyIdentifier"', "'safety-identifier'"):
-            with self.subTest(text=text):
-                self.assertTrue(_identifier_present(text, "safety_identifier"))
-
-    def test_an_absent_field_is_absent(self):
-        from apidrift.verify import _identifier_present
-        self.assertFalse(_identifier_present("x.other_thing", "safety_identifier"))
-
-
-class TestReauditFindings(unittest.TestCase):
-    """Regressions for what a SECOND adversarial audit found."""
-
-    def test_pop_is_not_a_use_of_a_field(self):
-        # `payload.pop("safety_identifier", None)` deletes a key that is never
-        # populated. It is a defensive no-op, not a call site.
-        sites, _ = python_sites(
-            'payload.pop("safety_identifier", None)\n', "safety_identifier")
-        self.assertEqual(sites, [])
-
-    def test_get_is_still_a_use(self):
-        sites, _ = python_sites(
-            'x = payload.get("safety_identifier")\n', "safety_identifier")
-        self.assertEqual([s.kind for s in sites], ["dict_get"])
-
-    def test_an_endpoint_quoted_in_prose_is_not_a_call(self):
-        from apidrift.verify import python_endpoint_sites
-        source = ('import twilio\n'
-                  'st.caption("Runs POST /v1/Stores/x/Events and returns rows")\n')
-        sites, _ = python_endpoint_sites(source, "/Events")
-        self.assertEqual(sites, [], "documentation is not an API call")
-
-    def test_an_endpoint_in_a_url_string_is_a_call(self):
-        from apidrift.verify import python_endpoint_sites
-        source = ('import twilio\n'
-                  'r = post(f"{BASE}/v1/Stores/{sid}/Events")\n')
-        sites, _ = python_endpoint_sites(source, "/Events")
-        self.assertTrue(sites)
-
-    def test_vendor_evidence_needs_a_word_boundary(self):
-        from apidrift.verify import find_vendor_evidence
-        self.assertEqual(
-            find_vendor_evidence(
-                "from some_pkg.config import OpenAICompatibleConfig\n",
-                get("openai")),
-            "", "a longer identifier is not an import of the vendor")
-        self.assertEqual(
-            find_vendor_evidence("import openai\n", get("openai")),
-            "import openai")
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

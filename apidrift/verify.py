@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .diff import ABSENCE_KINDS, ENDPOINT_KINDS, FIELD_KINDS, Finding
 from .classify import classify
+from .dependence import prove
 from .prospect import static_run
 from .signatures import build_signatures
 from .vendors import Vendor
@@ -42,6 +43,8 @@ _GENERATED_MARKERS = (
 )
 
 NOT_AUTHOR_CODE = "rejected_generated"
+NO_DEPENDENCE = "rejected_no_dependence"   # near the change, but not affected by it
+UNPROVEN = "unproven"                      # no analyser can establish dependence here
 
 CONFIRMED = "confirmed"          # parsed call site + vendor evidence
 LIKELY = "likely"                # lexical call site + vendor evidence
@@ -50,8 +53,9 @@ NO_SITE = "rejected_no_site"      # symbol only in comments / prose / strings
 UNSUPPORTED = "unsupported"
 ERROR = "error"
 
-VERDICT_RANK = {CONFIRMED: 0, LIKELY: 1, NO_VENDOR: 2, NO_SITE: 3,
-                NOT_AUTHOR_CODE: 4, UNSUPPORTED: 5, ERROR: 6}
+VERDICT_RANK = {CONFIRMED: 0, LIKELY: 1, NO_DEPENDENCE: 2, NO_VENDOR: 3,
+                NO_SITE: 4, NOT_AUTHOR_CODE: 5, UNPROVEN: 6, UNSUPPORTED: 7,
+                ERROR: 8}
 
 
 def looks_generated(source: str) -> str:
@@ -84,6 +88,7 @@ class Site:
     line: int
     kind: str
     text: str
+    chain: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -107,7 +112,8 @@ class Verdict:
             "verdict": self.verdict, "reason": self.reason,
             "vendor_evidence": self.vendor_evidence,
             "blob_sha": self.blob_sha,
-            "sites": [{"line": s.line, "kind": s.kind, "text": s.text} for s in self.sites],
+            "sites": [{"line": s.line, "kind": s.kind, "text": s.text,
+                       "chain": s.chain} for s in self.sites],
         }
 
 
@@ -451,102 +457,42 @@ def fetch_file(repo: str, path: str, ref: str = "") -> Tuple[str, str]:
 def verify_source(
     source: str, file_path: str, finding: Finding, vendor: Vendor,
 ) -> Tuple[str, str, str, List[Site]]:
-    """Return (verdict, reason, vendor_evidence, sites) for one file's contents."""
+    """Return (verdict, reason, vendor_evidence, sites) for one file's contents.
+
+    A file is a lead only if dependence can be PROVEN: a call that reaches the
+    changed operation by method and path, or a read or write of the changed
+    field on a value traced back to the vendor. Everything weaker than that is
+    co-location, and co-location produced a nine-in-ten refutation rate across
+    two independent audits.
+    """
     marker = looks_generated(source)
     if marker:
         return (NOT_AUTHOR_CODE,
                 f"header says `{marker}` — generated code is repaired by "
                 f"regenerating, not by its authors", "", [])
 
+    if not file_path.endswith(PY_EXT):
+        extension = file_path.rsplit(".", 1)[-1] if "." in file_path else "?"
+        return (UNPROVEN,
+                f"dependence cannot be established in `.{extension}` — only "
+                f"Python is parsed, and an unproven lead is an unmeasured claim",
+                "", [])
+
     evidence = find_vendor_evidence(source, vendor)
-    symbol, mode = target_symbol(finding)
-
-    if mode == "endpoint":
-        # The path literal is itself vendor evidence: only that vendor serves it.
-        if not symbol:
-            return NO_SITE, "no path literal to search for", evidence, []
-        # A change to one operation does not affect every caller of a shared
-        # URL prefix. If the finding also names a field, that identifier has to
-        # appear, or the file cannot be touching what changed. Seven of ten
-        # sampled leads failed exactly here: `/guilds` matched kick and ban
-        # routes for a change to a channel icon field.
-        named = _named_identifier(finding)
-        if named and not _identifier_present(source, named):
-            return (NO_SITE,
-                    f"calls {symbol} but never names `{named}`", evidence, [])
-        if file_path.endswith(PY_EXT):
-            sites, error = python_endpoint_sites(source, symbol)
-            if error:
-                return ERROR, error, evidence or symbol, []
-            if sites:
-                return (CONFIRMED, f"calls {symbol} at {len(sites)} site(s)",
-                        evidence or symbol, sites)
-            return (NO_SITE,
-                    f"`{symbol}` appears only in comments or docstrings",
-                    evidence, [])
-        stripped_lines = _strip_comments(source).splitlines()
-        raw = source.splitlines()
-        sites = [Site(line=i + 1, kind="endpoint_ref",
-                      text=raw[i].strip()[:160] if i < len(raw) else "")
-                 for i, line in enumerate(stripped_lines) if symbol in line]
-        if sites:
-            return (LIKELY, f"references {symbol}, unparsed language",
-                    evidence or symbol, sites)
-        return NO_SITE, f"`{symbol}` appears only in comments", evidence, []
-
-    if not evidence:
+    # For an operation-level change the path itself identifies the vendor:
+    # nobody else serves it.
+    if not evidence and finding.kind not in ENDPOINT_KINDS:
         return (NO_VENDOR,
                 f"no {vendor.name} import, host or key in the file", "", [])
 
-    if mode == "absence":
-        # A newly-required field breaks the callers that DO NOT send it. So the
-        # caller must first be shown to call the endpoint, and the field must
-        # then be shown to be missing. Finding the field means they already
-        # migrated; not finding the endpoint means they were never affected.
-        if not file_path.endswith(PY_EXT + LEXICAL_EXT):
-            return UNSUPPORTED, f"no analyser for {file_path.rsplit('.', 1)[-1]}", evidence, []
-        call_sites, parsed = endpoint_call_sites(source, file_path, finding, vendor)
-        if parsed:
-            supplies, _ = python_sites(source, symbol)
-        else:
-            supplies = lexical_sites(source, symbol)
+    proofs, why_not = prove(source, finding, vendor)
+    if not proofs:
+        return NO_DEPENDENCE, why_not, evidence, []
 
-        if not call_sites:
-            return (NO_SITE, f"does not call {finding.path}", evidence, [])
-        if supplies:
-            return (NO_SITE, f"already supplies `{symbol}` — migrated",
-                    evidence, supplies)
-        return ((CONFIRMED if parsed else LIKELY),
-                f"calls {finding.path} without required `{symbol}`",
-                evidence, call_sites)
-
-    if file_path.endswith(PY_EXT):
-        sites, error = python_sites(source, symbol)
-        if error:
-            return ERROR, error, evidence, []
-        directed = _sites_matching_direction(sites, finding)
-        if not directed:
-            if sites:
-                kinds = ", ".join(sorted({s.kind for s in sites}))
-                return (NO_SITE,
-                        f"`{symbol}` appears only as {kinds}, which is a "
-                        f"declaration rather than a use of the changed field",
-                        evidence, [])
-            if symbol in source:
-                return (NO_SITE,
-                        f"`{symbol}` appears only in comments or prose",
-                        evidence, [])
-            return NO_SITE, f"`{symbol}` not present at all", evidence, []
-        return (CONFIRMED, f"{len(directed)} parsed call site(s)",
-                evidence, directed)
-
-    if file_path.endswith(LEXICAL_EXT):
-        sites = lexical_sites(source, symbol)
-        if not sites:
-            return NO_SITE, f"`{symbol}` not used in code", evidence, []
-        return LIKELY, f"{len(sites)} lexical match(es), unparsed language", evidence, sites
-
-    return UNSUPPORTED, f"no analyser for {file_path.rsplit('.', 1)[-1]}", evidence, []
+    sites = [Site(line=p.line, kind=p.kind, text=p.text, chain=p.chain)
+             for p in proofs[:5]]
+    reason = " — ".join(proofs[0].chain) if proofs[0].chain else proofs[0].kind
+    return CONFIRMED, reason, evidence or "path is served only by this vendor", sites
 
 
 def verify_candidate(
