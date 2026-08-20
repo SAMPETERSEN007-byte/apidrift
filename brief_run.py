@@ -90,8 +90,14 @@ def build(vendor_key: str, entry: dict, leads: List[dict], window: dict) -> str:
     top = sorted(breaking, key=lambda f: -f["occurrences"])[:6]
     out.append("### Highest fan-out changes\n")
     for f in top:
-        ops = f.get("affected_op_count") or 0
-        fan = (f" — reaches **{ops} operations**" if ops > 1 else "")
+        near = f.get("direct_op_count") or 0
+        reach = f.get("affected_op_count") or 0
+        if near > 1:
+            fan = f" — used directly by **{near} operations**"
+        elif reach > 1:
+            fan = f" — reaches **{reach} operations**"
+        else:
+            fan = ""
         out.append(f"- `{f['root_cause'] or f['subject']}`{fan}  \n  "
                    f"{f['detail'][:180]}")
     out.append("")
@@ -146,8 +152,12 @@ def build(vendor_key: str, entry: dict, leads: List[dict], window: dict) -> str:
 def main() -> int:
     findings = {e["vendor"]: e for e in json.load(open(ROOT / "out" / "findings.json"))}
     leads: Dict[str, List[dict]] = {}
-    for path in sorted((ROOT / "out").glob("leads*.json")):
-        language = path.stem.replace("leads_", "") if "_" in path.stem else "python"
+    lead_files = sorted((ROOT / "out").glob("leads_*.json"))
+    if not lead_files:
+        print("no lead files found — run leads_run.py first; briefs will list "
+              "findings only", file=sys.stderr)
+    for path in lead_files:
+        language = path.stem.replace("leads_", "")
         for vendor_key, rows in json.load(open(path)).items():
             for row in rows:
                 row["language"] = language

@@ -348,6 +348,49 @@ class TestDepthTruncation(unittest.TestCase):
                              "a truncation marker leaked into a finding")
 
 
+class TestRefEquivalence(unittest.TestCase):
+    """Two ways of writing the same type are not a change."""
+
+    def test_allof_wrapper_around_a_ref_is_not_a_type_change(self):
+        # `$ref` siblings are ignored in OpenAPI 3.0, so vendors wrap the ref
+        # in a single-arm allOf to attach `deprecated`. Plaid did this to
+        # Transfer.guarantee_decision. The referenced type is identical.
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        old["components"]["schemas"]["Charge"] = {
+            "type": "object",
+            "properties": {"src": {"$ref": "#/components/schemas/Card"}}}
+        new["components"]["schemas"]["Charge"] = {
+            "type": "object",
+            "properties": {"src": {"deprecated": True,
+                                   "allOf": [{"$ref": "#/components/schemas/Card"}]}}}
+        kinds_found = {f.kind for f in run(old, new).findings}
+        self.assertNotIn("schema_field_type_changed", kinds_found)
+
+    def test_retargeting_a_ref_to_an_identical_shape_is_not_breaking(self):
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        shape = {"type": "object",
+                 "properties": {"id": {"type": "string"},
+                                "amount": {"type": "integer"}}}
+        old["components"]["schemas"]["OptionsGet"] = copy.deepcopy(shape)
+        new["components"]["schemas"]["OptionsCreate"] = copy.deepcopy(shape)
+        old["components"]["schemas"]["Card"]["properties"]["opts"] = {
+            "$ref": "#/components/schemas/OptionsGet"}
+        new["components"]["schemas"]["Card"]["properties"]["opts"] = {
+            "$ref": "#/components/schemas/OptionsCreate"}
+        kinds_found = {f.kind for f in run(old, new).findings}
+        self.assertNotIn("schema_field_type_changed", kinds_found,
+                         "a rename with an unchanged shape is not a break")
+
+    def test_retargeting_a_ref_to_a_different_shape_is_breaking(self):
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        old["components"]["schemas"]["Card"]["properties"]["opts"] = {
+            "$ref": "#/components/schemas/Card"}
+        new["components"]["schemas"]["Card"]["properties"]["opts"] = {
+            "$ref": "#/components/schemas/Bank"}
+        self.assertIn("schema_field_type_changed",
+                      {f.kind for f in run(old, new).breaking})
+
+
 class TestProvenanceSeverity(unittest.TestCase):
     """Tightening what a caller SENDS breaks them; what they RECEIVE does not."""
 

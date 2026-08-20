@@ -271,6 +271,20 @@ MUTATIONS = [
         ["test_direct_reach_is_smaller_than_transitive_reach"],
     ),
     (
+        "single-arm allOf wrapper read as a different type",
+        "apidrift/loader.py",
+        "    arms = node.get(\"allOf\")\n    if isinstance(arms, list) and len(arms) == 1 and \"properties\" not in node:",
+        "    arms = node.get(\"allOf\")\n    if False:",
+        ["test_allof_wrapper_around_a_ref_is_not_a_type_change"],
+    ),
+    (
+        "schema rename reported as a type change",
+        "apidrift/diff.py",
+        "            if was.type != now.type and not _same_shape(was.type, now.type,",
+        "            if was.type != now.type or _same_shape(was.type, now.type,",
+        ["test_retargeting_a_ref_to_an_identical_shape_is_not_breaking"],
+    ),
+    (
         "signature builder drops the field name",
         "apidrift/signatures.py",
         "        if leaf and not leaf.startswith(\"<\"):",

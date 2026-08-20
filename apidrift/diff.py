@@ -644,6 +644,29 @@ def _schema_op(name: str) -> Operation:
                      operation_id=name, summary="", deprecated=False)
 
 
+def _shape_of(spec: Spec, name: str, depth: int = 0) -> Optional[Tuple]:
+    """A comparable fingerprint of a schema: its field names and their types."""
+    view = spec.schemas.get(name)
+    if view is None or depth > 1:
+        return None
+    return tuple(sorted((field, meta.type) for field, meta in view.fields.items()))
+
+
+def _same_shape(old_type: str, new_type: str, old: Spec, new: Spec) -> bool:
+    """True when a `$ref` was retargeted to a schema of identical shape.
+
+    Renaming a schema and repointing every reference at the new name is not a
+    breaking change for a consumer, who never sees the name. Plaid renamed
+    `CraCheckReportCashflowInsightsGetOptions` to
+    `CraCheckReportCreateCashflowInsightsOptions` without altering a field.
+    """
+    if not (old_type.startswith("->") and new_type.startswith("->")):
+        return False
+    before = _shape_of(old, old_type[2:])
+    after = _shape_of(new, new_type[2:])
+    return before is not None and before == after and len(before) > 0
+
+
 def _diff_schema_views(old: Spec, new: Spec) -> List[Finding]:
     out: List[Finding] = []
 
@@ -704,7 +727,8 @@ def _diff_schema_views(old: Spec, new: Spec) -> List[Finding]:
                      f"`{subject}` was removed from the schema",
                      subject, was.signature(), "<removed>")
                 continue
-            if was.type != now.type:
+            if was.type != now.type and not _same_shape(was.type, now.type,
+                                                          old, new):
                 emit("schema_field_type_changed", BREAKING,
                      f"`{subject}` changed type", subject, was.type, now.type)
             if not was.required and now.required and in_request:

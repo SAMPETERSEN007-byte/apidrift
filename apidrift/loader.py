@@ -521,10 +521,22 @@ class SchemaView:
 
 
 def _ref_name(node: Any) -> Optional[str]:
-    if isinstance(node, dict):
-        ref = node.get("$ref")
-        if isinstance(ref, str) and "/" in ref:
-            return ref.rsplit("/", 1)[-1]
+    """The schema a property points at, seeing through a single-arm `allOf`.
+
+    Vendors wrap `$ref: X` as `allOf: [$ref: X]` when they need to attach a
+    sibling keyword such as `deprecated`, because `$ref` siblings are ignored in
+    OpenAPI 3.0. The referenced type is unchanged, so reading the wrapper as a
+    different type reports a break where none exists. Plaid did this to
+    `Transfer.guarantee_decision`.
+    """
+    if not isinstance(node, dict):
+        return None
+    ref = node.get("$ref")
+    if isinstance(ref, str) and "/" in ref:
+        return ref.rsplit("/", 1)[-1]
+    arms = node.get("allOf")
+    if isinstance(arms, list) and len(arms) == 1 and "properties" not in node:
+        return _ref_name(arms[0])
     return None
 
 
