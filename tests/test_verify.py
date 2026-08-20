@@ -335,6 +335,22 @@ class TestWholeSchemaVersusField(unittest.TestCase):
         self.assertEqual(verdict_of(self.PLAID_CALLER, f, get("plaid")),
                          NO_DEPENDENCE)
 
+    def test_a_body_argument_stands_in_for_an_unstated_verb(self):
+        """`self.api(path=..., data=d)` names no verb but is plainly a write."""
+        from apidrift.dependence import _method_of
+        import ast
+        node = next(n for n in ast.walk(ast.parse('self.api(path="/x", data=d)'))
+                    if isinstance(n, ast.Call))
+        self.assertIn("post", _method_of(node))
+
+    def test_a_bare_path_list_does_not_stand_in_for_a_verb(self):
+        from apidrift.dependence import _method_of
+        import ast
+        node = next(n for n in ast.walk(
+            ast.parse('pytest.mark.parametrize("p", ["/x"])'))
+            if isinstance(n, ast.Call))
+        self.assertEqual(_method_of(node), set())
+
     def test_a_deleted_schema_still_needs_the_right_operation(self):
         source = ('import plaid\n'
                   'def check(self, d):\n'
@@ -343,3 +359,43 @@ class TestWholeSchemaVersusField(unittest.TestCase):
                     path="/link/token/get", method="post",
                     ops=["POST /link/token/get"])
         self.assertEqual(verdict_of(source, f, get("plaid")), NO_DEPENDENCE)
+
+
+class TestPathsAreNotSelfIdentifying(unittest.TestCase):
+    """`/v2/conversations` is Twilio's, and also plenty of other people's."""
+
+    PARAMETRIZE = ('import pytest\n'
+                   '@pytest.mark.parametrize("p", ["/api/v2/conversations/{}"])\n'
+                   'def test_routes(p):\n    assert p\n')
+
+    def test_a_repos_own_route_is_not_a_vendor_call(self):
+        f = finding(kind="endpoint_moved",
+                    subject="/v2/Conversations/{sid}",
+                    path="/v2/Conversations/{sid}", method="delete")
+        self.assertEqual(verdict_of(self.PARAMETRIZE, f, get("twilio")),
+                         NO_VENDOR)
+
+    def test_the_same_path_with_the_vendor_present_is_still_checked(self):
+        source = 'import twilio\n' + self.PARAMETRIZE
+        f = finding(kind="endpoint_moved",
+                    subject="/v2/Conversations/{sid}",
+                    path="/v2/Conversations/{sid}", method="delete")
+        # Vendor evidence passes, but the method is wrong, so still no proof.
+        self.assertEqual(verdict_of(source, f, get("twilio")), NO_DEPENDENCE)
+
+
+class TestProofNamesTheMatchedOperation(unittest.TestCase):
+    def test_the_chain_states_which_operation_was_called(self):
+        source = ('import twilio\n'
+                  'r = requests.post(f"{BASE}/v2/Services/{sid}/Verifications")\n')
+        f = finding(kind="security_requirement_added", subject="security",
+                    path="/v2/Services/{Sid}", method="delete",
+                    ops=["DELETE /v2/Services/{Sid}",
+                         "POST /v2/Services/{ServiceSid}/Verifications"])
+        verdict, reason, _, sites = verify_source(source, "v.py", f, get("twilio"))
+        self.assertEqual(verdict, CONFIRMED)
+        chain = " ".join(sites[0].chain)
+        self.assertIn("which is `POST", chain,
+                      "the proof must state the operation actually called")
+        self.assertNotIn("DELETE /v2/Services/{Sid}", chain,
+                         "and not the representative operation")

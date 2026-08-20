@@ -479,9 +479,10 @@ def verify_source(
                 "", [])
 
     evidence = find_vendor_evidence(source, vendor)
-    # For an operation-level change the path itself identifies the vendor:
-    # nobody else serves it.
-    if not evidence and finding.kind not in ENDPOINT_KINDS:
+    # Required for every kind. Treating a path as self-identifying was wrong:
+    # `/v2/conversations` is Twilio's and also gptme's own, and a pytest
+    # parametrize list of gptme's routes read as calls to Twilio.
+    if not evidence:
         return (NO_VENDOR,
                 f"no {vendor.name} import, host or key in the file", "", [])
 

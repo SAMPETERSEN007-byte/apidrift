@@ -48,6 +48,10 @@ _REQUEST_CALLEES = frozenset({
     "get", "post", "put", "patch", "delete", "route", "Route", "api_call",
 })
 
+# Keyword arguments that carry a request body.
+_BODY_ARGS = frozenset({"data", "json", "body", "payload", "params_json",
+                        "content", "files"})
+
 _MAX_TRACE = 6
 
 
@@ -263,6 +267,15 @@ def _method_of(node: ast.Call) -> Set[str]:
     callee = _attr_chain(node.func).rsplit(".", 1)[-1].lower()
     if callee in HTTP_VERBS:
         found.add(callee)
+    else:
+        # Callers wrap the verb into the helper's name: `plaid_post`, `_post`,
+        # `post_json`. Reading only an exact match missed most hand-written
+        # clients, which then looked like calls of unknown method.
+        for verb in HTTP_VERBS:
+            if callee in (f"_{verb}", f"{verb}_json", f"{verb}_request") \
+                    or callee.endswith(f"_{verb}") or callee.startswith(f"{verb}_"):
+                found.add(verb)
+                break
     for child in list(node.args) + [kw.value for kw in node.keywords]:
         text = literal_of(child)
         if text and text.strip().lower() in HTTP_VERBS:
@@ -272,6 +285,11 @@ def _method_of(node: ast.Call) -> Set[str]:
             text = literal_of(keyword.value)
             if text:
                 found.add(text.strip().lower())
+    if not found and any(kw.arg in _BODY_ARGS for kw in node.keywords):
+        # A body implies a write. `self.api(path="/link/token/get", data=d)`
+        # names no verb but is plainly not a GET, and rejecting it lost real
+        # callers of POST-only APIs.
+        found.update({"post", "put", "patch"})
     return found
 
 
@@ -347,6 +365,11 @@ def find_operation_calls(tree: ast.AST, method: str, path: str,
             continue
         methods = _method_of(node)
         if methods and wanted not in methods:
+            continue
+        if not methods and wanted != "get":
+            # A change scoped to DELETE, POST, PUT or PATCH cannot be pinned on
+            # a call that never says which verb it uses. A pytest parametrize
+            # list of path strings was confirming a DELETE-only change.
             continue
         line = getattr(node, "lineno", 0)
         text = lines[line - 1].strip()[:160] if 0 < line <= len(lines) else ""
@@ -542,8 +565,15 @@ def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], s
             op_method, _, op_path = op_key.partition(" ")
             if not op_path or op_path.startswith("#"):
                 continue
-            found.extend(find_operation_calls(tree, op_method.lower(), op_path, lines))
-            if found:
+            hits = find_operation_calls(tree, op_method.lower(), op_path, lines)
+            if hits:
+                # A change can touch many operations; say which one this file
+                # actually calls. Reporting the representative made a Twilio
+                # security change read as `DELETE /v2/Services/{Sid}` against
+                # code that only ever POSTs Verifications.
+                for hit in hits:
+                    hit.chain.append(f"which is `{op_method.upper()} {op_path}`")
+                found.extend(hits)
                 break
         if not found:
             found = find_sdk_calls(tree, idioms, lines)
