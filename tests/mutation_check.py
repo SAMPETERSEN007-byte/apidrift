@@ -18,6 +18,20 @@ PY_BIN = str(ROOT / ".venv" / "bin" / "python")
 
 MUTATIONS = [
     (
+        "a brand-new spec file skipped as purely additive again",
+        "apidrift/cli.py",
+        "            result.additions.append(spec_added_finding(pair.path, added))",
+        "            pass",
+        ["test_a_new_api_version_reaches_the_pipeline"],
+    ),
+    (
+        "a version segment read as the resource, so relevance never matches",
+        "apidrift/diff.py",
+        '        if low in {"api", "2010-04-01"} or re.fullmatch(r"v\\d+", low):',
+        '        if low in {"api", "2010-04-01"} or low in {"v1", "v2", "v3"}:',
+        ["test_a_version_segment_is_not_mistaken_for_the_resource"],
+    ),
+    (
         "the shape projection carries prose, so a copy-edit becomes a finding",
         "apidrift/diff.py",
         '    return ("scalar", field.type)',

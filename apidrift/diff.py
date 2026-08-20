@@ -605,10 +605,11 @@ OPPORTUNITY = "opportunity"
 
 ADDITIVE_KINDS = frozenset({
     "endpoint_added", "schema_field_added", "param_added_optional",
-    "response_field_added",
+    "response_field_added", "spec_added",
 })
 
 ADDITIVE_LABEL = {
+    "spec_added": "new API version",
     "endpoint_added": "new endpoint",
     "schema_field_added": "new optional field",
     "param_added_optional": "new optional parameter",
@@ -626,10 +627,43 @@ def _resource_of(path: str) -> str:
     for segment in path.split("/"):
         if not segment or "{" in segment:
             continue
-        if segment.lower() in {"v1", "v2", "v3", "api", "2010-04-01"}:
+        low = segment.lower()
+        if low in {"api", "2010-04-01"} or re.fullmatch(r"v\d+", low):
             continue
         return segment
     return ""
+
+
+def spec_added_finding(path: str, spec: "Spec") -> Finding:
+    """A spec FILE that did not exist before.
+
+    Silently skipping these as "purely additive" is a false negative on the
+    single most consequential event a sharded vendor produces. Adyen ships 129
+    per-service, per-version files and a new API version arrives as a NEW FILE
+    -- `CheckoutService-v52.json` -- so a differ watching v51 path-by-path
+    reports "no change" forever and misses the launch entirely.
+
+    It is an opportunity, not a break: nothing was taken away.
+    """
+    op_keys = sorted(spec.operations)
+    first = spec.operations[op_keys[0]] if op_keys else None
+    carrier = first or Operation(path="/", method="get", operation_id=None,
+                                 summary="", deprecated=False)
+    finding = _mk(
+        carrier, "spec_added", OPPORTUNITY,
+        f"`{path}` is new since the last release, with "
+        f"{len(op_keys)} operation{'' if len(op_keys) == 1 else 's'}",
+        subject=path, old="<absent>", new=path,
+    )
+    finding.root_cause = path
+    finding.blurb = (f"A spec file that did not exist before. For a vendor that "
+                     f"ships one file per service version, this is how a new "
+                     f"API version arrives.")
+    finding.resource = _resource_of(carrier.path)
+    finding.affected_ops = op_keys[:200]
+    finding.affected_op_count = len(op_keys)
+    finding.spec_file = path
+    return finding
 
 
 def _diff_additions(old: Spec, new: Spec) -> List[Finding]:

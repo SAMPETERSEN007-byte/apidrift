@@ -83,10 +83,11 @@ def _is_incidental(rel_path: str) -> bool:
 # endpoint, is something you have to choose to use. Ranking by that is what
 # separates nine useful suggestions from sixty.
 _ADDITION_RANK = {
-    "endpoint_added": 0,
-    "schema_field_added": 1,        # request-side: you could start sending it
-    "param_added_optional": 2,
-    "response_field_added": 3,      # arrives whether you act or not
+    "spec_added": 0,                # a whole new API version outranks everything
+    "endpoint_added": 1,
+    "schema_field_added": 2,        # request-side: you could start sending it
+    "param_added_optional": 3,
+    "response_field_added": 4,      # arrives whether you act or not
 }
 
 DEFAULT_OPPORTUNITY_LIMIT = 12

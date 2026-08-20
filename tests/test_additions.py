@@ -165,6 +165,9 @@ class TestRelevanceIsNotDependence(unittest.TestCase):
 class TestRanking(unittest.TestCase):
 
     def test_something_you_must_act_on_outranks_something_that_arrives(self):
+        self.assertLess(_ADDITION_RANK["spec_added"],
+                        _ADDITION_RANK["endpoint_added"],
+                        "a whole new API version is the biggest event there is")
         self.assertLess(_ADDITION_RANK["endpoint_added"],
                         _ADDITION_RANK["schema_field_added"])
         self.assertLess(_ADDITION_RANK["schema_field_added"],
@@ -184,3 +187,88 @@ class TestRanking(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestANewSpecFileIsANewApiVersion(unittest.TestCase):
+    """A sharded vendor ships a new API version as a NEW FILE.
+
+    Adyen publishes 129 per-service, per-version files; `CheckoutService-v52`
+    arrives beside `-v51` rather than editing it. Skipping a file with no
+    predecessor as "purely additive" therefore reported "no change" straight
+    through the launch — the single most consequential event the tool exists
+    to catch.
+    """
+
+    def _spec(self, version: int, ops: int) -> dict:
+        paths = {}
+        for n in range(ops):
+            paths[f"/v{version}/payments/action{n}"] = {"post": {
+                "operationId": f"pay{n}",
+                "responses": {"200": {"description": "ok"}}}}
+        return {"openapi": "3.0.3", "info": {"title": "Checkout", "version": "1"},
+                "servers": [{"url": "https://checkout-test.adyen.com"}],
+                "paths": paths}
+
+    def _added(self, version: int, ops: int):
+        from apidrift.diff import spec_added_finding
+        return spec_added_finding(f"json/CheckoutService-v{version}.json",
+                                  spec(self._spec(version, ops)))
+
+    def test_a_new_spec_file_is_reported_not_skipped(self):
+        finding = self._added(52, 3)
+        self.assertEqual(finding.kind, "spec_added")
+        self.assertEqual(finding.severity, OPPORTUNITY)
+        self.assertIn("3 operations", finding.detail)
+
+    def test_a_version_segment_is_not_mistaken_for_the_resource(self):
+        """`v51` is a version, not a resource — and it is not just v1/v2/v3."""
+        self.assertEqual(self._added(52, 1).resource, "payments")
+        self.assertEqual(caller_visible_path("POST /v71/payments"),
+                         "POST /v71/payments")
+
+    def test_a_caller_of_the_old_version_is_found_by_the_resource(self):
+        source = ('import requests\n'
+                  'def pay(b):\n'
+                  '    return requests.post(\n'
+                  '        "https://checkout-test.adyen.com/v51/payments/action0",\n'
+                  '        json=b)\n')
+        from apidrift.vendors import Vendor
+        adyen = Vendor(key="adyen", name="Adyen", repo="Adyen/adyen-openapi",
+                       spec_path="json/*.json", docs_url="",
+                       evidence=("checkout-test.adyen.com", "adyen"))
+        proofs, why = prove_relevance(source, self._added(51, 1), adyen)
+        self.assertTrue(proofs, why)
+
+
+class TestNewSpecFileReachesThePipeline(unittest.TestCase):
+    """The unit above proves the finding is built correctly. This proves
+    `analyse()` actually puts it on the result, which is a different claim and
+    was the part that was broken."""
+
+    def test_a_new_api_version_reaches_the_pipeline(self):
+        import datetime as dt
+        from pathlib import Path
+        from unittest import mock
+        from apidrift import cli
+        from apidrift.source import SpecPair, SpecVersion
+        from apidrift.vendors import get
+
+        raw = json.dumps({
+            "openapi": "3.0.3", "info": {"title": "New", "version": "1"},
+            "servers": [{"url": "https://api.stripe.com"}],
+            "paths": {"/v2/widgets": {"get": {
+                "operationId": "listWidgets",
+                "responses": {"200": {"description": "ok"}}}}},
+        }).encode()
+        pair = SpecPair(path="openapi/spec4.json", old=None,
+                        new=SpecVersion(ref="abc", date="2026-08-20",
+                                        path="openapi/spec4.json", raw=raw))
+        meta = {"old_ref": "a", "new_ref": "b", "old_date": "2026-05-01",
+                "new_date": "2026-08-20", "specs_matched": "1",
+                "specs_changed": "1"}
+        with mock.patch.object(cli, "spec_pairs", return_value=([pair], meta)):
+            result = cli.analyse(get("stripe"), Path("/nonexistent"),
+                                 "2026-05-01", False)
+        kinds = [a.kind for a in result.additions]
+        self.assertIn("spec_added", kinds,
+                      "a spec file with no predecessor must not be skipped")

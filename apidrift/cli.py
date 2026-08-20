@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from . import signatures as sig
-from .diff import BREAKING, DiffResult, Finding, collapse, diff_specs
+from .diff import (BREAKING, DiffResult, Finding, collapse, diff_specs,
+                   spec_added_finding)
 from .loader import Operation, SpecParseError, load_spec
 from .report import to_json, to_markdown
 from .source import GitError, SpecPair, spec_pairs
@@ -41,7 +42,16 @@ def analyse(vendor: Vendor, cache_dir: Path, since: str, fetch: bool) -> DiffRes
 
     for pair in pairs:
         if pair.old is None:
-            continue  # brand-new spec file: purely additive
+            # NOT a no-op. A sharded vendor ships a new API version as a new
+            # FILE, so skipping this reports "no change" through the launch.
+            try:
+                added = load_spec(pair.new.raw, pair.new.path)
+            except SpecParseError as exc:
+                parse_errors.append(str(exc))
+                continue
+            result.new_op_count += added.op_count
+            result.additions.append(spec_added_finding(pair.path, added))
+            continue
         if pair.new is None:
             result.findings.append(_spec_removed_finding(pair))
             continue
