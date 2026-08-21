@@ -7,9 +7,10 @@ proves — per file, per line — which of them land on real code.
 Two vantage points, and the difference is the whole product:
 
 - `apidrift` (the report) — what changed across the tracked vendors. A claim
-  about a **spec diff**. 49/49 on the five default vendors; **94.3% across all
-  21**, measured for the first time 2026-08-20. The two numbers are not in
-  conflict — the first was never a statement about the engine.
+  about a **spec diff**. 49/49 on the five default vendors; **96.7% across all
+  21** (1487/1537, 337 undecidable), measured for the first time 2026-08-20.
+  The two numbers are not in conflict — the first was never a statement about
+  the engine.
 - `apidrift scan PATH` (the CI gate) — which of those changes break code in a
   repository you have a checkout of. A claim about a **repo**. Zero impacts
   across 22 real repos, which is a measurement, not an absence.
@@ -36,8 +37,8 @@ layers, each asking a question none of the others asks:
 
 | # | Layer | Question | Baseline (2026-08-20) |
 |---|-------|----------|----------------------|
-| 1 | unit tests | does the code do what it says? | 252 tests |
-| 2 | mutation testing | do the tests fail when the code is wrong? | 126/126 killed |
+| 1 | unit tests | does the code do what it says? | 278 tests |
+| 2 | mutation testing | do the tests fail when the code is wrong? | 142/142 killed |
 | 3 | precision audit | are the FINDINGS real, per the RAW specs? | 49/49 breaking, 67/67 potentially |
 | 4 | end-to-end | does the pipeline still produce output? | `out/report.md` |
 | 5 | lead standing | are the LEADS real, per the last audit? | 0/10 — NOT sendable |
@@ -76,8 +77,10 @@ confirm or refute against the raw spec is not a weaker finding — it is not a
 finding. `measure_precision.py` reports UNDECIDABLE as its own bucket and
 excludes it from the ratio rather than counting it as a pass. 49/49 means
 forty-nine decided and forty-nine confirmed, not "49 of the ones we liked".
-Across all 21 vendors 335 findings are still UNDECIDABLE, and that number is
-the honest measure of how much of the engine is unaudited.
+Across all 21 vendors 337 findings are still UNDECIDABLE and 50 are REFUTED —
+together the honest measure of how much of the engine is unaudited or wrong.
+Seven vendors have no precision measurement at all (no findings in the window)
+and print as UNMEASURED, which is not a pass.
 
 **2. A test is worthless until you have watched it fail.** Every new test gets
 a mutation in `tests/mutation_check.py`. Three times a test was written that
@@ -109,6 +112,14 @@ precision:
   name not in schemas_of(new)` — literally the engine's own question. Asked the
   caller's way, **694 of 1007 are refuted.** All-vendor precision was never
   96.3%; it was 67.8%.
+
+**3a. The checker itself is tested now, and it was not.** `measure_precision.py`
+is layer 3 and it found every large defect this engine has had, while having
+zero tests and zero mutations of its own. `tests/test_checker.py` pins twelve of
+its decisions and seven mutations target it. Reverting `schema_removed` to the
+engine's question, deleting the dereferenced-document control, or refuting a
+path parameter's TYPE change on positionality all go red. A silent break in the
+checker makes layer 3 report 100% while checking nothing.
 
 **3b. A refuter whose precondition holds for 100% of inputs is a broken
 instrument, not a result.** The first version of the new `unreachable` rule
@@ -278,6 +289,20 @@ Do not add a PR path, an auto-commit, or an email send. Do not flip
 ./.venv/bin/python -m apidrift.cli scan ~/somerepo --days 30
 ./.venv/bin/python -m apidrift.cli scan ~/somerepo --opportunities
 ```
+
+### 🚨 50 findings are still refuted, and every proposed fix was measured unsafe
+
+Recorded in `lead_audit.json → scan_standing.open_false_positive_classes` with
+the mechanism for each: `response_field_removed` 13, `schema_removed` 10,
+`schema_field_type_changed` 8, `request_field_added_required` 8,
+`endpoint_removed` 5, `request_field_now_required` 4, `schema_field_removed` 2.
+
+Three adversarial audits diagnosed the first three correctly — every raw-spec
+claim they made re-derived — and **all three of their proposed fixes measured as
+unsafe**. One dropped all-vendor precision to 77.3% and refuted
+`stripe token.card.iin`, this repo's canonical real break. Do not apply a
+diagnosis without measuring the fix; on this class a correct diagnosis and a
+correct remedy came apart three times out of three.
 
 **The whole gate is ~65 seconds.** There is no reason to skip it or to run a
 subset and call it verified. Layer 1 is essentially free (0.1s) — run it after

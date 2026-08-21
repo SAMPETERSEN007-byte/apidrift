@@ -36,7 +36,7 @@
     "lead_precision": "0/10",
     "sendable": false,
     "blocker": "Operation reachability is accepted as proof for a whole-schema removal. A caller who reaches the operation but never reads any field of the removed schema is not affected, and seven of ten audited leads were exactly that. The fix is to resolve the removed schema to its leaf field names in the OLD spec and require a read of one of them, rejecting calls whose response is discarded.",
-    "findings_precision": "5-vendor gate population: 49/49 breaking, zero undecidable. ALL 21 registered vendors, measured for the first time 2026-08-20: 1492/1583 = 94.3% on independently decidable findings, 335 undecidable. The earlier 64/64 was a statement about five vendors, not about the engine.",
+    "findings_precision": "5-vendor gate population: 49/49 breaking, zero undecidable. ALL 21 registered vendors, measured for the first time 2026-08-20: 1487/1537 = 96.7% on independently decidable findings, 337 undecidable, over 1874 breaking findings. Started the day claiming 96.3% over 2766 findings, which was really 67.8%. The earlier 64/64 was a statement about five vendors, not about the engine.",
     "also_open": [
       "operation_reached() stops at the first affected operation with a hit, in list order, so an alphabetically earlier DELETE whose response is discarded wins over a GET whose response is deserialized. Rank by whether the response is consumed.",
       "A lead's breaks_on names the finding's representative operation while its proof names the operation the file actually calls, with nothing stating the two are related. This misled three auditors who had the repo, the spec and the source in front of them."
@@ -90,7 +90,48 @@
         "sendgrid"
       ],
       "unmeasured_reason": "zero breaking findings in the window, so there is nothing to audit. Not a pass -- the report prints them as UNMEASURED rather than clean.",
-      "window_caveats": "14 of 21 carry one: an observed range shorter OR LONGER than requested (the old side is the last commit BEFORE the window, which for a quiet repo can be a year earlier -- openai 429d of 180d), or specs with no history behind them. sendgrid's HEAD is 2026-03-24, so its window ends five months before `asof`."
+      "window_caveats": "14 of 21 carry one: an observed range shorter OR LONGER than requested (the old side is the last commit BEFORE the window, which for a quiet repo can be a year earlier -- openai 429d of 180d), or specs with no history behind them. sendgrid's HEAD is 2026-03-24, so its window ends five months before `asof`.",
+      "per_vendor_precision": {
+        "modern_treasury": "40/40",
+        "plaid": "33/33",
+        "square": "7/7",
+        "twilio": "6/6",
+        "klaviyo": "183/186",
+        "paypal": "474/482",
+        "vercel": "57/59",
+        "adyen": "51/53",
+        "sentry": "217/227",
+        "cloudflare": "315/329",
+        "datadog": "58/61",
+        "github": "17/18",
+        "stripe": "15/16",
+        "discord": "14/20",
+        "_unmeasured": [
+          "auth0",
+          "cohere",
+          "intercom",
+          "mistral",
+          "openai",
+          "resend",
+          "sendgrid"
+        ],
+        "_note": "zero breaking findings in the window, so nothing to audit. Printed as UNMEASURED, which is not a pass."
+      }
+    },
+    "open_false_positive_classes": {
+      "_note": "50 findings the independent checker still refutes, by kind. Each is a real defect and none is fixed. Three adversarial audits diagnosed the first three correctly and every one of their proposed fixes was measured as UNSAFE -- one would have dropped all-vendor precision to 77.3% and refuted `stripe token.card.iin`.",
+      "response_field_removed": 13,
+      "schema_removed": 10,
+      "schema_field_type_changed": 8,
+      "request_field_added_required": 8,
+      "endpoint_removed": 5,
+      "request_field_now_required": 4,
+      "schema_field_removed": 2,
+      "known_mechanisms": [
+        "flattener key identity: `oneOf[null, X]` collapsing to `$ref X`, a root `$ref X` becoming `allOf[X, ...]`, and union arms renamed by content -- a key vanishes while the payload is unchanged.",
+        "engine and checker both ask whether the string appears in a `required:[...]` array at the one node their path reaches, rather than whether a body that validated under OLD is rejected under NEW. An independent adjudication of that class put it at 43 TRUE / 124 FALSE, and found HALF the checker's own confirmations were also false positives.",
+        "endpoint_removed: the engine keys on METHOD+path and the checker on path alone. Their refuted sets are disjoint, so the 5 each is not the same 5."
+      ]
     }
   },
   "findings_defect_found_and_fixed_5": {
