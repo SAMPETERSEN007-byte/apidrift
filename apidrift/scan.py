@@ -272,7 +272,7 @@ def unmeasurable_callers(
             for key in vendor_keys:
                 if is_vendored_path(rel, key):
                     continue
-                if find_vendor_evidence(source, get(key)):
+                if find_vendor_evidence(source, get(key), rel):
                     out.setdefault(key, {})
                     out[key][language] = out[key].get(language, 0) + 1
     return out
@@ -307,7 +307,7 @@ def detect_vendors(
             vendor = get(key)
             if is_vendored_path(rel, key):
                 continue
-            if find_vendor_evidence(source, vendor):
+            if find_vendor_evidence(source, vendor, rel):
                 by_vendor[key].append((rel, source))
     return {k: v for k, v in by_vendor.items() if v}, read
 

@@ -198,6 +198,53 @@ class TestVendorEvidence(unittest.TestCase):
             "import openai")
 
 
+class TestEvidenceIsLanguageAware(unittest.TestCase):
+    """Every marker in the registry is PYTHON-shaped.
+
+    JavaScript writes the module name in quotes, so
+    `import { Resend } from 'resend'` matched NOTHING for resend, openai,
+    cloudflare, box, telnyx and most of the rest. Stripe passed only by
+    accident: `import Stripe` contains `import stripe` once lowercased. The
+    consequence was not a weaker proof -- files were rejected at this gate and
+    never examined, so a TypeScript repo full of Resend calls reported "no
+    impact" having looked at nothing.
+    """
+
+    def test_an_es_module_import_is_evidence(self):
+        for key, package in (("resend", "resend"), ("plaid", "plaid"),
+                             ("openai", "openai"), ("telnyx", "telnyx")):
+            source = f"import {{ X }} from '{package}';\n"
+            self.assertTrue(
+                find_vendor_evidence(source, get(key), "a.ts"),
+                f"{key}: an ES-module import of its own SDK is evidence")
+
+    def test_a_scoped_package_and_a_subpath_are_evidence(self):
+        self.assertTrue(find_vendor_evidence(
+            'import { Client } from "@hubspot/api-client";\n',
+            get("hubspot"), "a.ts"))
+        self.assertTrue(find_vendor_evidence(
+            "import x from '@sentry/node/esm';\n", get("sentry"), "a.ts"))
+
+    def test_require_is_evidence(self):
+        self.assertTrue(find_vendor_evidence(
+            "const { Resend } = require('resend');\n", get("resend"), "a.js"))
+
+    def test_an_unrelated_package_is_not_evidence(self):
+        """The control. Admitting every JS file would move the failure from
+        'never looked' to 'looked at everything', which is the co-location
+        mistake two audits already refuted nine leads for."""
+        self.assertEqual("", find_vendor_evidence(
+            "import { Resend } from 'not-resend-at-all';\n",
+            get("resend"), "a.ts"))
+        self.assertEqual("", find_vendor_evidence(
+            "// we should use resend one day\n", get("resend"), "a.ts"))
+
+    def test_python_files_are_unaffected(self):
+        self.assertEqual("", find_vendor_evidence(
+            "import { X } from 'resend';\n", get("resend"), "a.py"),
+            "the JavaScript forms must not leak into the Python gate")
+
+
 class TestUnprovableLanguages(unittest.TestCase):
     """An unproven lead is an unmeasured claim, not a weaker one."""
 

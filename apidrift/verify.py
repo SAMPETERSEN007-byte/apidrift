@@ -30,6 +30,7 @@ from .classify import classify
 from .dependence import prove
 from .prospect import static_run
 from .signatures import build_signatures
+from .js_dependence import is_js
 from .vendors import Vendor
 
 # Markers a code generator leaves in the first lines of what it produces.
@@ -338,7 +339,8 @@ def endpoint_call_sites(
     return sites, parsed
 
 
-def find_vendor_evidence(source: str, vendor: Vendor) -> str:
+def find_vendor_evidence(source: str, vendor: Vendor,
+                         file_path: str = "") -> str:
     """A marker tying this file to the vendor's API, matched at a word boundary.
 
     An unbounded substring search is not evidence. A line reading
@@ -346,7 +348,22 @@ def find_vendor_evidence(source: str, vendor: Vendor) -> str:
     "import openai", so a file with no OpenAI import at all cleared the gate --
     and that was the vendor evidence recorded on the one lead that survived an
     adversarial audit.
+
+    Every marker in the registry is PYTHON-shaped -- `from resend`,
+    `import telnyx` -- and JavaScript writes the module name in quotes, so
+    `import { Resend } from 'resend'` matched NOTHING for resend, openai,
+    cloudflare, box, telnyx and most of the rest. Stripe passed only by
+    accident, because `import Stripe` happens to contain `import stripe` once
+    lowercased. The consequence was not a weaker proof: files were rejected at
+    this gate and never examined at all, so a TypeScript repo full of Resend
+    calls reported "no impact" having looked at nothing. Found by a scan
+    control whose TypeScript half stayed silent while its Python half fired on
+    the same dependence.
     """
+    if file_path and is_js(file_path):
+        marker = _js_package_evidence(source, vendor)
+        if marker:
+            return marker
     lowered = source.lower()
     for marker in vendor.evidence:
         needle = marker.lower()
@@ -360,6 +377,29 @@ def find_vendor_evidence(source: str, vendor: Vendor) -> str:
             if not (following.isalnum() or following == "_"):
                 return marker
             start = at + 1
+    return ""
+
+
+def _js_package_evidence(source: str, vendor: Vendor) -> str:
+    """Does this file import the vendor's SDK the way JavaScript imports it?
+
+    The package list is the one `js_dependence` proves against, so evidence and
+    proof cannot drift apart: a file admitted here is a file the prover can
+    reason about, and a package added there is admitted here automatically.
+    """
+    from .js_dependence import _SDK_PACKAGES
+
+    for package in _SDK_PACKAGES.get(vendor.key, ()):
+        for form in (f"from '{package}'", f'from "{package}"',
+                     f"require('{package}')", f'require("{package}")',
+                     f"import '{package}'", f'import "{package}"'):
+            if form in source:
+                return form
+        # Subpath imports: `from '@scope/pkg/thing'`.
+        for quote in ("'", '"'):
+            needle = f"from {quote}{package}/"
+            if needle in source:
+                return f"from {quote}{package}/…{quote}"
     return ""
 
 
@@ -505,7 +545,7 @@ def verify_source(
                 f"lead is an unmeasured claim",
                 "", [])
 
-    evidence = find_vendor_evidence(source, vendor)
+    evidence = find_vendor_evidence(source, vendor, file_path)
     # Required for every kind. Treating a path as self-identifying was wrong:
     # `/v2/conversations` is Twilio's and also gptme's own, and a pytest
     # parametrize list of gptme's routes read as calls to Twilio.

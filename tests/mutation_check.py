@@ -69,7 +69,7 @@ MUTATIONS = [
     (
         "callers in other languages stop being counted at all",
         "apidrift/scan.py",
-        "                if find_vendor_evidence(source, get(key)):",
+        "                if find_vendor_evidence(source, get(key), rel):",
         "                if False:",
         ["test_a_language_that_is_still_unparsed_is_counted"],
     ),
@@ -1177,6 +1177,21 @@ MUTATIONS = [
         "_ACTIONABLE_KINDS = (\"spec_added\", \"endpoint_added\", \"schema_field_added\",\n                     \"param_added_optional\")",
         "_ACTIONABLE_KINDS = (\"spec_added\", \"endpoint_added\", \"schema_field_added\",\n                     \"param_added_optional\", \"response_field_added\")",
         ["test_a_passive_field_is_not_called_something_to_adopt"],
+    ),
+    (
+        "javascript imports stop counting as vendor evidence",
+        "apidrift/verify.py",
+        "    if file_path and is_js(file_path):\n        marker = _js_package_evidence(source, vendor)",
+        "    if False:\n        marker = _js_package_evidence(source, vendor)",
+        ["test_an_es_module_import_is_evidence",
+         "test_a_scoped_package_and_a_subpath_are_evidence"],
+    ),
+    (
+        "any javascript file counts as vendor evidence",
+        "apidrift/verify.py",
+        "        for form in (f\"from '{package}'\", f'from \"{package}\"',",
+        "        for form in (f\"from\", f'from \"{package}\"',",
+        ["test_an_unrelated_package_is_not_evidence"],
     ),
 ]
 
