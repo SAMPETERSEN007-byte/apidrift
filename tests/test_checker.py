@@ -260,5 +260,345 @@ class TestOperationServerChanged(unittest.TestCase):
         self.assertEqual(REFUTED, verdict, why)
 
 
+class TestOperationAddressing(unittest.TestCase):
+    """A path parameter's NAME never reaches the wire, so it cannot decide
+    whether the checker can FIND the operation a finding is about."""
+
+    def test_a_renamed_path_parameter_still_finds_the_operation(self):
+        """Cloudflare renamed `{postfix_id}` -> `{investigate_id}`. Every other
+        finding on that operation then reported "missing from one side"."""
+        old = doc({}, {"/investigate/{postfix_id}": {"get": {"responses": resp(
+            {"type": "object", "properties": {"log": {"type": "string"}}})}}})
+        new = doc({}, {"/investigate/{investigate_id}": {"get": {"responses": resp(
+            {"type": "object", "properties": {"log": {"type": "integer"}}})}}})
+        verdict, why = check(
+            finding("response_field_type_changed", subject="log",
+                    root_cause="log", op_key="GET /investigate/{investigate_id}",
+                    status="200"),
+            old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+
+    def test_two_paths_sharing_a_template_stay_UNDECIDABLE(self):
+        """The fallback must not GUESS. A document holding two paths that
+        differ only in parameter names cannot say which one was meant, and
+        picking one would answer a question nobody asked."""
+        body = {"type": "object", "properties": {"log": {"type": "string"}}}
+        old = doc({}, {"/investigate/{a_id}": {"get": {"responses": resp(body)}},
+                       "/investigate/{b_id}": {"get": {"responses": resp(body)}}})
+        new = doc({}, {"/investigate/{a_id}": {"get": {"responses": resp(body)}},
+                       "/investigate/{b_id}": {"get": {"responses": resp(body)}}})
+        verdict, why = check(
+            finding("response_field_type_changed", subject="log",
+                    root_cause="log", op_key="GET /investigate/{c_id}",
+                    status="200"),
+            old, new, [], [])
+        self.assertEqual(UNDECIDABLE, verdict, why)
+
+
+class TestFieldTypeChanged(unittest.TestCase):
+    def test_a_schema_qualified_root_is_walked_through_the_BODY(self):
+        """`root_cause` is `MessageResponse.nonce` while the body's properties
+        are `nonce`. Walking the schema NAME as a property found nothing on
+        either side and the whole class reported UNDECIDABLE for that alone."""
+        old = doc({"MessageResponse": {"type": "object", "properties": {
+                       "nonce": {"oneOf": [{"type": "integer"},
+                                           {"type": "null"}]}}}},
+                  {"/things": {"get": {"responses": resp(
+                      {"$ref": "#/components/schemas/MessageResponse"})}}})
+        new = doc({"MessageResponse": {"type": "object", "properties": {
+                       "nonce": {"oneOf": [{"type": "integer"}]}}}},
+                  {"/things": {"get": {"responses": resp(
+                      {"$ref": "#/components/schemas/MessageResponse"})}}})
+        verdict, why = check(
+            finding("response_field_type_changed",
+                    subject="<MessageResponse>.nonce",
+                    root_cause="MessageResponse.nonce", status="200"),
+            old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+
+    def test_a_head_the_BODY_does_not_use_is_not_stripped(self):
+        """The guard is the whole safety of the head strip. `Foo.id` must not
+        be re-read against whatever schema this operation happens to return,
+        or an unrelated `Bar.id` decides it."""
+        old = doc({"Foo": {"type": "object", "properties": {"id": {"type": "string"}}},
+                   "Bar": {"type": "object", "properties": {"id": {"type": "string"}}}},
+                  {"/things": {"get": {"responses": resp(
+                      {"$ref": "#/components/schemas/Bar"})}}})
+        new = doc({"Foo": {"type": "object", "properties": {"id": {"type": "integer"}}},
+                   "Bar": {"type": "object", "properties": {"id": {"type": "string"}}}},
+                  {"/things": {"get": {"responses": resp(
+                      {"$ref": "#/components/schemas/Bar"})}}})
+        verdict, why = check(
+            finding("response_field_type_changed", subject="<Foo>.id",
+                    root_cause="Foo.id", status="200"),
+            old, new, [], [])
+        self.assertEqual(UNDECIDABLE, verdict, why)
+
+    def test_an_allOf_is_read_as_an_intersection_not_as_nothing(self):
+        """PayPal narrowed a field from `{}` -- which accepts anything -- to
+        `allOf: [$ref crypto_request, {title}]`. Reading only the node's own
+        keywords sees an empty schema on BOTH sides and calls them equal."""
+        old = doc({"Req": {"type": "object", "properties": {"crypto": {}}},
+                   "Crypto": {"type": "object",
+                              "properties": {"chain": {"type": "string"}}}},
+                  {"/things": {"post": {"requestBody": {"content": {
+                      "application/json": {"schema": {
+                          "$ref": "#/components/schemas/Req"}}}}}}})
+        new = doc({"Req": {"type": "object", "properties": {"crypto": {
+                       "allOf": [{"$ref": "#/components/schemas/Crypto"},
+                                 {"title": "crypto"}]}}},
+                   "Crypto": old["components"]["schemas"]["Crypto"]},
+                  {"/things": {"post": {"requestBody": {"content": {
+                      "application/json": {"schema": {
+                          "$ref": "#/components/schemas/Req"}}}}}}})
+        verdict, why = check(
+            finding("request_field_type_changed", subject="<Req>.crypto",
+                    root_cause="Req.crypto", op_key="POST /things"),
+            old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+
+    def test_a_field_relocated_between_allOf_arms_is_refuted(self):
+        """Klaviyo moved `relationships` out of an inline arm and into the
+        referenced base schema. The property set a caller sees is identical,
+        and reading `allOf` as an intersection is what shows that."""
+        base_old = {"type": "object", "properties": {
+            "id": {"type": "string"}, "attributes": {"type": "object"}}}
+        base_new = {"type": "object", "properties": {
+            "id": {"type": "string"}, "attributes": {"type": "object"},
+            "relationships": {"type": "object"}}}
+        old = doc({"Res": base_old,
+                   "Envelope": {"type": "object", "properties": {"data": {
+                       "allOf": [{"$ref": "#/components/schemas/Res"},
+                                 {"properties": {
+                                     "relationships": {"type": "object"}}}]}}}},
+                  {"/things": {"get": {"responses": resp(
+                      {"$ref": "#/components/schemas/Envelope"})}}})
+        new = doc({"Res": base_new,
+                   "Envelope": {"type": "object", "properties": {"data": {
+                       "allOf": [{"$ref": "#/components/schemas/Res"}]}}}},
+                  {"/things": {"get": {"responses": resp(
+                      {"$ref": "#/components/schemas/Envelope"})}}})
+        verdict, why = check(
+            finding("response_field_type_changed", subject="<Envelope>.data",
+                    root_cause="Envelope.data", status="200"),
+            old, new, [], [])
+        self.assertEqual(REFUTED, verdict, why)
+
+
+class TestNullability(unittest.TestCase):
+    """Whether a value may be null is part of the contract, and
+    `effective_shape` never looked at it. Cloudflare dropped `nullable: true`
+    from five email-security REQUEST fields in one window: a caller that was
+    sending null is now rejected, and every one compared equal to itself."""
+
+    def _check(self, old_prop, new_prop):
+        old = doc({"Req": {"type": "object", "properties": {"p": old_prop}},
+                   "Pattern": {"type": "string", "enum": ["EMAIL", "IP"]}},
+                  {"/things": {"post": {"requestBody": {"content": {
+                      "application/json": {"schema": {
+                          "$ref": "#/components/schemas/Req"}}}}}}})
+        new = doc({"Req": {"type": "object", "properties": {"p": new_prop}},
+                   "Pattern": {"type": "string", "enum": ["EMAIL", "IP"]}},
+                  {"/things": {"post": {"requestBody": {"content": {
+                      "application/json": {"schema": {
+                          "$ref": "#/components/schemas/Req"}}}}}}})
+        return check(finding("schema_field_type_changed", subject="<Req>.p",
+                             root_cause="Req.p", op_key="POST /things"),
+                     old, new, [], [])
+
+    def test_dropping_nullable_from_an_allOf_arm_is_confirmed(self):
+        """`allOf: [{$ref: X}, {nullable: true}]` is the only way OpenAPI 3.0
+        can make a reference nullable, so the flag has to survive the merge."""
+        verdict, why = self._check(
+            {"allOf": [{"$ref": "#/components/schemas/Pattern"},
+                       {"nullable": True, "type": "string"}]},
+            {"$ref": "#/components/schemas/Pattern"})
+        self.assertEqual(CONFIRMED, verdict, why)
+
+    def test_dropping_nullable_from_the_field_itself_is_confirmed(self):
+        verdict, why = self._check({"type": "string", "nullable": True},
+                                   {"type": "string"})
+        self.assertEqual(CONFIRMED, verdict, why)
+
+    def test_nullable_on_both_sides_is_still_refuted(self):
+        """The other direction: nullability must DISTINGUISH, not confirm
+        everything it touches."""
+        verdict, why = self._check(
+            {"allOf": [{"$ref": "#/components/schemas/Pattern"},
+                       {"nullable": True}]},
+            {"allOf": [{"$ref": "#/components/schemas/Pattern"},
+                       {"nullable": True, "description": "reworded"}]})
+        self.assertEqual(REFUTED, verdict, why)
+
+
+class TestParameterEnum(unittest.TestCase):
+    """A query parameter's enum lives in `parameters`, not in a schema.
+    `vendor_control.py` injected exactly this break into twelve vendors' real
+    specs and printed `found+undecidable` for every one of them."""
+
+    def _specs(self, new_schema):
+        old = doc({}, {"/things": {"get": {
+            "parameters": [{"name": "object", "in": "query",
+                            "schema": {"type": "string",
+                                       "enum": ["bank_account", "card"]}}],
+            "responses": resp({"type": "object"})}}})
+        new = doc({}, {"/things": {"get": {
+            "parameters": [{"name": "object", "in": "query",
+                            "schema": new_schema}],
+            "responses": resp({"type": "object"})}}})
+        return old, new
+
+    def test_a_dropped_parameter_enum_value_is_confirmed(self):
+        old, new = self._specs({"type": "string", "enum": ["bank_account"]})
+        verdict, why = check(
+            finding("request_enum_value_removed", subject="object",
+                    root_cause=""), old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+
+    def test_dropping_the_enum_KEYWORD_widens_and_is_refuted(self):
+        """The refutation the engine's question cannot reach: with no `enum`
+        the parameter accepts every value, so "no longer accepts card" is
+        false."""
+        old, new = self._specs({"type": "string"})
+        verdict, why = check(
+            finding("request_enum_value_removed", subject="object",
+                    root_cause=""), old, new, [], [])
+        self.assertEqual(REFUTED, verdict, why)
+
+    def test_a_parameter_that_kept_every_value_is_refuted(self):
+        old, new = self._specs({"type": "string",
+                                "enum": ["card", "bank_account", "other"]})
+        verdict, why = check(
+            finding("request_enum_value_removed", subject="object",
+                    root_cause=""), old, new, [], [])
+        self.assertEqual(REFUTED, verdict, why)
+
+    def test_a_referenced_parameter_is_resolved(self):
+        old = doc({}, {"/things": {"get": {
+            "parameters": [{"$ref": "#/components/parameters/Obj"}],
+            "responses": resp({"type": "object"})}}})
+        old["components"]["parameters"] = {"Obj": {
+            "name": "object", "in": "query",
+            "schema": {"type": "string", "enum": ["a", "b"]}}}
+        new = doc({}, {"/things": {"get": {
+            "parameters": [{"$ref": "#/components/parameters/Obj"}],
+            "responses": resp({"type": "object"})}}})
+        new["components"]["parameters"] = {"Obj": {
+            "name": "object", "in": "query",
+            "schema": {"type": "string", "enum": ["a"]}}}
+        verdict, why = check(
+            finding("request_enum_value_removed", subject="object",
+                    root_cause=""), old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+
+
+class TestArmMarkers(unittest.TestCase):
+    def test_an_uncollapsed_subject_is_still_addressable(self):
+        """`root_cause` is only set on findings that went through collapse().
+        Anything else arrives as `<ListCompanyResponse>._links`, and every
+        branch looked that up in components/schemas and found nothing. It is
+        why the adyen and sendgrid response controls read found+undecidable."""
+        old = doc({"ListCompanyResponse": {"type": "object", "properties": {
+                       "_links": {"type": "object"},
+                       "data": {"type": "string"}}}},
+                  {"/companies": {"get": {"responses": resp(
+                      {"$ref": "#/components/schemas/ListCompanyResponse"})}}})
+        new = doc({"ListCompanyResponse": {"type": "object", "properties": {
+                       "data": {"type": "string"}}}},
+                  {"/companies": {"get": {"responses": resp(
+                      {"$ref": "#/components/schemas/ListCompanyResponse"})}}})
+        verdict, why = check(
+            finding("response_field_removed",
+                    subject="<ListCompanyResponse>._links",
+                    root_cause="", op_key="GET /companies", status="200"),
+            old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+
+
+class TestRequestBodyNowRequired(unittest.TestCase):
+    def test_a_body_that_became_required_is_confirmed(self):
+        old = doc({}, {"/things": {"post": {"requestBody": {
+            "content": {"application/json": {"schema": {"type": "object"}}}}}}})
+        new = doc({}, {"/things": {"post": {"requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": {"type": "object"}}}}}}})
+        verdict, why = check(
+            finding("request_body_now_required", subject="body",
+                    root_cause="body", op_key="POST /things"), old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+
+    def test_a_body_that_is_still_optional_is_refuted(self):
+        body = {"content": {"application/json": {"schema": {"type": "object"}}}}
+        old = doc({}, {"/things": {"post": {"requestBody": body}}})
+        new = doc({}, {"/things": {"post": {"requestBody": dict(body)}}})
+        verdict, why = check(
+            finding("request_body_now_required", subject="body",
+                    root_cause="body", op_key="POST /things"), old, new, [], [])
+        self.assertEqual(REFUTED, verdict, why)
+
+    def test_the_required_flag_is_read_through_a_reference(self):
+        """`requestBody` is routinely a $ref and `required` lives on the
+        TARGET. Reading the flag off the reference object sees nothing and
+        refutes every one of them."""
+        old = doc({}, {"/things": {"post": {"requestBody": {
+            "$ref": "#/components/requestBodies/Body"}}}})
+        old["components"]["requestBodies"] = {"Body": {
+            "content": {"application/json": {"schema": {"type": "object"}}}}}
+        new = doc({}, {"/things": {"post": {"requestBody": {
+            "$ref": "#/components/requestBodies/Body"}}}})
+        new["components"]["requestBodies"] = {"Body": {
+            "required": True,
+            "content": {"application/json": {"schema": {"type": "object"}}}}}
+        verdict, why = check(
+            finding("request_body_now_required", subject="body",
+                    root_cause="body", op_key="POST /things"), old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+
+
+class TestServerUrlChanged(unittest.TestCase):
+    def test_a_base_url_move_with_no_overlap_is_confirmed(self):
+        old = doc()
+        old["servers"] = [{"url": "https://paltokenization-test.adyen.com/x"}]
+        new = doc()
+        new["servers"] = [{"url": "https://pal-test.adyen.com/y"}]
+        verdict, why = check(
+            finding("server_url_changed", subject="<server>",
+                    root_cause="server", op_key="GET /"), old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+
+    def test_an_overlapping_base_url_set_is_refuted(self):
+        old = doc()
+        old["servers"] = [{"url": "https://api.example.com"}]
+        new = doc()
+        new["servers"] = [{"url": "https://api.example.com"},
+                          {"url": "https://eu.example.com"}]
+        verdict, why = check(
+            finding("server_url_changed", subject="<server>",
+                    root_cause="server", op_key="GET /"), old, new, [], [])
+        self.assertEqual(REFUTED, verdict, why)
+
+    def test_a_templated_url_is_expanded_before_comparing(self):
+        """Parameterising a URL that did not move is notation, not a
+        relocation -- the same mistake as a path parameter rename."""
+        old = doc()
+        old["servers"] = [{"url": "https://eu.example.com"}]
+        new = doc()
+        new["servers"] = [{"url": "https://{region}.example.com",
+                           "variables": {"region": {"default": "eu"}}}]
+        verdict, why = check(
+            finding("server_url_changed", subject="<server>",
+                    root_cause="server", op_key="GET /"), old, new, [], [])
+        self.assertEqual(REFUTED, verdict, why)
+
+    def test_a_missing_servers_block_is_UNDECIDABLE_not_refuted(self):
+        old = doc()
+        new = doc()
+        new["servers"] = [{"url": "https://api.example.com"}]
+        verdict, why = check(
+            finding("server_url_changed", subject="<server>",
+                    root_cause="server", op_key="GET /"), old, new, [], [])
+        self.assertEqual(UNDECIDABLE, verdict, why)
+
+
 if __name__ == "__main__":
     unittest.main()

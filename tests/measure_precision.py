@@ -88,19 +88,74 @@ def walk_properties(schema: Any, parts: List[str], doc: Dict[str, Any],
     return False, None
 
 
+def merge_all_of(prop: Dict[str, Any], doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten an `allOf` into the single schema a consumer actually faces.
+
+    `allOf` is an INTERSECTION: a value must satisfy every arm at once, so what
+    the consumer sees is all of them merged. Reading only the node's own
+    keywords sees an empty schema, and an empty schema is what a document says
+    when it accepts ANYTHING -- so `{}` and
+    `allOf: [$ref crypto_request, {title, description}]` both scored
+    `('scalar', None, None)` and compared EQUAL. PayPal narrowed
+    `order_request.payment_source.crypto` from "any JSON" to "a crypto_request"
+    and this file called it unchanged, twice from the schema side and twice
+    from the request side.
+
+    Sibling keywords on the node itself win over an arm's, because they are
+    the more specific statement about this use.
+    """
+    merged = {key: value for key, value in prop.items() if key != "allOf"}
+    props = dict(merged.get("properties") or {})
+    required = list(merged.get("required") or [])
+    for arm in prop.get("allOf") or []:
+        # Resolve the arm's whole reference chain before reading it. Taking one
+        # hop and copying a `$ref` up into the merged node would let that ref
+        # win in `effective_shape` -- which consults `$ref` before
+        # `properties` -- and silently discard every other arm.
+        target = follow(doc, arm)
+        if isinstance(target, dict) and target.get("allOf"):
+            target = merge_all_of(target, doc)
+        if not isinstance(target, dict) or "$ref" in target:
+            continue
+        props.update(target.get("properties") or {})
+        required += list(target.get("required") or [])
+        # `allOf: [{$ref: X}, {nullable: true}]` is the OpenAPI 3.0 idiom for
+        # "a nullable X" -- there is no other way to attach nullability to a
+        # reference. Cloudflare's email-security request fields carry it in the
+        # ARM, and dropping it silently made a field that stopped accepting
+        # null compare equal to its old self.
+        if target.get("nullable") is True:
+            merged["nullable"] = True
+        for key in ("type", "enum", "items", "oneOf", "anyOf"):
+            if key not in merged and key in target:
+                merged[key] = target[key]
+    if props:
+        merged["properties"] = props
+    if required:
+        merged["required"] = sorted(set(required))
+    return merged
+
+
 def effective_shape(prop: Any, doc: Dict[str, Any], depth: int = 0) -> Any:
     """What a consumer actually sees for this property.
 
     Written independently of the engine, and deliberately so: it answers the
     same question by resolving to a concrete shape rather than by comparing
-    type labels. A single-arm `allOf` is transparent, and a reference resolves
-    to the sorted field names of its target so that a rename is invisible.
+    type labels. An `allOf` is flattened to its intersection, and a reference
+    resolves to the sorted field names of its target so that a rename is
+    invisible.
     """
     if not isinstance(prop, dict) or depth > 3:
         return "opaque"
-    arms = prop.get("allOf")
-    if isinstance(arms, list) and len(arms) == 1 and "properties" not in prop:
-        return effective_shape(arms[0], doc, depth + 1)
+    if isinstance(prop.get("allOf"), list) and prop["allOf"]:
+        return effective_shape(merge_all_of(prop, doc), doc, depth + 1)
+    # Nullability is part of the VALUE a caller may send or receive, and this
+    # function never looked at it. Cloudflare dropped `nullable: true` from
+    # five email-security REQUEST fields in this window: a caller that was
+    # sending null is now rejected, and every one of them compared equal.
+    if prop.get("nullable") is True:
+        rest = {k: v for k, v in prop.items() if k != "nullable"}
+        return ("nullable", effective_shape(rest, doc, depth + 1))
     ref = prop.get("$ref")
     if isinstance(ref, str):
         target = schemas_of(doc).get(ref.rsplit("/", 1)[-1])
@@ -123,6 +178,66 @@ def effective_shape(prop: Any, doc: Dict[str, Any], depth: int = 0) -> Any:
     return ("scalar", prop.get("type"), tuple(sorted(map(str, enum))) if enum else None)
 
 
+def body_roots_at(doc: Dict[str, Any], node: Any, depth: int = 0,
+                  seen: Optional[set] = None) -> set:
+    """Schema NAMES this body node resolves to at its ROOT position.
+
+    Only `$ref` and the composition keywords are followed, never `properties`
+    or `items`: the question is what schema the body IS, not what it contains.
+    `allOf: [Envelope, {...}]` is both `Envelope` and an inline object, so both
+    arms count.
+
+    Written here with this file's own resolver. The engine has its own notion
+    of which schema an operation's body is, and a checker that borrows it
+    agrees with it by construction.
+    """
+    seen = set() if seen is None else seen
+    names: set = set()
+    if depth > 8 or not isinstance(node, dict):
+        return names
+    ref = node.get("$ref")
+    if isinstance(ref, str):
+        name = ref.rsplit("/", 1)[-1]
+        if name in seen:
+            return names
+        names.add(name)
+        return names | body_roots_at(doc, schemas_of(doc).get(name) or {},
+                                     depth + 1, seen | {name})
+    for keyword in ("allOf", "anyOf", "oneOf"):
+        for arm in node.get(keyword) or []:
+            names |= body_roots_at(doc, arm, depth + 1, seen)
+    return names
+
+
+def strip_schema_head(parts: List[str], old: Dict[str, Any],
+                      new: Dict[str, Any], old_body: Any) -> Optional[List[str]]:
+    """Drop a leading SCHEMA NAME from a field path, when that is what it is.
+
+    `collapse()` keys a finding on its innermost named schema, so `root_cause`
+    reads `MessageResponse.nonce` while the operation's body is
+    `$ref: MessageResponse` and its properties are `nonce`, `content`, ... .
+    Walking `MessageResponse` as if it were a property finds nothing on either
+    side, and the whole class reported UNDECIDABLE for that reason alone --
+    an ADDRESSING failure, not a fact about the change.
+
+    Guarded twice over. The head must name a schema in one of the documents,
+    and the OLD body must actually resolve to that schema at its root. Without
+    the second test a path rooted at `Foo` would be re-read against whatever
+    schema this operation happens to return, and a `Bar.id` that never moved
+    would refute a real change to `Foo.id`. Returns None when either test
+    fails, which leaves the finding UNDECIDABLE -- honest, and the direction
+    that cannot manufacture a verdict.
+    """
+    if len(parts) < 2:
+        return None
+    head = parts[0]
+    if head not in (schemas_of(old) | schemas_of(new)):
+        return None
+    if head not in body_roots_at(old, old_body):
+        return None
+    return parts[1:]
+
+
 def resolve_root(doc: Dict[str, Any], root_cause: str) -> Optional[Tuple[Any, List[str]]]:
     """Split `Schema.a.b` into (schema object, ['a','b']). None if no schema."""
     segments = [s for s in root_cause.replace("[]", ".[].").split(".") if s]
@@ -135,12 +250,110 @@ def resolve_root(doc: Dict[str, Any], root_cause: str) -> Optional[Tuple[Any, Li
     return schemas[head], segments[1:]
 
 
+_ERASED = re.compile(r"\{[^}]*\}")
+
+
 def find_operation(doc: Dict[str, Any], op_key: str) -> Optional[Dict[str, Any]]:
+    """The operation this key names, addressed the way a CALLER addresses it.
+
+    A path parameter's NAME is OpenAPI-internal and never reaches the wire:
+    `/investigate/{postfix_id}` and `/investigate/{investigate_id}` produce
+    byte-identical URLs for every concrete value, so they are one endpoint. The
+    `endpoint_removed` and `endpoint_moved` branches below have always known
+    that; this lookup did not, so a vendor renaming a path parameter made every
+    OTHER finding on that operation UNDECIDABLE -- the operation "was missing
+    from one side" when it was sitting right there under a different spelling.
+
+    Cloudflare renamed `{postfix_id}` -> `{investigate_id}` in this window, and
+    that alone is why `result.action_log` could not be decided.
+
+    The fallback is deliberately narrow. It runs only when the exact key is
+    absent, and only when exactly ONE path normalises to the same template: a
+    document holding two distinct paths that differ only in parameter names is
+    self-contradictory, and guessing which one was meant would answer a
+    question nobody asked. Ambiguity stays UNDECIDABLE.
+    """
     method, _, path = op_key.partition(" ")
-    item = (doc.get("paths") or {}).get(path)
-    if not isinstance(item, dict):
+    item = find_path_item(doc, path)
+    if item is None:
         return None
-    return item.get(method.lower())
+    node = item.get(method.lower())
+    return node if isinstance(node, dict) else None
+
+
+_ARM_MARKER = re.compile(r"<[^<>]*>")
+
+
+def plain_path(subject: str) -> str:
+    """The dotted field path a CONSUMER walks, with the engine's arm markers off.
+
+    A finding's `subject` annotates each hop with the schema it passed through:
+    `<ListCompanyResponse>._links`, `customer<customer>.default_source<card>.iin`.
+    `root_cause` is the marker-free form, but it is only set on findings that
+    went through `collapse()` -- so anything reaching this checker uncollapsed
+    arrived as a string with angle brackets in it, and every branch that looks
+    up `parts[0]` in `components/schemas` found `<ListCompanyResponse>`, which
+    is not a schema name and never will be.
+
+    That is why `vendor_control.py` printed `found+undecidable` for
+    `response_field_removed` on adyen and sendgrid: an injected break, known
+    real, that nothing could confirm because the checker could not read the
+    address it was given. The markers are notation, not evidence -- a caller
+    reads `_links` off the body either way.
+    """
+    return _ARM_MARKER.sub("", subject).replace("..", ".").strip(".")
+
+
+def find_path_item(doc: Dict[str, Any], path: str) -> Optional[Dict[str, Any]]:
+    """The path item, matched on the URL a caller would actually build."""
+    paths = doc.get("paths") or {}
+    item = paths.get(path)
+    if isinstance(item, dict):
+        return item
+    wanted = _ERASED.sub("{}", path)
+    candidates = [value for key, value in paths.items()
+                  if isinstance(value, dict)
+                  and _ERASED.sub("{}", str(key)) == wanted]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def operation_params(doc: Dict[str, Any], op_key: str) -> Dict[str, Any]:
+    """Every parameter in effect on this operation, by name.
+
+    Path-item parameters apply to every operation under them and the operation
+    may override one, so the operation's own entries are merged last.
+    """
+    method, _, path = op_key.partition(" ")
+    item = find_path_item(doc, path) or {}
+    op = item.get(method.lower())
+    op = op if isinstance(op, dict) else {}
+    merged: Dict[str, Any] = {}
+    for entry in list(item.get("parameters") or []) + list(op.get("parameters") or []):
+        if isinstance(entry, dict) and "$ref" in entry:
+            ref = str(entry["$ref"]).rsplit("/", 1)[-1]
+            entry = ((doc.get("components") or {}).get("parameters")
+                     or doc.get("parameters") or {}).get(ref) or {}
+        if isinstance(entry, dict) and entry.get("name"):
+            merged[str(entry["name"])] = entry
+    return merged
+
+
+def param_schema(entry: Dict[str, Any]) -> Any:
+    """Where a parameter's value schema lives, across the dialects in use.
+
+    OpenAPI 3 puts it under `schema`, or under `content/<mime>/schema` for a
+    serialised one; Swagger 2 writes `type`/`enum` on the parameter itself.
+    """
+    if not isinstance(entry, dict):
+        return None
+    if isinstance(entry.get("schema"), dict):
+        return entry["schema"]
+    for body in (entry.get("content") or {}).values():
+        if isinstance(body, dict) and isinstance(body.get("schema"), dict):
+            return body["schema"]
+    if "enum" in entry or "type" in entry:
+        return entry
+    return None
 
 
 
@@ -315,7 +528,7 @@ def check_schema_removed(finding: Dict[str, Any], old: Dict[str, Any],
 def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
           old_tree: List[str], new_tree: List[str]) -> Tuple[str, str]:
     kind = finding["kind"]
-    root = finding.get("root_cause") or finding.get("subject") or ""
+    root = finding.get("root_cause") or plain_path(finding.get("subject") or "")
 
     if kind == "spec_removed":
         target = finding["subject"]
@@ -545,6 +758,11 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
         parts = [p for p in root.replace("[]", ".[].").split(".") if p]
         found_old, node_old = walk_properties(old_body, parts, old)
         found_new, node_new = walk_properties(new_body, parts, new)
+        if not (found_old or found_new):
+            tail = strip_schema_head(parts, old, new, old_body)
+            if tail:
+                found_old, node_old = walk_properties(old_body, tail, old)
+                found_new, node_new = walk_properties(new_body, tail, new)
         if not (found_old and found_new):
             return UNDECIDABLE, f"field not resolvable (old={found_old}, new={found_new})"
         before, after = effective_shape(node_old, old), effective_shape(node_new, new)
@@ -569,14 +787,13 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
         parts = root.split(".")
         available = schemas_of(old) | schemas_of(new)
         schema_name = None
+        field_name = ""
         for cut in range(len(parts) - 1, 0, -1):
             if ".".join(parts[:cut]) in available:
                 schema_name = ".".join(parts[:cut])
                 # `field[]` names the array, not a property called "field[]".
                 field_name = ".".join(parts[cut:]).replace("[]", "")
                 break
-        if schema_name is None:
-            return UNDECIDABLE, f"root `{root}` names no known schema"
 
         def prop(doc):
             node = schemas_of(doc).get(schema_name)
@@ -590,7 +807,56 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
                     props.update(target.get("properties") or {})
             return props.get(field_name)
 
-        before_prop, after_prop = prop(old), prop(new)
+        if schema_name is None:
+            # A QUERY or PATH parameter's enum lives in `parameters`, not in a
+            # schema, so `root` is a bare parameter name and every one of these
+            # was UNDECIDABLE -- including the injected control that
+            # `vendor_control.py` reports as `found+undecidable` on twelve
+            # vendors: a break we KNOW is real that nothing could confirm.
+            #
+            # Asked the caller's way: can a request that was legal under OLD
+            # still be sent under NEW? Two refutations fall out of that and
+            # neither is available to the engine's question. Widening to an
+            # unconstrained parameter is the important one -- dropping the
+            # `enum` keyword altogether makes every value legal, so "no longer
+            # accepts X" is false.
+            if kind == "schema_field_now_nullable":
+                return UNDECIDABLE, f"root `{root}` names no known schema"
+            name = str(finding.get("subject") or root)
+            op_key = finding.get("op_key") or ""
+            was_param = operation_params(old, op_key).get(name)
+            now_param = operation_params(new, op_key).get(name)
+            if was_param is not None and now_param is not None:
+                before = effective_enum(param_schema(was_param), old)
+                after = effective_enum(param_schema(now_param), new)
+                if before is None:
+                    return UNDECIDABLE, (
+                        f"parameter `{name}` had no resolvable enum in the "
+                        f"old spec")
+                if after is None:
+                    return REFUTED, (
+                        f"parameter `{name}` no longer constrains its value "
+                        f"at all — the enum keyword is gone, so every value "
+                        f"the old {len(before)}-value list allowed is still "
+                        f"accepted")
+                lost = sorted(set(before) - set(after))
+                if kind.endswith("_added"):
+                    gained = sorted(set(after) - set(before))
+                    if gained:
+                        return CONFIRMED, f"parameter `{name}` gained {gained}"
+                    return REFUTED, f"parameter `{name}` gained no values"
+                if lost:
+                    return CONFIRMED, f"parameter `{name}` no longer accepts {lost}"
+                return REFUTED, (f"parameter `{name}` lost no values "
+                                 f"(old={len(before)}, new={len(after)})")
+            # Not a parameter either. Stripe sends `ui_mode` in a form-encoded
+            # request BODY, so fall through to the operation-body resolution
+            # below rather than giving up here -- returning UNDECIDABLE at this
+            # point is what kept those undecidable when the answer was one
+            # walk away.
+            before_prop = after_prop = None
+        else:
+            before_prop, after_prop = prop(old), prop(new)
         if kind == "schema_field_now_nullable":
             def nullable(node, doc):
                 if not isinstance(node, dict):
@@ -636,6 +902,69 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
         if lost:
             return CONFIRMED, f"lost {lost}"
         return REFUTED, f"no values lost (old={len(before)}, new={len(after)})"
+
+    if kind == "server_url_changed":
+        # The document-level counterpart of `operation_server_changed`, and it
+        # had no check at all. A base URL is the one part of a spec that is
+        # PURELY a caller's concern, so the question is simply whether any
+        # host a caller was pointed at still works.
+        #
+        # Server URLs are templates: `https://{region}.example.com` with a
+        # `default` is the same address as the expanded literal, so both sides
+        # are expanded with their own defaults before comparing. Without that
+        # a vendor parameterising a URL it did not move would score as a
+        # relocation -- the same notation-versus-contract mistake as a path
+        # parameter rename.
+        def bases(doc):
+            block = doc.get("servers")
+            if not isinstance(block, list) or not block:
+                return None
+            urls = set()
+            for entry in block:
+                if not isinstance(entry, dict) or not entry.get("url"):
+                    continue
+                url = str(entry["url"])
+                for name, spec in (entry.get("variables") or {}).items():
+                    if isinstance(spec, dict) and spec.get("default") is not None:
+                        url = url.replace("{%s}" % name, str(spec["default"]))
+                urls.add(url.rstrip("/"))
+            return urls or None
+
+        was, now = bases(old), bases(new)
+        if was is None or now is None:
+            return UNDECIDABLE, (
+                f"no `servers` block on one side (old={was is not None}, "
+                f"new={now is not None}) — the base URL is then whatever "
+                f"served the document, which is not in the document")
+        if was & now:
+            return REFUTED, f"the base URLs still overlap: {sorted(was & now)}"
+        return CONFIRMED, (f"every base URL changed: {sorted(was)} -> "
+                           f"{sorted(now)}")
+
+    if kind == "request_body_now_required":
+        # No check existed for this kind either. The caller's question is
+        # whether a request that carried NO body stops being accepted.
+        op_old = find_operation(old, finding["op_key"])
+        op_new = find_operation(new, finding["op_key"])
+        if op_new is None:
+            return UNDECIDABLE, "the operation is absent from the new spec"
+        # `requestBody` is frequently a $ref into components/requestBodies, and
+        # `required` lives on the TARGET. Reading the flag off the reference
+        # object sees nothing and would refute every one of them.
+        body_new = follow(new, op_new.get("requestBody"))
+        now = bool(body_new.get("required")) if isinstance(body_new, dict) else False
+        if not now:
+            return REFUTED, "the new spec does not mark the request body required"
+        if op_old is None:
+            return UNDECIDABLE, "the operation is absent from the old spec"
+        body_old = follow(old, op_old.get("requestBody"))
+        if not isinstance(body_old, dict):
+            return CONFIRMED, ("the old operation took no request body at all "
+                               "and the new one requires it")
+        was = bool(body_old.get("required"))
+        if was:
+            return REFUTED, "the request body was already required"
+        return CONFIRMED, "request body optional at old, required at new"
 
     if kind == "operation_server_changed":
         # Resolved here from the raw document, with this checker's own reading

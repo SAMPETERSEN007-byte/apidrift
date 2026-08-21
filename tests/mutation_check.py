@@ -1244,6 +1244,122 @@ MUTATIONS = [
         "    traced = []\n    if traced:\n        return traced, \"\"",
         ["test_a_traced_read_stands_ALONE_when_the_path_does_not_match"],
     ),
+    # ---------------------------------------------------------------------
+    # The blind spots: kinds the checker could not decide AT ALL. Every one of
+    # these behaviours turns an UNDECIDABLE into a decision, so each gets a
+    # mutation in BOTH directions -- disable it and the "this IS decidable"
+    # test reddens; make it decide unconditionally and the "abstain here" test
+    # reddens. A decider with only the first half is a guess nobody is
+    # checking.
+    # ---------------------------------------------------------------------
+    (
+        "the checker addresses operations by parameter NAME again",
+        "tests/measure_precision.py",
+        "    item = find_path_item(doc, path)\n    if item is None:",
+        "    item = (doc.get(\"paths\") or {}).get(path)\n    if not isinstance(item, dict):",
+        ["test_a_renamed_path_parameter_still_finds_the_operation"],
+    ),
+    (
+        "the checker GUESSES which of two same-template paths was meant",
+        "tests/measure_precision.py",
+        "    return candidates[0] if len(candidates) == 1 else None",
+        "    return candidates[0] if candidates else None",
+        ["test_two_paths_sharing_a_template_stay_UNDECIDABLE"],
+    ),
+    (
+        "the checker stops stripping a schema head off a field path",
+        "tests/measure_precision.py",
+        "            tail = strip_schema_head(parts, old, new, old_body)",
+        "            tail = None",
+        ["test_a_schema_qualified_root_is_walked_through_the_BODY"],
+    ),
+    (
+        "the head strip drops its guard that the BODY uses that schema",
+        "tests/measure_precision.py",
+        "    if head not in body_roots_at(old, old_body):\n        return None",
+        "    if False:\n        return None",
+        ["test_a_head_the_BODY_does_not_use_is_not_stripped"],
+    ),
+    (
+        "the checker reads a multi-arm allOf as an empty schema again",
+        "tests/measure_precision.py",
+        "    if isinstance(prop.get(\"allOf\"), list) and prop[\"allOf\"]:\n        return effective_shape(merge_all_of(prop, doc), doc, depth + 1)",
+        "    if isinstance(prop.get(\"allOf\"), list) and len(prop[\"allOf\"]) == 1 and \"properties\" not in prop:\n        return effective_shape(prop[\"allOf\"][0], doc, depth + 1)",
+        ["test_an_allOf_is_read_as_an_intersection_not_as_nothing",
+         "test_a_field_relocated_between_allOf_arms_is_refuted"],
+    ),
+    (
+        "nullability stops being part of the shape a caller sees",
+        "tests/measure_precision.py",
+        "    if prop.get(\"nullable\") is True:\n        rest = {k: v for k, v in prop.items() if k != \"nullable\"}",
+        "    if False:\n        rest = {k: v for k, v in prop.items() if k != \"nullable\"}",
+        ["test_dropping_nullable_from_an_allOf_arm_is_confirmed",
+         "test_dropping_nullable_from_the_field_itself_is_confirmed"],
+    ),
+    (
+        "the allOf merge drops a nullable declared in an arm",
+        "tests/measure_precision.py",
+        "        if target.get(\"nullable\") is True:\n            merged[\"nullable\"] = True",
+        "        if False:\n            merged[\"nullable\"] = True",
+        ["test_dropping_nullable_from_an_allOf_arm_is_confirmed"],
+    ),
+    (
+        "everything nullable is called a change, whatever the other side says",
+        "tests/measure_precision.py",
+        "        return (\"nullable\", effective_shape(rest, doc, depth + 1))",
+        "        return (\"nullable\", id(prop))",
+        ["test_nullable_on_both_sides_is_still_refuted"],
+    ),
+    (
+        "the allOf merge takes the first arm instead of intersecting them all",
+        "tests/measure_precision.py",
+        "    for arm in prop.get(\"allOf\") or []:\n        # Resolve the arm's whole reference chain",
+        "    for arm in (prop.get(\"allOf\") or [])[:1]:\n        # Resolve the arm's whole reference chain",
+        ["test_a_field_relocated_between_allOf_arms_is_refuted"],
+    ),
+    (
+        "the checker cannot see a parameter's enum again",
+        "tests/measure_precision.py",
+        "            if was_param is not None and now_param is not None:",
+        "            if False:",
+        ["test_a_dropped_parameter_enum_value_is_confirmed",
+         "test_a_referenced_parameter_is_resolved"],
+    ),
+    (
+        "the checker confirms a parameter that stopped constraining anything",
+        "tests/measure_precision.py",
+        "                if after is None:\n                    return REFUTED, (\n                        f\"parameter `{name}` no longer constrains its value \"",
+        "                if after is None and False:\n                    return REFUTED, (\n                        f\"parameter `{name}` no longer constrains its value \"",
+        ["test_dropping_the_enum_KEYWORD_widens_and_is_refuted"],
+    ),
+    (
+        "the checker stops reading the engine's arm markers off a subject",
+        "tests/measure_precision.py",
+        "    return _ARM_MARKER.sub(\"\", subject).replace(\"..\", \".\").strip(\".\")",
+        "    return subject",
+        ["test_an_uncollapsed_subject_is_still_addressable"],
+    ),
+    (
+        "the required flag is read off the reference instead of its target",
+        "tests/measure_precision.py",
+        "        body_new = follow(new, op_new.get(\"requestBody\"))",
+        "        body_new = op_new.get(\"requestBody\")",
+        ["test_the_required_flag_is_read_through_a_reference"],
+    ),
+    (
+        "the checker compares server URLs without expanding their variables",
+        "tests/measure_precision.py",
+        "                for name, spec in (entry.get(\"variables\") or {}).items():",
+        "                for name, spec in {}.items():",
+        ["test_a_templated_url_is_expanded_before_comparing"],
+    ),
+    (
+        "the checker decides a base URL move with no servers block to read",
+        "tests/measure_precision.py",
+        "        was, now = bases(old), bases(new)\n        if was is None or now is None:",
+        "        was, now = bases(old) or set(), bases(new) or set()\n        if False:",
+        ["test_a_missing_servers_block_is_UNDECIDABLE_not_refuted"],
+    ),
 ]
 
 
