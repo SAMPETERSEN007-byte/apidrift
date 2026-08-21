@@ -147,13 +147,20 @@ def parse_document(raw: bytes, filename: str) -> Dict[str, Any]:
     text = raw.decode("utf-8", errors="replace")
     if filename.endswith(".json"):
         try:
-            return json.loads(text)
+            doc = json.loads(text)
         except json.JSONDecodeError as exc:
             raise SpecParseError(f"{filename}: invalid JSON: {exc}") from exc
-    try:
-        doc = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        raise SpecParseError(f"{filename}: invalid YAML: {exc}") from exc
+    else:
+        try:
+            doc = yaml.safe_load(text)
+        except yaml.YAMLError as exc:
+            raise SpecParseError(f"{filename}: invalid YAML: {exc}") from exc
+    # This guard covered the YAML branch only, so a JSON ARRAY sailed past it
+    # and this function returned a list while promising a mapping. `load_spec`
+    # then reached `doc.get(...)` and raised AttributeError, which is not a
+    # SpecParseError -- so `analyse` did not catch it and one stray file inside
+    # a vendor's glob took that whole vendor down with a stack trace. Found by
+    # pointing a probe at a repo whose matching file was a bare JSON array.
     if not isinstance(doc, dict):
         raise SpecParseError(f"{filename}: top level is {type(doc).__name__}, expected mapping")
     return doc

@@ -1074,6 +1074,14 @@ MUTATIONS = [
         "        if False:\n            return UNDECIDABLE, \"\"",
         ["test_a_path_absent_from_the_OLD_spec_is_undecidable"],
     ),
+    (
+        "a non-mapping document crashes the loader again",
+        "apidrift/loader.py",
+        "    if not isinstance(doc, dict):\n        raise SpecParseError(f\"{filename}: top level is {type(doc).__name__}, expected mapping\")",
+        "    if False:\n        raise SpecParseError(\"\")",
+        ["test_a_json_array_is_a_parse_error_not_a_crash",
+         "test_a_yaml_scalar_is_a_parse_error_not_a_crash"],
+    ),
 ]
 
 

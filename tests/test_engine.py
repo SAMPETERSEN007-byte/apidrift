@@ -1703,3 +1703,28 @@ class TestRenamedResponseSchemaMayCarryMore(unittest.TestCase):
         self.assertFalse(_shape_presents(bigger, smaller), "losing one is not")
         self.assertFalse(_shape_presents(("scalar", "string"), ("scalar", "integer")),
                          "a scalar has to match exactly")
+
+
+class TestLoaderRejectsNonMappings(unittest.TestCase):
+    """A document that parses but is not a mapping is not a spec.
+
+    It used to reach `doc.get(...)` and raise AttributeError, which is not a
+    SpecParseError, so `analyse` did not catch it: one stray file inside a
+    vendor's glob took that whole vendor down with a stack trace instead of
+    being reported and skipped. Found by a probe pointing a glob at a repo
+    whose matching file was a bare JSON array.
+    """
+
+    def test_a_json_array_is_a_parse_error_not_a_crash(self):
+        from apidrift.loader import SpecParseError, load_spec
+        with self.assertRaises(SpecParseError):
+            load_spec(b'[{"openapi": "3.0.0"}]', "list.json")
+
+    def test_a_yaml_scalar_is_a_parse_error_not_a_crash(self):
+        from apidrift.loader import SpecParseError, load_spec
+        with self.assertRaises(SpecParseError):
+            load_spec(b"just a string\n", "scalar.yaml")
+
+    def test_a_real_spec_still_loads(self):
+        """The control: the guard must reject non-mappings, not everything."""
+        self.assertTrue(spec(copy.deepcopy(BASE)).operations)
