@@ -32,6 +32,94 @@ VENDORS: Dict[str, Vendor] = {
     # tying a file to THIS vendor, a matching path is a coincidence. Keep them
     # specific: `github.` matches everything, `api.github.com` does not.
     # ---------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # Added 2026-08-21. Every one was verified by `tools/vendor_probe.py`
+    # before it was written here: the repo exists, the glob matches, what it
+    # matches parses, and the history reaches past the window. The operation
+    # count is in the commit message -- a glob that yields three operations is
+    # a wrong glob and only the count says so.
+    #
+    # `evidence` is still the precision-critical field. Keep the markers
+    # specific: `box.` matches everything, `api.box.com` does not.
+    # ---------------------------------------------------------------------
+    "hubspot": Vendor(
+        key="hubspot", name="HubSpot",
+        repo="HubSpot/HubSpot-public-api-spec-collection",
+        spec_path="PublicApiSpecs/*/*/Rollouts/*/*.json",
+        docs_url="https://developers.hubspot.com/docs/api/overview",
+        version_prefixes=("/crm/v3", "/crm/v4", "/marketing/v3"),
+        evidence=("import hubspot", "from hubspot", "@hubspot/api-client",
+                  "api.hubapi.com", "HUBSPOT_ACCESS_TOKEN", "HUBSPOT_API_KEY"),
+    ),
+    "telnyx": Vendor(
+        key="telnyx", name="Telnyx", repo="team-telnyx/openapi",
+        spec_path="openapi/spec3.json", docs_url="https://developers.telnyx.com/api",
+        version_prefixes=("/v2",),
+        evidence=("import telnyx", "from telnyx", "require('telnyx')",
+                  'require("telnyx")', "api.telnyx.com", "TELNYX_API_KEY"),
+    ),
+    "pagerduty": Vendor(
+        key="pagerduty", name="PagerDuty", repo="PagerDuty/api-schema",
+        spec_path="reference/REST/openapiv3.json",
+        docs_url="https://developer.pagerduty.com/api-reference/",
+        evidence=("import pdpyras", "from pdpyras", "@pagerduty/pdjs",
+                  "api.pagerduty.com", "PAGERDUTY_API_KEY", "PAGERDUTY_TOKEN"),
+    ),
+    "docusign": Vendor(
+        key="docusign", name="DocuSign", repo="docusign/OpenAPI-Specifications",
+        spec_path="esignature.rest.swagger-v2.1.json",
+        docs_url="https://developers.docusign.com/docs/esign-rest-api/reference/",
+        version_prefixes=("/v2.1",),
+        evidence=("import docusign_esign", "from docusign_esign", "docusign-esign",
+                  "docusign.net/restapi", "DOCUSIGN_ACCOUNT_ID",
+                  "DOCUSIGN_INTEGRATION_KEY"),
+    ),
+    "box": Vendor(
+        key="box", name="Box", repo="box/box-openapi", spec_path="openapi.json",
+        docs_url="https://developer.box.com/reference/",
+        version_prefixes=("/2.0",),
+        evidence=("import boxsdk", "from boxsdk", "box-node-sdk",
+                  "api.box.com", "upload.box.com", "BOX_CLIENT_ID"),
+    ),
+    "asana": Vendor(
+        key="asana", name="Asana", repo="Asana/openapi",
+        spec_path="defs/asana_oas.yaml",
+        docs_url="https://developers.asana.com/reference/rest-api-reference",
+        version_prefixes=("/api/1.0",),
+        evidence=("import asana", "from asana", "require('asana')",
+                  'require("asana")', "app.asana.com/api", "ASANA_ACCESS_TOKEN"),
+    ),
+    "xero": Vendor(
+        key="xero", name="Xero Accounting", repo="XeroAPI/Xero-OpenAPI",
+        spec_path="xero_accounting.yaml",
+        docs_url="https://developer.xero.com/documentation/api/accounting/overview",
+        version_prefixes=("/api.xro/2.0",),
+        evidence=("from xero_python", "import xero_python", "xero-node",
+                  "api.xero.com", "XERO_CLIENT_ID", "XERO_CLIENT_SECRET"),
+    ),
+    "lithic": Vendor(
+        key="lithic", name="Lithic", repo="lithic-com/lithic-openapi",
+        spec_path="lithic-openapi.yml", docs_url="https://docs.lithic.com/reference",
+        version_prefixes=("/v1",),
+        evidence=("import lithic", "from lithic", "require('lithic')",
+                  'require("lithic")', "api.lithic.com", "sandbox.lithic.com",
+                  "LITHIC_API_KEY"),
+    ),
+    "recurly": Vendor(
+        key="recurly", name="Recurly", repo="recurly/recurly-client-python",
+        spec_path="openapi/api.yaml", docs_url="https://recurly.com/developers/api/",
+        version_prefixes=("/sites",),
+        evidence=("import recurly", "from recurly", "require('recurly')",
+                  'require("recurly")', "v3.recurly.com", "RECURLY_API_KEY"),
+    ),
+    "deepgram": Vendor(
+        key="deepgram", name="Deepgram", repo="deepgram/deepgram-api-specs",
+        spec_path="openapi.yml", docs_url="https://developers.deepgram.com/reference/",
+        version_prefixes=("/v1",),
+        evidence=("import deepgram", "from deepgram", "@deepgram/sdk",
+                  "api.deepgram.com", "DEEPGRAM_API_KEY"),
+    ),
+
     "square": Vendor(
         key="square", name="Square", repo="square/connect-api-specification",
         spec_path="api.json", docs_url="https://developer.squareup.com/reference/square",
