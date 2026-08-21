@@ -806,6 +806,20 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
             parts = [p for p in root.replace("[]", ".[].").split(".") if p]
             in_old, _ = walk_properties(old_schema, parts, old)
             in_new, _ = walk_properties(new_schema, parts, new)
+            if not (in_old or in_new) and parts:
+                # `collapse()` rewrites root_cause to a SCHEMA-qualified path:
+                # `<secrets-store_store_response>.result.id` becomes
+                # `secrets-store_store_response.result.id`. The head is a
+                # schema NAME, never a property, so walking it through the
+                # operation body finds nothing on either side -- and the
+                # fall-through then answers a DOCUMENT-scoped question ("is
+                # that schema still defined and does it still hold the
+                # field?"), which says "present in both" precisely when the
+                # vendor changed WHICH SCHEMA THE OPERATION RETURNS. Same
+                # schema-name defect as `schema_removed`, in a fallback path.
+                if parts[0] in (schemas_of(old) | schemas_of(new)) and parts[1:]:
+                    in_old, _ = walk_properties(old_schema, parts[1:], old)
+                    in_new, _ = walk_properties(new_schema, parts[1:], new)
             if in_old and not in_new:
                 return CONFIRMED, f"`{root}` present at old, absent at new"
             if in_old or in_new:

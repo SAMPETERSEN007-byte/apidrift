@@ -997,6 +997,62 @@ MUTATIONS = [
         "    if False:\n        return _view_shape(before, old) == _view_shape(after, new)",
         ["test_the_widening_rule_applies_only_to_what_a_caller_READS"],
     ),
+    # ---------------------------------------------------------------------
+    # The CHECKER. Layer 3 of the gate caught the largest defects this engine
+    # has had and nothing verified it until now: a silent break here makes the
+    # layer report 100% while checking nothing, which is the failure mode it
+    # exists to catch, one level up.
+    # ---------------------------------------------------------------------
+    (
+        "the checker asks the engine's question about a removed schema again",
+        "tests/measure_precision.py",
+        "    if kind == \"schema_removed\":\n        return check_schema_removed(finding, old, new)",
+        "    if kind == \"schema_removed\":\n        n = finding.get(\"root_cause\") or finding[\"subject\"]\n        return ((CONFIRMED, \"present at old, absent at new\")\n                if n in schemas_of(old) and n not in schemas_of(new)\n                else (REFUTED, \"still there\"))",
+        ["test_an_inlined_schema_is_refuted",
+         "test_a_dereferenced_document_is_UNDECIDABLE_not_refuted"],
+    ),
+    (
+        "the checker drops the dereferenced-document control",
+        "tests/measure_precision.py",
+        "        linked = len(ref_sites(old, None))\n        if linked == 0:",
+        "        linked = len(ref_sites(old, None))\n        if False:",
+        ["test_a_dereferenced_document_is_UNDECIDABLE_not_refuted"],
+    ),
+    (
+        "the checker stops treating a discriminator mapping as a reference",
+        "tests/measure_precision.py",
+        "        disc = node.get(\"discriminator\")\n        if isinstance(disc, dict) and isinstance(disc.get(\"mapping\"), dict):",
+        "        disc = node.get(\"discriminator\")\n        if False:",
+        ["test_a_discriminator_mapping_counts_as_a_reference"],
+    ),
+    (
+        "the checker resolves a schema-qualified root against the schema table",
+        "tests/measure_precision.py",
+        "                if parts[0] in (schemas_of(old) | schemas_of(new)) and parts[1:]:",
+        "                if False:",
+        ["test_a_schema_qualified_root_is_decided_against_the_OPERATION"],
+    ),
+    (
+        "the checker resolves every response against the 200 body",
+        "tests/measure_precision.py",
+        "            node = responses.get(status) if status else None",
+        "            node = None",
+        ["test_the_named_response_status_is_the_one_resolved"],
+    ),
+    (
+        "the checker refutes a path parameter's TYPE change on positionality",
+        "tests/measure_precision.py",
+        "        if entry.get(\"in\") == \"path\" and kind != \"param_type_changed\":",
+        "        if entry.get(\"in\") == \"path\":",
+        ["test_a_path_parameter_type_change_is_decided_on_the_TYPE"],
+    ),
+    (
+        "the checker ignores an operation's own servers",
+        "tests/measure_precision.py",
+        "            for node in (op if isinstance(op, dict) else {}, item, doc):",
+        "            for node in (doc,):",
+        ["test_a_host_move_on_one_operation_is_confirmed"],
+    ),
 ]
 
 
