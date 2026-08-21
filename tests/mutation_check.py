@@ -1104,9 +1104,9 @@ MUTATIONS = [
     (
         "an unterminated string is guessed at instead of reported",
         "apidrift/js.py",
-        "            raise UnreadableSource(f\"unterminated string at line {line}\")\n        chunks.append(char)",
-        "            return index + 1, line, \"\".join(chunks)\n        chunks.append(char)",
-        ["test_an_unterminated_string_is_reported_not_guessed"],
+        "    if strict:\n        raise UnreadableSource(f\"unterminated string at line {line}\")\n    return start + 1, line, \"\"",
+        "    return start + 1, line, \"\"",
+        ["test_a_string_running_to_END_OF_FILE_is_reported"],
     ),
     (
         "import.meta is treated as an import declaration again",
@@ -1192,6 +1192,36 @@ MUTATIONS = [
         "        for form in (f\"from '{package}'\", f'from \"{package}\"',",
         "        for form in (f\"from\", f'from \"{package}\"',",
         ["test_an_unrelated_package_is_not_evidence"],
+    ),
+    (
+        "JSX text is tokenised as code again",
+        "apidrift/js.py",
+        "        if char == \"<\" and regex_allowed() and _jsx_starts_here(source, index):",
+        "        if False:",
+        ["test_an_apostrophe_in_jsx_text_is_not_a_string",
+         "test_an_apostrophe_inside_a_jsx_EXPRESSION_child_is_not_a_string"],
+    ),
+    (
+        "any < starts a JSX element",
+        "apidrift/js.py",
+        "    return bool(_JSX_TAG_START.match(source, index))",
+        "    return True",
+        ["test_only_a_tag_name_or_a_fragment_opens_JSX"],
+    ),
+    (
+        "code inside a JSX expression is skipped as text",
+        "apidrift/js.py",
+        "        if char == \"{\":\n            index, line = _tokenize_embedded(source, index, line, out)\n            continue\n        index += 1          # text child: prose, not code",
+        "        index += 1          # text child: prose, not code",
+        ["test_code_inside_a_jsx_CHILD_is_still_read"],
+    ),
+    (
+        "the scanner relaxation leaks into the real tokeniser",
+        "apidrift/js.py",
+        "            if strict:\n                raise UnreadableSource(f\"unterminated string at line {line}\")",
+        "            if False:\n                raise UnreadableSource(f\"unterminated string at line {line}\")",
+        ["test_an_unterminated_string_is_reported_not_guessed",
+         "test_an_unterminated_string_in_real_code_still_raises"],
     ),
 ]
 

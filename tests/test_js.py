@@ -54,6 +54,13 @@ class TestTokenizer(unittest.TestCase):
         with self.assertRaises(UnreadableSource):
             tokenize("const a = 'oops\nconst b = 2;")
 
+    def test_a_string_running_to_END_OF_FILE_is_reported(self):
+        """A different branch from the newline case: the file simply ends
+        inside the quote. Covered separately because the two exits are
+        separate, and the newline one was doing all the work."""
+        with self.assertRaises(UnreadableSource):
+            tokenize("const a = 'oops")
+
     def test_an_unterminated_template_is_reported(self):
         with self.assertRaises(UnreadableSource):
             tokenize("const a = `oops;")
@@ -138,6 +145,94 @@ class TestCallSites(unittest.TestCase):
         module = analyse("const v = resp?.data?.card?.iin;")
         reads = {(r.base, r.path) for r in module.reads}
         self.assertIn(("resp", ("data", "card", "iin")), reads)
+
+
+class TestJSX(unittest.TestCase):
+    """JSX text is prose, and prose has apostrophes.
+
+    `We've just migrated` opened a string that never closed, and the tokeniser
+    correctly reported the file unreadable -- correctly and uselessly, because
+    React components are exactly the TypeScript that calls these APIs. Measured
+    across 181 real files: this was the only one that could not be read.
+    """
+
+    def test_an_apostrophe_in_jsx_text_is_not_a_string(self):
+        module = analyse(
+            "const C = () => <p>We've just migrated</p>;\n"
+            "const s = await stripe.customers.create({ email });\n")
+        self.assertIn("stripe.customers.create",
+                      {".".join(c.chain) for c in module.calls})
+
+    def test_an_apostrophe_inside_a_jsx_EXPRESSION_child_is_not_a_string(self):
+        """The shape that actually occurred: `{cond && (<div>We've</div>)}`.
+        The brace-matching scanner walked the text looking for the closing
+        brace and read the apostrophe as a quote, while the tokeniser one
+        level down would have handled it correctly."""
+        module = analyse(
+            "const C = () => (\n"
+            "  <div>\n"
+            "    {show && (\n"
+            "      <p style={{ a: '1' }}>We've done it</p>\n"
+            "    )}\n"
+            "  </div>\n"
+            ");\n"
+            "const s = await stripe.customers.create({ email });\n")
+        self.assertIn("stripe.customers.create",
+                      {".".join(c.chain) for c in module.calls})
+
+    def test_code_inside_a_jsx_ATTRIBUTE_is_still_read(self):
+        """Skipping JSX must not skip the CODE in it. A call inside an
+        `onClick` is a call."""
+        module = analyse(
+            "const C = () => <button onClick={() => "
+            "stripe.customers.create({ email })}>Go</button>;\n")
+        self.assertIn("stripe.customers.create",
+                      {".".join(c.chain) for c in module.calls})
+
+    def test_code_inside_a_jsx_CHILD_is_still_read(self):
+        """A different branch from the attribute case: children are skipped as
+        text until a `{`, and what follows that brace is code."""
+        module = analyse(
+            "const C = () => <div>{stripe.customers.create({ email })}</div>;\n")
+        self.assertIn("stripe.customers.create",
+                      {".".join(c.chain) for c in module.calls})
+
+    def test_only_a_tag_name_or_a_fragment_opens_JSX(self):
+        """Asserted on the predicate directly.
+
+        In valid JavaScript `regex_allowed()` already does nearly all of this
+        work -- a comparison only ever follows a value -- so no source I can
+        write makes the pipeline disagree. The guard still has to hold, because
+        it is what stops a stray `<` consuming the rest of the file, and the
+        honest place to pin a property no end-to-end input can reach is where
+        it lives.
+        """
+        from apidrift.js import _jsx_starts_here
+        for source in ("<div>", "<>", "<Foo.Bar>", "<svg:rect>"):
+            self.assertTrue(_jsx_starts_here(source, 0), source)
+        for source in ("< 5", "<= b", "<< 2", "<3"):
+            self.assertFalse(_jsx_starts_here(source, 0), source)
+
+    def test_a_comparison_is_not_mistaken_for_a_tag(self):
+        """The control. `regex_allowed()` is the discriminator, and it must
+        keep `a < b` and `Array<string>` out of JSX mode -- both appear only
+        after a value, where an expression cannot start."""
+        module = analyse(
+            "const smaller = a < b;\n"
+            "const list: Array<string> = [];\n"
+            "const s = await stripe.customers.create({ email });\n")
+        self.assertIn("stripe.customers.create",
+                      {".".join(c.chain) for c in module.calls})
+
+    def test_an_unterminated_string_in_real_code_still_raises(self):
+        """The scanner relaxation must not reach the tokeniser. An actually
+        unterminated string is still unreadable."""
+        with self.assertRaises(UnreadableSource):
+            analyse("const C = () => <div>{ 'oops\n }</div>;\n")
+
+    def test_an_unclosed_jsx_element_is_reported(self):
+        with self.assertRaises(UnreadableSource):
+            analyse("const C = () => <div><p>forever</p>;\n")
 
 
 class TestVersionPins(unittest.TestCase):

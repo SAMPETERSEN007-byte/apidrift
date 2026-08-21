@@ -131,6 +131,20 @@ def tokenize(source: str) -> List[Token]:
             out.append(token)
             last_significant = token
             continue
+        if char == "<" and regex_allowed() and _jsx_starts_here(source, index):
+            # JSX. Its TEXT children are prose, not code: `We've just migrated`
+            # opens a string that never closes, and the tokeniser correctly
+            # reported the file unreadable -- correctly, and uselessly, because
+            # React components are exactly the TypeScript that calls these APIs.
+            #
+            # `regex_allowed()` is the discriminator, and it is the right one:
+            # JSX only appears where an expression may START (`return <div>`,
+            # `= <div>`, `(<div>`), while a comparison or a generic
+            # (`a < b`, `Array<string>`) only appears after a value, where it
+            # is False. Nothing else in the language is `<` in that position.
+            index, line = _skip_jsx(source, index, line, out)
+            last_significant = out[-1] if out else last_significant
+            continue
         if char == "/" and regex_allowed():
             try:
                 index, text = _read_regex(source, index)
@@ -167,7 +181,119 @@ def tokenize(source: str) -> List[Token]:
     return out
 
 
-def _read_string(source: str, index: int, line: int, quote: str) -> Tuple[int, int, str]:
+_JSX_TAG_START = re.compile(r"<\s*(?:>|[A-Za-z_$][A-Za-z0-9_$.:-]*)")
+
+
+def _jsx_starts_here(source: str, index: int) -> bool:
+    """Is this `<` opening a JSX element rather than a comparison?
+
+    Requires a tag name or a fragment immediately after it. `< 5` is not JSX.
+    """
+    return bool(_JSX_TAG_START.match(source, index))
+
+
+def _skip_jsx(source: str, index: int, line: int,
+              out: List[Token]) -> Tuple[int, int]:
+    """Consume a JSX element, tokenising only the CODE inside it.
+
+    Attribute values and `{...}` children are real expressions and are handed
+    back to the tokeniser; tag names and text children are skipped. Depth is
+    tracked so nested elements close correctly, and an element that never
+    closes still raises rather than silently ending the file early.
+    """
+    depth = 0
+    size = len(source)
+    while index < size:
+        char = source[index]
+        if char == "\n":
+            line += 1
+            index += 1
+            continue
+        if source.startswith("</", index):
+            end = source.find(">", index)
+            if end < 0:
+                raise UnreadableSource(f"unterminated JSX element at line {line}")
+            line += source.count("\n", index, end)
+            index = end + 1
+            depth -= 1
+            if depth <= 0:
+                return index, line
+            continue
+        if char == "<" and _jsx_starts_here(source, index):
+            index, line, self_closing = _skip_jsx_tag(source, index, line, out)
+            if not self_closing:
+                depth += 1
+            elif depth == 0:
+                return index, line
+            continue
+        if char == "{":
+            index, line = _tokenize_embedded(source, index, line, out)
+            continue
+        index += 1          # text child: prose, not code
+    raise UnreadableSource(f"unterminated JSX element at line {line}")
+
+
+def _skip_jsx_tag(source: str, index: int, line: int,
+                  out: List[Token]) -> Tuple[int, int, bool]:
+    """Consume `<Tag attr="x" other={expr}>`. Returns (index, line, self_closing)."""
+    index += 1
+    size = len(source)
+    while index < size:
+        char = source[index]
+        if char == "\n":
+            line += 1
+            index += 1
+            continue
+        if char in "\"'":
+            index, line, _ = _read_string(source, index, line, char)
+            continue
+        if char == "{":
+            index, line = _tokenize_embedded(source, index, line, out)
+            continue
+        if source.startswith("/>", index):
+            return index + 2, line, True
+        if char == ">":
+            return index + 1, line, False
+        index += 1
+    raise UnreadableSource(f"unterminated JSX tag at line {line}")
+
+
+def _tokenize_embedded(source: str, index: int, line: int,
+                       out: List[Token]) -> Tuple[int, int]:
+    """A `{...}` expression inside JSX: real code, tokenised as such."""
+    depth = 0
+    start = index
+    size = len(source)
+    while index < size:
+        char = source[index]
+        if char == "\n":
+            line += 1
+        elif char in "\"'":
+            index, line, _ = _read_string(source, index, line, char, strict=False)
+            continue
+        elif char == "`":
+            index, line, _ = _read_template(source, index, line)
+            continue
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                inner = source[start + 1:index]
+                # Line numbers inside the expression are relative to the
+                # expression, so they are re-based onto the file.
+                base = line - inner.count("\n")
+                for token in tokenize(inner):
+                    out.append(Token(token.kind, token.text,
+                                     token.line + base - 1))
+                return index + 1, line
+        index += 1
+    raise UnreadableSource(f"unterminated JSX expression at line {line}")
+
+
+def _read_string(source: str, index: int, line: int, quote: str,
+                 strict: bool = True) -> Tuple[int, int, str]:
+    start = index
     index += 1
     chunks: List[str] = []
     while index < len(source):
@@ -181,10 +307,22 @@ def _read_string(source: str, index: int, line: int, quote: str) -> Tuple[int, i
         if char == "\n":
             # A newline inside a normal string is a syntax error in JS; treat
             # it as unreadable rather than guessing where the string ended.
-            raise UnreadableSource(f"unterminated string at line {line}")
+            #
+            # Except when only SCANNING for a matching brace. JSX text is
+            # prose -- `We've just migrated` -- and every apostrophe in it
+            # looks like a quote to a scanner that is not parsing. The
+            # guarantee is not weakened by this: the recursive tokenise of the
+            # same region is strict and still raises, so an actually
+            # unterminated string inside the expression is still caught. This
+            # only stops the SCANNER mistaking an apostrophe for one.
+            if strict:
+                raise UnreadableSource(f"unterminated string at line {line}")
+            return start + 1, line, ""
         chunks.append(char)
         index += 1
-    raise UnreadableSource(f"unterminated string at line {line}")
+    if strict:
+        raise UnreadableSource(f"unterminated string at line {line}")
+    return start + 1, line, ""
 
 
 def _read_template(source: str, index: int, line: int) -> Tuple[int, int, str]:
