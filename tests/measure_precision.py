@@ -1431,16 +1431,38 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
                 break
 
         def prop(doc):
+            """The named property, following `allOf` as deep as it goes.
+
+            One level was not enough. OpenAI composes
+            `CreateResponse -> CreateModelResponseProperties ->
+            ModelResponseProperties`, so `prompt_cache_key` sits two arms down
+            and this returned None -- which the nullability branch then read as
+            "not nullable" and REFUTED. A property you could not LOCATE is
+            undecidable; calling it refuted is the same error as calling a
+            failed search an absence, in the direction that flatters the
+            checker.
+            """
+            seen = set()
+
+            def collect(node, depth=0):
+                if not isinstance(node, dict) or depth > 6:
+                    return {}
+                props = dict(node.get("properties") or {})
+                for arm in node.get("allOf") or []:
+                    target = arm
+                    if isinstance(arm, dict) and "$ref" in arm:
+                        name = str(arm["$ref"]).rsplit("/", 1)[-1]
+                        if name in seen:
+                            continue
+                        seen.add(name)
+                        target = schemas_of(doc).get(name)
+                    props.update(collect(target, depth + 1))
+                return props
+
             node = schemas_of(doc).get(schema_name)
             if not isinstance(node, dict):
                 return None
-            props = dict(node.get("properties") or {})
-            for arm in node.get("allOf") or []:
-                target = schemas_of(doc).get(str(arm.get("$ref", "")).rsplit("/", 1)[-1]) \
-                    if "$ref" in arm else arm
-                if isinstance(target, dict):
-                    props.update(target.get("properties") or {})
-            return props.get(field_name)
+            return collect(node).get(field_name)
 
         if schema_name is None:
             # A QUERY or PATH parameter's enum lives in `parameters`, not in a
@@ -1493,19 +1515,51 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
         else:
             before_prop, after_prop = prop(old), prop(new)
         if kind == "schema_field_now_nullable":
-            def nullable(node, doc):
-                if not isinstance(node, dict):
-                    return None
+            def nullable(node, doc, depth=0):
+                """Can a consumer see null here?
+
+                Three spellings, and the checker knew only two. OpenAPI 3.1
+                DELETED the `nullable` keyword: `{type: string, nullable: true}`
+                becomes `{anyOf: [{type: string}, {type: "null"}]}`. OpenAI
+                migrated dialects mid-window and `FunctionCallOutputItemParam
+                .call_id` went from a bare string to exactly that union -- it
+                really did become nullable, and this function answered False
+                for the new document and refuted all thirteen.
+
+                Written from the raw node, with its own recursion, because the
+                engine's answer is what is on trial. This is the sixth time a
+                checker sharing the engine's blind spot has produced a number
+                that was not a measurement; sharing the FIX would be the same
+                mistake wearing the opposite sign.
+                """
+                if not isinstance(node, dict) or depth > 4:
+                    return None if not isinstance(node, dict) else False
                 if node.get("nullable") is True:
                     return True
                 t = node.get("type")
                 if isinstance(t, list):
                     return "null" in t
+                if t == "null":
+                    return True
+                for keyword in ("anyOf", "oneOf"):
+                    members = node.get(keyword)
+                    if isinstance(members, list):
+                        if any(nullable(m, doc, depth + 1) for m in members):
+                            return True
+                arms = node.get("allOf")
+                if isinstance(arms, list):
+                    if any(nullable(a, doc, depth + 1) for a in arms):
+                        return True
                 ref = node.get("$ref")
                 if isinstance(ref, str):
-                    return nullable(schemas_of(doc).get(ref.rsplit("/", 1)[-1]), doc)
+                    return nullable(schemas_of(doc).get(ref.rsplit("/", 1)[-1]),
+                                    doc, depth + 1)
                 return False
             was, now = nullable(before_prop, old), nullable(after_prop, new)
+            if was is None or now is None:
+                return UNDECIDABLE, (
+                    f"could not locate `{field_name}` on `{schema_name}` in "
+                    f"{'the old' if was is None else 'the new'} document")
             if now and not was:
                 return CONFIRMED, "became nullable"
             return REFUTED, f"nullable old={was} new={now}"

@@ -20,8 +20,8 @@ MUTATIONS = [
     (
         "a spec with no history behind it goes back to reading as clean",
         "apidrift/scan.py",
-        "        if result.unmeasured or result.short_history:",
-        "        if result.unmeasured:",
+        "        if (result.unmeasured or result.short_history or result.pinned\n                or result.incidental):",
+        "        if result.unmeasured or result.pinned or result.incidental:",
         ["test_a_quiet_result_over_unseen_history_is_not_called_clean"],
     ),
     (
@@ -62,8 +62,8 @@ MUTATIONS = [
     (
         "an unmeasured language reported as clean again",
         "apidrift/scan.py",
-        "        if result.unmeasured or result.short_history:",
-        "        if result.short_history:",
+        "        if (result.unmeasured or result.short_history or result.pinned\n                or result.incidental):",
+        "        if result.short_history or result.pinned or result.incidental:",
         ["test_the_word_clean_is_never_printed_over_an_unmeasured_language"],
     ),
     (
@@ -104,8 +104,8 @@ MUTATIONS = [
     (
         "relevance stops requiring the repo to call the resource",
         "apidrift/dependence.py",
-        "    sdk = find_sdk_calls(tree, idioms, lines)\n    if sdk:\n        return sdk[:3], \"\"\n    return [], (f\"calls nothing on",
-        "    sdk = find_sdk_calls(tree, idioms, lines)\n    return sdk[:3] or [Proof(kind=OPERATION_CALL, line=1, text=\"\")], (f\"calls nothing on",
+        "    sdk = find_sdk_calls(tree, idioms, lines, vendor, _assignments_of(tree))\n    if sdk:\n        return sdk[:3], \"\"\n    return [], (f\"calls nothing on",
+        "    sdk = find_sdk_calls(tree, idioms, lines, vendor, _assignments_of(tree))\n    return sdk[:3] or [Proof(kind=OPERATION_CALL, line=1, text=\"\")], (f\"calls nothing on",
         ["test_a_repo_calling_nothing_on_it_is_not"],
     ),
     (
@@ -204,7 +204,7 @@ MUTATIONS = [
     (
         "a renamed operation is no longer diffed body-to-body",
         "apidrift/diff.py",
-        "            findings.extend(_diff_operation(op, new_op))",
+        "            findings.extend(_diff_operation(op, new_op, old))",
         "            pass",
         ["test_a_renamed_operation_is_still_compared_body_to_body"],
     ),
@@ -350,7 +350,11 @@ MUTATIONS = [
         "apidrift/loader.py",
         '            if len(real) == 1 and (len(real) < len(members) or _is_nullable(node)):\n                return _ref_name(real[0])',
         '            if False:\n                return _ref_name(real[0])',
-        ["test_dropping_the_null_arm_is_not_a_break"],
+        # Retargeted 2026-08-21: once `_nullable_wrapper_payload` ran first in
+        # the schema-view builder, nothing reached this branch through `run()`
+        # any more and the mutation went quiet. The branch still ships and
+        # other callers use it, so it gets an assertion of its own.
+        ["test_ref_name_still_sees_through_a_wrapper_on_its_own"],
     ),
     (
         "the root marker counted as a field again",
@@ -615,7 +619,7 @@ MUTATIONS = [
     (
         "dependence: SDK-form calls no longer recognised",
         "apidrift/dependence.py",
-        "        if not found:\n            found = find_sdk_calls(tree, idioms, lines)",
+        "        if not found:\n            found = find_sdk_calls(tree, idioms, lines, vendor,\n                                   assignments)",
         "        if not found:\n            pass",
         ["test_an_sdk_call_reaches_an_operation_that_names_no_path"],
     ),
@@ -1409,8 +1413,8 @@ MUTATIONS = [
     (
         "a traced read stops being accepted",
         "apidrift/js_dependence.py",
-        "    traced = _reads_of(module, leaf, bindings, lines, traced_only=True)\n    if traced:\n        return traced, \"\"",
-        "    traced = []\n    if traced:\n        return traced, \"\"",
+        "    traced = _reads_of(module, leaf, bindings, lines, traced_only=True,\n                       finding=finding, origins=origins)",
+        "    traced = []  # noqa",
         ["test_a_traced_read_stands_ALONE_when_the_path_does_not_match"],
     ),
     # ---------------------------------------------------------------------
@@ -1793,6 +1797,210 @@ MUTATIONS = [
         "    old_nodes = descend(old_body, parents, old)\n    if True:",
         ["test_a_requirement_added_to_an_EXISTING_object_is_confirmed"],
     ),
+    # --- a read is a POSITION, not a word (2026-08-21) -------------------
+    # Both directions for each half: disable it and the "not a break" test goes
+    # red; make it fire unconditionally and the "still a break" test goes red.
+    (
+        "the positional filter is switched off, so a word matches anywhere again",
+        "apidrift/dependence.py",
+        """    wanted = subject_ancestry(finding)
+    if not wanted:
+        return True""",
+        """    wanted = subject_ancestry(finding)
+    if wanted or not wanted:
+        return True""",
+        # Only this one. The other three are ALSO refuted by the reach
+        # check, so position alone going dark leaves them green — which is
+        # itself the measurement that both questions earn their place.
+        ["test_position_decides_even_when_the_operation_IS_reached"],
+    ),
+    (
+        "the positional filter fires unconditionally, deleting a real break",
+        "apidrift/dependence.py",
+        """    wanted = subject_ancestry(finding)
+    if not wanted:
+        return True""",
+        """    wanted = subject_ancestry(finding)
+    if not wanted:
+        return False""",
+        ["test_the_one_that_is_REAL_still_confirms",
+         "test_a_read_TRACED_to_a_vendor_call_is_still_dependence",
+         "test_a_read_traced_to_a_vendor_call_is_proven"],
+    ),
+    (
+        "ancestry goes back to dropping the head of an already-stripped subject",
+        "apidrift/dependence.py",
+        '    head = 1 if finding.kind.startswith("schema_") else 0',
+        "    head = 1",
+        ["test_a_response_finding_brackets_it_and_wire_subject_removes_it"],
+    ),
+    (
+        "ancestry keeps the schema name, so a caller must write one",
+        "apidrift/dependence.py",
+        '    head = 1 if finding.kind.startswith("schema_") else 0',
+        "    head = 0",
+        ["test_a_schema_finding_writes_its_schema_name_bare"],
+    ),
+    (
+        "a read chain stops at the first subscript, so position cannot be seen",
+        "apidrift/dependence.py",
+        """        if isinstance(node, ast.Subscript):
+            key = literal_of(node.slice)
+            if key:
+                parts.append(key)
+            node = node.value
+            continue""",
+        """        if isinstance(node, ast.Subscript):
+            break""",
+        ["test_a_python_caller_walking_a_body_by_subscript_is_positioned"],
+    ),
+    (
+        "reach stops abstaining on a truncated operation list",
+        "apidrift/js_dependence.py",
+        "    if finding.affected_op_count > len(finding.affected_ops or ()):\n        return True",
+        "    if False:\n        return True",
+        ["test_reach_abstains_rather_than_refusing_a_truncated_list"],
+    ),
+    (
+        "reach answers yes for everything, so it decides nothing",
+        "apidrift/js_dependence.py",
+        "    return any(_chain_matches_path(chain, op_path) for op_path in paths)",
+        "    return True",
+        ["test_a_reached_operation_is_required_when_the_list_is_complete"],
+    ),
+
+    # --- a member chain needs PROVENANCE (2026-08-21, fourth audit) --------
+    (
+        "any member chain counts as an SDK call again, as it did before the audit",
+        "apidrift/dependence.py",
+        """        link = call_reaches_vendor(node, vendor, assignments)
+        if not link:
+            continue
+        line = getattr(node, "lineno", 0)""",
+        """        link = "unchecked"
+        if not link:
+            continue
+        line = getattr(node, "lineno", 0)""",
+        ["test_a_local_list_append_is_not_an_api_call",
+         "test_a_dict_get_is_not_an_api_call",
+         "test_the_standard_library_is_not_an_api_call"],
+    ),
+    (
+        "the provenance gate rejects everything, so a real SDK call is lost",
+        "apidrift/dependence.py",
+        """        link = call_reaches_vendor(node, vendor, assignments)
+        if not link:
+            continue
+        line = getattr(node, "lineno", 0)""",
+        """        link = None
+        if not link:
+            continue
+        line = getattr(node, "lineno", 0)""",
+        ["test_a_real_sdk_chain_still_proves_the_call",
+         "test_a_client_traced_through_an_assignment_still_proves_it"],
+    ),
+    (
+        "a vendor-less call goes back to proving things",
+        "apidrift/dependence.py",
+        "    if not wanted or vendor is None:\n        return []",
+        "    if not wanted:\n        return []",
+        ["test_without_a_vendor_nothing_is_proven"],
+    ),
+    # --- 3.0 and 3.1 spell nullability differently ------------------------
+    (
+        "the schema view stops collapsing 3.1's nullability union",
+        "apidrift/loader.py",
+        """                if not target:
+                    arm = _nullable_wrapper_payload(node, resolver)
+                    if arm is not None:""",
+        """                if not target:
+                    arm = None
+                    if arm is not None:""",
+        ["test_the_two_dialects_are_the_same_field",
+         "test_it_reads_the_same_in_both_directions"],
+    ),
+    (
+        "the collapse forgets to record that the field is nullable",
+        "apidrift/loader.py",
+        """                    nullable=(wrapped_nullable
+                              or (_is_nullable(node) if isinstance(node, dict)
+                                  else False)),""",
+        """                    nullable=(_is_nullable(node) if isinstance(node, dict)
+                              else False),""",
+        ["test_both_dialects_record_the_same_flag"],
+    ),
+    (
+        "the collapse fires on a real union, silencing a lost payload arm",
+        "apidrift/loader.py",
+        "    if not isinstance(node, dict) or \"properties\" in node:\n        return None",
+        "    if not isinstance(node, dict):\n        return None",
+        ["test_a_node_with_properties_is_never_a_wrapper"],
+    ),
+    # --- the scan control must write the read where the subject says ------
+    (
+        "the control fixture writes the leaf at the root again",
+        "tools/scan_control.py",
+        '    access = ".".join(case.get("wire_path") or [leaf])',
+        "    access = leaf",
+        ["test_the_scan_control_fixture_reads_the_full_wire_path"],
+    ),
+
+    # --- a spec that documented no auth cannot be compared on auth ---------
+    (
+        "an undocumented old spec is compared on auth again",
+        "apidrift/diff.py",
+        "    undocumented_before = old_spec is not None and not old_spec.security_schemes",
+        "    undocumented_before = False",
+        ["test_a_spec_that_documented_no_auth_at_all_abstains"],
+    ),
+    (
+        "the auth abstention fires always, silencing a real tightening",
+        "apidrift/diff.py",
+        "    undocumented_before = old_spec is not None and not old_spec.security_schemes",
+        "    undocumented_before = True",
+        ["test_a_spec_that_DID_document_auth_still_reports_a_tightening",
+         "test_adding_a_scheme_to_every_alternative_is_breaking",
+         "test_removing_an_alternative_is_breaking"],
+    ),
+
+    # --- a dated API version is not HEAD (2026-08-21, fourth audit) --------
+    (
+        "the pinned bucket is dropped, so SDK callers are judged against HEAD",
+        "apidrift/scan.py",
+        "        if vendor.versioned:",
+        "        if False:",
+        ["test_a_pinned_sdk_caller_is_unmeasured_not_broken"],
+    ),
+    (
+        "the SDK package list is emptied, so an ES import reads as raw HTTP",
+        "apidrift/scan.py",
+        "    for package in _SDK_PACKAGES.get(vendor.key, ()):",
+        "    for package in ():",
+        ["test_an_es_import_of_the_sdk_counts_as_pinned"],
+    ),
+    (
+        "every file counts as an SDK caller, so nothing is ever judged",
+        "apidrift/scan.py",
+        "    if re.search(rf\"^\\s*from\\s+{key}(\\.\\w+)*\\s+import\\b\", source, re.M):\n        return True\n    return False",
+        "    if re.search(rf\"^\\s*from\\s+{key}(\\.\\w+)*\\s+import\\b\", source, re.M):\n        return True\n    return True",
+        ["test_raw_http_is_NOT_pinned",
+         "test_the_method_call_marker_is_not_an_import"],
+    ),
+    (
+        "Stripe stops being a dated-version vendor",
+        "apidrift/vendors.py",
+        "        versioned=True,   # Stripe-Version; stripe-node and stripe-python each pin one",
+        "        versioned=False,",
+        ["test_the_dated_version_vendors_are_marked"],
+    ),
+    (
+        "test files count towards the exit status again",
+        "apidrift/scan.py",
+        "    result.incidental = [i for i in result.impacts if _is_incidental(i.file)]",
+        "    result.incidental = []",
+        ["test_a_test_file_impact_is_split_out_of_the_exit_status"],
+    ),
+
 ]
 
 

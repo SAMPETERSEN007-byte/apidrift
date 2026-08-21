@@ -201,6 +201,43 @@ def _attr_chain(node: ast.AST) -> str:
     return ".".join(reversed(parts))
 
 
+def read_position(node: ast.AST) -> Tuple[str, ...]:
+    """The caller's own chain for a read, base first.
+
+    `sub.discount["coupon"].currency` -> ("sub", "discount", "coupon",
+    "currency"). Subscripts and `.get("x")` are how a Python caller walks a
+    JSON body, so a chain that stopped at the first `[` could not see where a
+    read sits -- and where it sits is the whole question
+    `read_sits_where_subject_says` asks.
+    """
+    parts: List[str] = []
+    while True:
+        if isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+            continue
+        if isinstance(node, ast.Subscript):
+            key = literal_of(node.slice)
+            if key:
+                parts.append(key)
+            node = node.value
+            continue
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr in ("get", "setdefault") and node.args:
+            key = literal_of(node.args[0])
+            if key:
+                parts.append(key)
+            node = node.func.value
+            continue
+        if isinstance(node, ast.Await):
+            node = node.value
+            continue
+        break
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return tuple(reversed(parts))
+
+
 def _mentions_vendor_host(node: ast.AST, vendor: Vendor) -> Optional[str]:
     """A literal inside `node` naming the vendor's API host."""
     hosts = tuple(m for m in vendor.evidence if "." in m and "/" not in m)
@@ -301,16 +338,43 @@ def _method_of(node: ast.Call) -> Set[str]:
 
 
 def find_sdk_calls(tree: ast.AST, idioms: Sequence[str],
-                   lines: Sequence[str]) -> List[Proof]:
+                   lines: Sequence[str], vendor: Optional[Vendor] = None,
+                   assignments: Optional[Dict[str, ast.AST]] = None) -> List[Proof]:
     """Calls written through the vendor's SDK, which never name a path.
 
     `stripe.checkout.Session.create(...)` reaches `POST /v1/checkout/sessions`
     without the string ever appearing, so a path-only proof misses the majority
     of a vendor's actual customers.
+
+    🚨 The ROOT of the chain must trace back to the vendor. Without that this
+    matched a member chain on ANY object whose name happened to start with one
+    of the finding's idioms, and a fourth adversarial audit (2026-08-21, 74
+    impacts across 22 real repositories) found that to be the largest defect in
+    the Python prover:
+
+      * onyx  `collaborators.append(info)` -- a local `List[UserInfo]` --
+        reported as "the SDK form of" `GET /projects/{project_id}/collaborators`;
+      * posthog `permissions.get("push")` -- a plain dict read off a repository
+        payload -- reported as `/collaborators/{username}/permission`;
+      * posthog `branches.insert(0, default_branch)` -- `list.insert` -- used as
+        the ANCHOR that let an unrelated field read become an impact;
+      * posthog `secrets.token_urlsafe(32)` -- the Python standard library --
+        reported three times over as GitHub's environment-secret endpoints.
+
+    JavaScript never had this hole: `_vendor_bindings` requires the root be
+    imported from one of the vendor's SDK packages. This is the same gate,
+    stated in Python's terms. `call_reaches_vendor` already follows assignments,
+    so `client.repos.get(...)` where `client = Github(token)` still resolves --
+    the requirement is provenance, not spelling.
+
+    `vendor` is optional only so the existing signature keeps working; when it
+    is absent nothing is proven and nothing is returned, because an
+    unprovenanced chain is exactly what this function must stop accepting.
     """
     wanted = [idiom.rstrip(".(") for idiom in idioms if len(idiom) > 6]
-    if not wanted:
+    if not wanted or vendor is None:
         return []
+    assignments = assignments if assignments is not None else {}
     proofs: List[Proof] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -320,6 +384,9 @@ def find_sdk_calls(tree: ast.AST, idioms: Sequence[str],
             continue
         hit = next((idiom for idiom in wanted if chain.startswith(idiom)), None)
         if not hit:
+            continue
+        link = call_reaches_vendor(node, vendor, assignments)
+        if not link:
             continue
         line = getattr(node, "lineno", 0)
         text = lines[line - 1].strip()[:160] if 0 < line <= len(lines) else ""
@@ -438,8 +505,15 @@ def find_operation_calls(tree: ast.AST, method: str, path: str,
 # ---------------------------------------------------------------------------
 
 def find_field_uses(tree: ast.AST, field_name: str,
-                    lines: Sequence[str]) -> List[Proof]:
-    """Every read of `field_name`, without asking where the value came from."""
+                    lines: Sequence[str],
+                    finding: Optional[Finding] = None) -> List[Proof]:
+    """Every read of `field_name`, without asking where the value came from.
+
+    Route 2 needs this because most reads happen on a function parameter whose
+    origin is in the caller. `finding` still constrains WHERE the read sits:
+    not knowing where a value came from is no reason to stop asking whether
+    the read is at the position the subject describes.
+    """
     proofs: List[Proof] = []
     for node in ast.walk(tree):
         matched = False
@@ -453,6 +527,9 @@ def find_field_uses(tree: ast.AST, field_name: str,
                 matched = True
         if not matched:
             continue
+        if finding is not None and not read_sits_where_subject_says(
+                finding, read_position(node), field_name):
+            continue
         line = getattr(node, "lineno", 0)
         proofs.append(Proof(
             kind=FIELD_READ, line=line,
@@ -464,8 +541,16 @@ def find_field_uses(tree: ast.AST, field_name: str,
 
 def find_field_reads(tree: ast.AST, field_name: str, vendor: Vendor,
                      assignments: Dict[str, ast.AST],
-                     lines: Sequence[str]) -> List[Proof]:
-    """Reads of `field_name` off a value traced back to the vendor."""
+                     lines: Sequence[str],
+                     finding: Optional[Finding] = None) -> List[Proof]:
+    """Reads of `field_name` off a value traced back to the vendor.
+
+    `finding` turns on the POSITIONAL filter. Without it a read is matched by
+    its leaf WORD, so `subscription.currency` counts as a read of
+    `<deleted_discount>.coupon.currency`. Measured on 22 real repositories at a
+    three-year window on 2026-08-21: twelve of thirteen impacts were that, the
+    same word at a different place. See `read_sits_where_subject_says`.
+    """
     proofs: List[Proof] = []
     for node in ast.walk(tree):
         source_expr: Optional[ast.AST] = None
@@ -483,6 +568,9 @@ def find_field_reads(tree: ast.AST, field_name: str, vendor: Vendor,
             continue
         link = call_reaches_vendor(source_expr, vendor, assignments)
         if not link:
+            continue
+        if finding is not None and not read_sits_where_subject_says(
+                finding, read_position(node), field_name):
             continue
         line = getattr(node, "lineno", 0)
         text = lines[line - 1].strip()[:160] if 0 < line <= len(lines) else ""
@@ -658,6 +746,74 @@ def wire_subject(finding: Finding) -> str:
     return finding.root_cause or finding.subject
 
 
+def subject_ancestry(finding: Finding) -> Tuple[str, ...]:
+    """The segments a CALLER writes between the subject's ROOT and its leaf.
+
+    `<invoice>.discount.customer` is the `customer` of the `discount` of an
+    `invoice`. `discount` is on the wire and a caller who reads that field
+    writes it; `invoice` is a schema name and no caller writes schema names.
+
+    A subject interleaves two alphabets and the KIND says which one the first
+    segment is in. A `schema_*` finding writes its schema name bare --
+    `subscription.current_period_start` -- so the head is dropped. A
+    `response_*`/`request_*` finding brackets it, `wire_subject` has already
+    removed it, and every segment that survives is one the caller writes.
+    Getting this backwards makes the check vacuous on exactly the population
+    it exists for: with `[1:-1]` applied to an already-stripped subject,
+    `<invoice>.discount.customer` yields no ancestry at all and four of the
+    twelve measured false positives came straight back.
+    """
+    wire = wire_subject(finding)
+    if not wire or wire.startswith("/"):
+        return ()
+    segments = [s.replace("[]", "").strip("<>") for s in wire.split(".")]
+    segments = [s for s in segments if s]
+    head = 1 if finding.kind.startswith("schema_") else 0
+    return tuple(segments[head:-1])
+
+
+def read_sits_where_subject_says(finding: Finding,
+                                 positions: Sequence[str],
+                                 leaf: str) -> bool:
+    """Does a read at `positions` sit WHERE the finding's subject says?
+
+    `positions` is the caller's own chain, base first: `subscription.customer.id`
+    is ("subscription", "customer", "id").
+
+    Matching a read by its LEAF NAME alone is the seventh instance of this
+    project's recurring defect, and the first in the PROVER rather than the
+    checker. The prover asked "is this identifier read off something from this
+    vendor?" when the caller's question is "is the value I read the value that
+    changed?". Measured 2026-08-21 over 22 real repositories at a three-year
+    window: `subscription.currency` was accepted as a read of
+    `deleted_discount.coupon.currency`, `subscription.customer` as a read of
+    `invoice.discount.customer`, and `subscription.customer?.id` as a read of
+    `invoiceitem.price.id`. Twelve of thirteen impacts were that, and the same
+    word at a different place is not the same field.
+
+    The root is not required -- it is a schema name. Everything strictly
+    between the root and the leaf IS observable, so it must appear, in order,
+    ahead of the leaf in the caller's own chain.
+    """
+    wanted = subject_ancestry(finding)
+    if not wanted:
+        return True
+    have = [p for p in positions if p]
+    try:
+        cut = len(have) - 1 - have[::-1].index(leaf)
+    except ValueError:
+        cut = len(have)
+    before = have[:cut]
+    index = 0
+    for name in wanted:
+        while index < len(before) and before[index] != name:
+            index += 1
+        if index == len(before):
+            return False
+        index += 1
+    return True
+
+
 def _leaf_of(finding: Finding) -> str:
     """The field or schema the change names, or empty if it names none.
 
@@ -738,7 +894,8 @@ def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], s
                 found.extend(hits)
                 break
         if not found:
-            found = find_sdk_calls(tree, idioms, lines)
+            found = find_sdk_calls(tree, idioms, lines, vendor,
+                                   assignments)
         return found
 
     if finding.kind in ABSENCE_KINDS:
@@ -801,15 +958,19 @@ def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], s
 
     read_proves, send_proves = directions(finding)
 
-    # Route 1: the read is traced to a vendor call.
-    traced = find_field_reads(tree, leaf, vendor, assignments, lines) \
-        if read_proves else []
+    # Route 1: the read is traced to a vendor call AND sits where the subject
+    # says. The word alone was never enough: `subscription.currency` is not a
+    # read of `<deleted_discount>.coupon.currency`, and twelve of thirteen
+    # impacts across 22 real repositories were exactly that shape.
+    traced = find_field_reads(tree, leaf, vendor, assignments, lines,
+                              finding=finding) if read_proves else []
     if traced:
         return traced, ""
 
     # Route 2: the field is read somewhere, AND this file calls an operation
     # that carries the schema it was removed from.
-    uses = find_field_uses(tree, leaf, lines) if read_proves else []
+    uses = find_field_uses(tree, leaf, lines, finding=finding) \
+        if read_proves else []
     if uses:
         calls = operation_reached()
         if calls:
@@ -857,6 +1018,18 @@ def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], s
     # depend on it, however many of the vendor's endpoints it calls.
     return [], f"`{leaf}` is never read or sent in this file"
 
+def _assignments_of(tree: ast.AST) -> Dict[str, ast.AST]:
+    """The module's name -> assigned-expression map.
+
+    `prove()` builds this once and threads it through; `prove_relevance()` did
+    not need it until `find_sdk_calls` started demanding provenance, and a
+    chain whose root cannot be traced is exactly what it must now reject.
+    """
+    collector = _Assignments()
+    collector.visit(tree)
+    return collector.by_name
+
+
 def prove_relevance(source: str, addition: Finding,
                     vendor: Vendor) -> Tuple[List[Proof], str]:
     """Is this repo positioned to USE something the vendor just added?
@@ -890,7 +1063,7 @@ def prove_relevance(source: str, addition: Finding,
                 hit.chain.append(f"which is `{op_method.upper()} {op_path}`")
             return hits[:3], ""
 
-    sdk = find_sdk_calls(tree, idioms, lines)
+    sdk = find_sdk_calls(tree, idioms, lines, vendor, _assignments_of(tree))
     if sdk:
         return sdk[:3], ""
     return [], (f"calls nothing on `{addition.resource or 'this resource'}`, "

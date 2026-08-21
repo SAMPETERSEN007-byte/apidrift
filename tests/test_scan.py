@@ -280,3 +280,284 @@ class TestOpportunitiesSayWhatWasRejected(unittest.TestCase):
         text = to_text(self._result(opportunities=[endpoint, passive]))
         self.assertLess(text.index("/v1/payment_records"), text.index("x.y"),
                         "a decision must be shown before a notification")
+
+
+class TestScanControlFixtureIsAGenuineDependence(unittest.TestCase):
+    """The recall control must inject a read at the position the subject names.
+
+    It did not. Stripe's `<radar.payment_evaluation>.insights.card_issuer_decline`
+    produced `record.card_issuer_decline`, which is not a read of that field at
+    all, and the control passed for exactly as long as the prover shared the
+    mistake. It went SILENT the day the prover learned that a read is a position
+    and not a word — a control that picks its stimulus the way the mechanism
+    under test would is not measuring that mechanism.
+    """
+
+    def _control(self):
+        import importlib.util
+        from pathlib import Path as _P
+        root = _P(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location(
+            "scan_control", root / "tools" / "scan_control.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_scan_control_fixture_reads_the_full_wire_path(self):
+        import tempfile
+        from pathlib import Path as _P
+        sc = self._control()
+        case = {
+            "finding": {"subject": "<radar.payment_evaluation>.insights.card_issuer_decline"},
+            "leaf": "card_issuer_decline",
+            "wire_path": sc._wire_path(
+                "<radar.payment_evaluation>.insights.card_issuer_decline"),
+            "resource": "payment_evaluations",
+            "path": "/v1/radar/payment_evaluations",
+            "method": "get",
+        }
+        tmp = _P(tempfile.mkdtemp())
+        sc._write_fixture(tmp, "stripe", case)
+        python = (tmp / "src" / "app.py").read_text()
+        typescript = (tmp / "src" / "app.ts").read_text()
+        self.assertIn("record.insights.card_issuer_decline", python)
+        self.assertIn("record.insights.card_issuer_decline", typescript)
+
+    def test_the_wire_path_drops_only_the_schema_annotations(self):
+        sc = self._control()
+        self.assertEqual(["insights", "card_issuer_decline"],
+                         sc._wire_path("<radar.payment_evaluation>.insights.card_issuer_decline"))
+        self.assertEqual(["rule", "item_id"],
+                         sc._wire_path("<TransactionsRulesCreateResponse>.rule.item_id"))
+
+
+class TestADatedApiVersionIsNotHead(unittest.TestCase):
+    """A caller on a pinned SDK does not meet HEAD, so HEAD's drift is silent
+    about it. Reported as UNMEASURED — never as clean, never as broken.
+
+    This refuted the most convincing impact this tool ever produced. Langfuse
+    reads `subscription.current_period_start` at
+    `handleCloudSpendAlertJob.ts:96`; Stripe removed it from the subscription
+    object in `2025-03-31.basil`; `stripe-node@17.4.0` sends
+    `2024-11-20.acacia` and Stripe still serves that shape. Two independent
+    auditors killed the claim on 2026-08-21 and both were right.
+    """
+
+    def test_an_es_import_of_the_sdk_counts_as_pinned(self):
+        from apidrift.scan import reaches_through_sdk
+        from apidrift.vendors import get
+        self.assertTrue(reaches_through_sdk(
+            'import Stripe from "stripe";\nconst s = new Stripe(k);\n', get("stripe")))
+
+    def test_a_python_import_of_the_sdk_counts_as_pinned(self):
+        from apidrift.scan import reaches_through_sdk
+        from apidrift.vendors import get
+        self.assertTrue(reaches_through_sdk(
+            "import stripe\nstripe.Charge.list()\n", get("stripe")))
+        self.assertTrue(reaches_through_sdk(
+            "from stripe import Charge\n", get("stripe")))
+
+    def test_raw_http_is_NOT_pinned(self):
+        """A caller writing its own request sends no version header and gets
+        the account default, so that one really can drift."""
+        from apidrift.scan import reaches_through_sdk
+        from apidrift.vendors import get
+        self.assertFalse(reaches_through_sdk(
+            'await fetch("https://api.stripe.com/v1/charges")\n', get("stripe")))
+
+    def test_an_unversioned_vendor_is_never_pinned(self):
+        """GitHub serves one version of its REST API to everybody."""
+        from apidrift.scan import reaches_through_sdk
+        from apidrift.vendors import get
+        self.assertFalse(get("github").versioned)
+
+    def test_the_method_call_marker_is_not_an_import(self):
+        """The first version of this asked whether any evidence marker was in
+        the source. Stripe's markers include `"stripe."` — a method call — so
+        the check passed straight over the case it was written for."""
+        from apidrift.scan import reaches_through_sdk
+        from apidrift.vendors import get
+        self.assertFalse(reaches_through_sdk(
+            "const total = stripe.total + 1\n", get("stripe")))
+
+
+class TestTestFilesAreNotTheProduct(unittest.TestCase):
+    """A vendor URL inside a `parametrize` decorator is not a broken build."""
+
+    def test_incidental_paths_are_recognised(self):
+        from apidrift.scan import _is_incidental
+        for path in ("tests/test_klaviyo.py", "src/foo/tests/test_x.py",
+                     "docs/example.py", "examples/demo.ts", "pkg/x_test.py"):
+            self.assertTrue(_is_incidental(path), path)
+        for path in ("src/billing/charge.py", "worker/src/jobs/spend.ts",
+                     "app/latest/handler.ts"):
+            self.assertFalse(_is_incidental(path), path)
+
+
+class TestPinnedAndIncidentalEndToEnd(unittest.TestCase):
+    """The two splits, exercised through `scan_repo` rather than a predicate.
+
+    A unit test of the predicate cannot show that the RESULT changed, and the
+    result is the product: what lands in `impacts` is what fails a build and
+    what would go into a pull request.
+
+    Runs against a SYNTHETIC two-commit vendor repo, not the real Stripe cache.
+    The first version of these tests diffed Stripe's 8 MB spec three times and
+    took layer 1 from 0.14s to 10s -- which would have put layer 2, the
+    mutation harness, at a quarter of an hour. A gate nobody runs is not a gate.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import json as _json
+        import subprocess
+        import tempfile
+        from pathlib import Path as _P
+        from apidrift.vendors import VENDORS, Vendor
+
+        cls._cache = _P(tempfile.mkdtemp(prefix="apidrift-fakevendor-"))
+        repo = cls._cache / "fake_vendor"
+        repo.mkdir(parents=True)
+
+        def git(*args, when=None):
+            import os
+            env = dict(os.environ)
+            if when:
+                # BOTH dates. `git commit --date` sets only the AUTHOR date and
+                # `commit_before` reads the COMMITTER date, so a fixture built
+                # with --date alone lands every commit at "now" and the window
+                # is empty.
+                env["GIT_AUTHOR_DATE"] = when
+                env["GIT_COMMITTER_DATE"] = when
+            subprocess.run(["git", "-C", str(repo), *args], check=True, env=env,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def spec(with_field):
+            insights = {"type": "object", "properties": {}}
+            if with_field:
+                insights["properties"]["card_issuer_decline"] = {"type": "string"}
+            return {
+                "openapi": "3.0.0", "info": {"title": "Fake", "version": "1"},
+                "components": {
+                    "securitySchemes": {"basic": {"type": "http"}},
+                    "schemas": {"evaluation": {"type": "object", "properties": {
+                        "insights": insights}}}},
+                "paths": {"/v1/evaluations/{id}": {"get": {
+                    "operationId": "getEvaluation",
+                    "parameters": [{"name": "id", "in": "path", "required": True,
+                                    "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": "ok", "content": {
+                        "application/json": {"schema": {
+                            "$ref": "#/components/schemas/evaluation"}}}}}}}},
+            }
+
+        git("init", "-q")
+        git("config", "user.email", "t@t"); git("config", "user.name", "t")
+        (repo / "openapi.json").write_text(_json.dumps(spec(True)))
+        git("add", "openapi.json")
+        git("commit", "-q", "-m", "before", when="2026-01-01T00:00:00+0000")
+        (repo / "openapi.json").write_text(_json.dumps(spec(False)))
+        git("add", "openapi.json")
+        git("commit", "-q", "-m", "after", when="2026-08-01T00:00:00+0000")
+
+        cls._key = "fakevendor"
+        cls._added = Vendor(
+            key=cls._key, name="FakeVendor", repo="fake/vendor",
+            spec_path="openapi.json", docs_url="https://example.invalid",
+            version_prefixes=("/v1",), versioned=True,
+            evidence=("import fakevendor", "from fakevendor",
+                      "api.fakevendor.com", "FAKEVENDOR_KEY"))
+        VENDORS[cls._key] = cls._added
+        from apidrift import js_dependence
+        js_dependence._SDK_PACKAGES[cls._key] = ("fakevendor",)
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        from apidrift.vendors import VENDORS
+        VENDORS.pop(cls._key, None)
+        shutil.rmtree(cls._cache, ignore_errors=True)
+
+    def _repo(self, files):
+        import tempfile
+        from pathlib import Path as _P
+        root = _P(tempfile.mkdtemp(prefix="apidrift-split-"))
+        for rel, text in files.items():
+            dest = root / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(text)
+        return root
+
+    def _scan(self, files):
+        from apidrift.scan import scan_repo
+        return scan_repo(root=self._repo(files), since="2026-03-01",
+                         vendor_keys=[self._key], cache_dir=self._cache,
+                         fetch=False, asof="2026-08-21", window_days=180,
+                         progress=None)
+
+    RAW = ('import requests\n'
+           '\n'
+           'def load(i):\n'
+           '    record = requests.get(\n'
+           '        "https://api.fakevendor.com/v1/evaluations/%s" % i\n'
+           '    ).json()\n'
+           '    return record["insights"]["card_issuer_decline"]\n')
+
+    SDK = ('import fakevendor\n'
+           '\n'
+           'def load(i):\n'
+           '    record = fakevendor.evaluations.retrieve(i)\n'
+           '    return record.insights.card_issuer_decline\n')
+
+    def test_a_raw_http_caller_IS_judged(self):
+        """The control, and it must come first: if this does not fire, the two
+        tests below prove nothing, because everything would be quiet anyway."""
+        result = self._scan({"src/app.py": self.RAW})
+        self.assertEqual(1, len(result.impacts),
+                         [(i.file, i.subject) for i in result.impacts])
+        self.assertEqual("src/app.py", result.impacts[0].file)
+        self.assertEqual({}, result.pinned)
+
+    def test_a_pinned_sdk_caller_is_unmeasured_not_broken(self):
+        result = self._scan({"src/app.py": self.SDK})
+        self.assertEqual([], result.impacts,
+                         [(i.file, i.subject) for i in result.impacts])
+        self.assertIn(self._key, result.pinned)
+        self.assertIn("src/app.py", result.pinned[self._key])
+        from apidrift.scan import to_text
+        self.assertIn("NOT clean-checked", to_text(result))
+
+    def test_a_test_file_impact_is_split_out_of_the_exit_status(self):
+        result = self._scan({"tests/test_app.py": self.RAW})
+        self.assertEqual([], result.impacts,
+                         "a test file must never fail the build")
+        self.assertEqual(1, len(result.incidental),
+                         "…but it must still be reported")
+        from apidrift.scan import to_text
+        self.assertIn("IN TEST / EXAMPLE / DOC FILES", to_text(result))
+
+
+class TestWhichVendorsServeDatedVersions(unittest.TestCase):
+    """Which vendors are marked `versioned` is a claim about the world, and it
+    decides whether a whole class of impact may be reported at all.
+
+    Each of these sends a dated version from its SDK, so a caller on that SDK
+    meets the version the SDK shipped with and not HEAD. Unmarking one puts
+    every SDK caller of it back in the impact list, which is what produced the
+    most convincing false positive this tool has ever emitted.
+    """
+
+    def test_the_dated_version_vendors_are_marked(self):
+        from apidrift.vendors import VENDORS
+        for key in ("stripe", "plaid", "klaviyo", "square"):
+            self.assertTrue(VENDORS[key].versioned,
+                            f"{key} serves dated API versions")
+
+    def test_vendors_that_serve_one_version_to_everybody_are_not(self):
+        """The control: this must not become a blanket. GitHub, OpenAI, Twilio
+        and Discord serve a single current API, so their callers really can
+        drift and must still be judged."""
+        from apidrift.vendors import VENDORS
+        for key in ("github", "openai", "twilio", "discord", "sentry"):
+            self.assertFalse(VENDORS[key].versioned,
+                             f"{key} does not serve dated API versions")

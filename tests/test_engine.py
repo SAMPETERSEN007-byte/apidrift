@@ -337,12 +337,30 @@ class TestAnonymousArmReshape(unittest.TestCase):
         self.assertNotIn("field_removed", classes)
 
     def test_arm_type_change_is_breaking_not_removal(self):
+        """Reported as a type change, never as a removal.
+
+        Asserted on the KIND CLASS, not the kind. Until the schema view learned
+        that `anyOf: [T, null]` is 3.1's spelling of `nullable: T`, this change
+        was invisible to the schema-level diff (`anyOf -> anyOf`) and only the
+        response flattener saw it, so the response kind WAS the representative.
+        Now both see it and `collapse()` prefers the schema view on purpose --
+        its operation list is a graph walk rather than one route. The finding,
+        its severity and its direction are unchanged; only which of two names
+        for the same root cause is printed.
+        """
+        from apidrift.diff import _kind_class
         self._tier(self.new).clear()
         self._tier(self.new).update({"type": "integer"})
         result = run(self.old, self.new)
-        found = {f.kind for f in result.findings}
-        self.assertIn("response_field_type_changed", found)
-        self.assertNotIn("response_field_removed", found)
+        classes = {_kind_class(f.kind) for f in result.findings}
+        self.assertIn("field_type_changed", classes)
+        self.assertNotIn("field_removed", classes)
+        changed = [f for f in result.breaking
+                   if _kind_class(f.kind) == "field_type_changed"]
+        self.assertEqual(1, len(changed), [f.kind for f in result.breaking])
+        self.assertEqual(("string", "integer"), (changed[0].old, changed[0].new))
+        self.assertTrue(changed[0].in_response,
+                        "the direction must survive the collapse")
 
 
 class TestInlineToRefMove(unittest.TestCase):
@@ -2599,3 +2617,169 @@ class TestNewlyRequiredIsAClaimAboutBodies(unittest.TestCase):
         self.assertTrue(
             any(s.endswith("limits.accounts") for s in found),
             f"nothing about an empty old side justifies suppressing; got {found}")
+
+
+class TestNullabilityDialects(unittest.TestCase):
+    """3.0 spelled nullability with a keyword; 3.1 spells it with a union arm.
+
+    OpenAPI 3.1 DELETED `nullable`. `{type: string, nullable: true}` and
+    `{anyOf: [{type: string}, {type: "null"}]}` are the same field in two
+    dialects, and a vendor migrating the document changes every nullable field
+    at once. The operation-level flattener always knew this; the SCHEMA view did
+    not, and the schema view is what the schema-level diff compares. OpenAI's
+    migration reported `string -> anyOf` on two chat-completion fields as
+    BREAKING, and those two alone were 75 of the 295 impacts a 22-repository
+    scan produced on 2026-08-21.
+    """
+
+    def _doc(self, tier):
+        doc = copy.deepcopy(BASE)
+        doc["components"]["schemas"]["Card"]["properties"]["tier"] = tier
+        return doc
+
+    KEYWORD = {"type": "string", "nullable": True}
+    UNION = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+
+    def test_the_two_dialects_are_the_same_field(self):
+        result = run(self._doc(self.KEYWORD), self._doc(self.UNION))
+        self.assertEqual([], result.breaking,
+                         [(f.kind, f.subject, f.old, f.new) for f in result.breaking])
+
+    def test_it_reads_the_same_in_both_directions(self):
+        result = run(self._doc(self.UNION), self._doc(self.KEYWORD))
+        self.assertEqual([], result.breaking,
+                         [(f.kind, f.subject, f.old, f.new) for f in result.breaking])
+
+    def test_becoming_nullable_is_still_reported(self):
+        """The collapse must not swallow a field that genuinely became
+        nullable — before this, `->X` vs `anyOf: [X, null]` compared equal on
+        BOTH type and nullability, so the change was invisible in either
+        direction. Making the dialects agree is what makes this visible."""
+        from apidrift.diff import _kind_class
+        result = run(self._doc({"type": "string"}), self._doc(self.UNION))
+        classes = {_kind_class(f.kind) for f in result.findings}
+        self.assertIn("field_now_nullable", classes,
+                      [(f.kind, f.subject) for f in result.findings])
+
+    def test_a_real_union_is_left_alone(self):
+        """Two payload arms is a genuine union, not a nullability wrapper.
+        Losing one of those is a payload alternative disappearing and this
+        must never be able to silence it."""
+        wide = {"anyOf": [{"type": "string"}, {"type": "integer"}, {"type": "null"}]}
+        result = run(self._doc(wide), self._doc(self.UNION))
+        self.assertNotEqual([], result.findings,
+                            "dropping the integer arm is a change")
+
+    def test_an_undeclared_single_member_union_is_a_real_union(self):
+        """`oneOf: [X]` with no null member and no `nullable` has simply not
+        grown its second arm yet — Cloudflare's `infra_ServiceConfig`."""
+        one = {"oneOf": [{"type": "string"}]}
+        two = {"oneOf": [{"type": "string"}, {"type": "integer"}]}
+        result = run(self._doc(one), self._doc(two))
+        self.assertEqual([], result.breaking, "widening a real union is not breaking")
+
+
+class TestAnUndocumentedSpecCannotBeComparedOnAuth(unittest.TestCase):
+    """A document naming no security schemes has no vocabulary for auth.
+
+    Its silence is an absence of DOCUMENTATION, not an absence of
+    authentication. OpenAI's 2023 spec declared neither `securitySchemes` nor
+    `security` and its 2026 one declares document-level `ApiKeyAuth`; the API
+    required a key throughout. Comparing them scored a new auth requirement on
+    every operation in the document at once — 23 of the 295 impacts a
+    22-repository scan produced on 2026-08-21.
+
+    Same shape as `unreachable` on a dereferenced document: a precondition
+    true of 100% of inputs is a broken instrument, not a result. The control is
+    a COUNT of the old document's schemes, so this can only fire where there
+    was genuinely nothing to compare against.
+    """
+
+    def setUp(self):
+        self.old = copy.deepcopy(BASE)
+        self.new = copy.deepcopy(BASE)
+        (self.old["components"] or {}).pop("securitySchemes", None)
+        (self.new["components"] or {}).pop("securitySchemes", None)
+
+    def test_a_spec_that_documented_no_auth_at_all_abstains(self):
+        self.new["components"]["securitySchemes"] = {"ApiKeyAuth": {"type": "apiKey"}}
+        self.new["security"] = [{"ApiKeyAuth": []}]
+        self.assertNotIn("security_requirement_added",
+                         {f.kind for f in run(self.old, self.new).findings})
+
+    def test_a_spec_that_DID_document_auth_still_reports_a_tightening(self):
+        """The control. The abstention is a count, not a blanket."""
+        self.old["components"]["securitySchemes"] = {"basic": {"type": "http"}}
+        self.new["components"]["securitySchemes"] = {"basic": {"type": "http"},
+                                                     "bearer": {"type": "http"}}
+        self.old["paths"]["/charges"]["get"]["security"] = [{"basic": []}]
+        self.new["paths"]["/charges"]["get"]["security"] = [{"basic": [],
+                                                             "bearer": []}]
+        self.assertIn("security_requirement_added",
+                      kinds(run(self.old, self.new)))
+
+
+class TestTheWrapperCollapseHasAGuard(unittest.TestCase):
+    """A node carrying `properties` alongside a union is an object in its own
+    right, not a nullability wrapper around one. Flattening through it would
+    move every key beneath it."""
+
+    def test_a_node_with_properties_is_never_a_wrapper(self):
+        from apidrift.loader import Resolver, _nullable_wrapper_payload
+        union = {"anyOf": [{"type": "object",
+                            "properties": {"kind": {"type": "string"}}},
+                           {"type": "null"}]}
+        with_props = dict(union, properties={"kind": {"type": "string"}})
+        resolver = Resolver({})
+        self.assertIsNotNone(_nullable_wrapper_payload(union, resolver),
+                             "a bare nullable union IS a wrapper")
+        self.assertIsNone(_nullable_wrapper_payload(with_props, resolver),
+                          "…but not once the node has properties of its own")
+
+    def test_ref_name_still_sees_through_a_wrapper_on_its_own(self):
+        """`_ref_name` has its own wrapper branch and other callers rely on it.
+
+        Once `_nullable_wrapper_payload` ran first in the schema-view builder,
+        nothing in the suite exercised that branch any more and its mutation
+        went quiet — a behaviour that still ships and is no longer covered is
+        exactly what the mutation harness is for.
+        """
+        from apidrift.loader import _ref_name
+        self.assertEqual("Theme", _ref_name(
+            {"oneOf": [{"type": "null"}, {"$ref": "#/components/schemas/Theme"}]}))
+        self.assertEqual("Theme", _ref_name(
+            {"anyOf": [{"$ref": "#/components/schemas/Theme"}], "nullable": True}))
+        self.assertIsNone(_ref_name(
+            {"oneOf": [{"$ref": "#/components/schemas/A"},
+                       {"$ref": "#/components/schemas/B"}]}),
+            "two real arms is a union, not a wrapper")
+
+
+class TestTheSchemaViewRecordsNullability(unittest.TestCase):
+    """The `nullable` FLAG on a schema-view field, asserted directly.
+
+    Going through `run()` cannot see this: the response-level flattener has
+    always understood the wrapper, so a finding still appears even when the
+    schema view forgets. The flag is what makes the two dialects compare equal
+    in the schema-level diff, so it needs an assertion of its own.
+    """
+
+    def _view(self, tier):
+        import json
+        from apidrift.loader import load_spec
+        doc = copy.deepcopy(BASE)
+        doc["components"]["schemas"]["Card"]["properties"]["tier"] = tier
+        return load_spec(json.dumps(doc).encode(), "spec.json")
+
+    def test_both_dialects_record_the_same_flag(self):
+        keyword = self._view({"type": "string", "nullable": True})
+        union = self._view({"anyOf": [{"type": "string"}, {"type": "null"}]})
+        a = keyword.schemas["Card"].fields["tier"]
+        b = union.schemas["Card"].fields["tier"]
+        self.assertEqual(("string", True), (a.type, a.nullable))
+        self.assertEqual(("string", True), (b.type, b.nullable))
+
+    def test_a_plain_field_is_not_nullable(self):
+        plain = self._view({"type": "string"})
+        field = plain.schemas["Card"].fields["tier"]
+        self.assertEqual(("string", False), (field.type, field.nullable))

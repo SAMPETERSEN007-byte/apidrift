@@ -25,7 +25,9 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .dependence import (FIELD_MISSING, FIELD_READ, FIELD_SENT, Proof,
-                         _is_distinctive, _leaf_of, paths_match)
+                         _is_distinctive, _leaf_of, paths_match,
+                         read_sits_where_subject_says, subject_ancestry,
+                         wire_subject)
 from .diff import ABSENCE_KINDS, ENDPOINT_KINDS, Finding
 from .js import CallSite, Module, UnreadableSource, analyse
 from .vendors import Vendor
@@ -133,6 +135,79 @@ def _text_at(lines: Sequence[str], line: int) -> str:
     return ""
 
 
+def _chain_matches_path(chain: Sequence[str], path: str) -> bool:
+    """Does an SDK member chain correspond to `path`'s resource segments?
+
+    Extracted from `_operation_calls` unchanged so that a single call site --
+    the one a traced read was assigned from -- can be tested against an
+    operation without re-walking the module. `_chain_reaches_change` needs
+    exactly that.
+    """
+    wanted = [segment for segment in path.split("/")
+              if segment and not segment.startswith("{")]
+    if not wanted or len(chain) < 2:
+        return False
+    middle = {part.lower().rstrip("s") for part in chain[1:-1]}
+    if not middle:
+        return False
+    return all(any(segment.lower().rstrip("s") == part
+                   or segment.lower().rstrip("s").endswith(part)
+                   for part in middle)
+               for segment in wanted[-len(middle):])
+
+
+def _change_operation_paths(finding: Finding) -> List[str]:
+    """Every path this change is KNOWN to touch.
+
+    `affected_ops` only. `finding.path` is the REPRESENTATIVE operation --
+    a display choice, arbitrary among the many an operation-spanning change
+    covers, and `card.iin` carries `DELETE /v1/accounts/{account}` for 551 of
+    them. Including it here made reach demand that a caller use the one
+    operation the report happened to name, which is the thing
+    `test_a_traced_read_stands_ALONE_when_the_path_does_not_match` exists to
+    forbid. A check must not smuggle an arbitrary pick in as a fact.
+    """
+    out: List[str] = []
+    for key in (finding.affected_ops or []):
+        _, _, op_path = key.partition(" ")
+        if op_path and not op_path.startswith("#"):
+            out.append(op_path)
+    return out
+
+
+def _chain_reaches_change(chain: Sequence[str], finding: Finding) -> bool:
+    """Does the call a traced read came from reach an operation that CHANGED?
+
+    The second half of the positional fix, and a different question from
+    `read_sits_where_subject_says`: that one asks where in a body the read
+    sits, this one asks whether the body is one the change touches at all.
+    Langfuse reads `subscription.customer` off `stripe.subscriptions.retrieve`;
+    `invoice.discount.customer` was removed from invoice operations, which that
+    call does not reach. Either question alone leaves real false positives
+    standing -- `subscription.discount.customer` DOES touch subscription
+    operations and dies only on position -- so both are asked.
+
+    Abstains (True) in two cases, both of them "cannot be measured here", and
+    neither of them a pass on the merits -- position still has to hold:
+
+      * the finding names no operation at all, so there is nothing to compare
+        against;
+      * the operation list is TRUNCATED. `affected_ops` is capped at 200 while
+        `affected_op_count` records the real total, and Stripe's `card.iin`
+        touches 551. Answering "not reached" from a list known to be partial
+        would reject a caller for using operation 300 of 551 -- a false
+        NEGATIVE manufactured by a cap, which is the one failure mode this
+        project rates worse than a false positive, because nothing downstream
+        can see it.
+    """
+    paths = _change_operation_paths(finding)
+    if not paths:
+        return True
+    if finding.affected_op_count > len(finding.affected_ops or ()):
+        return True
+    return any(_chain_matches_path(chain, op_path) for op_path in paths)
+
+
 def _operation_calls(module: Module, bindings: Set[str], method: str,
                      path: str, lines: Sequence[str]) -> List[Proof]:
     """Calls that reach `METHOD path`, by SDK chain or by fetch URL."""
@@ -154,13 +229,7 @@ def _operation_calls(module: Module, bindings: Set[str], method: str,
     for call in module.calls:
         if len(call.chain) < 2 or call.chain[0] not in bindings:
             continue
-        middle = {part.lower().rstrip("s") for part in call.chain[1:-1]}
-        if not middle:
-            continue
-        if all(any(segment.lower().rstrip("s") == part
-                   or segment.lower().rstrip("s").endswith(part)
-                   for part in middle)
-               for segment in wanted[-len(middle):]):
+        if _chain_matches_path(call.chain, path):
             found.append(Proof(
                 kind=FIELD_READ, line=call.line, text=_text_at(lines, call.line),
                 chain=[f"`{'.'.join(call.chain)}(...)` on the "
@@ -170,8 +239,17 @@ def _operation_calls(module: Module, bindings: Set[str], method: str,
 
 
 def _reads_of(module: Module, leaf: str, bindings: Set[str],
-              lines: Sequence[str], traced_only: bool = False) -> List[Proof]:
+              lines: Sequence[str], traced_only: bool = False,
+              finding: Optional[Finding] = None,
+              origins: Optional[Dict[int, Tuple[str, ...]]] = None) -> List[Proof]:
     """Reads of `leaf`, optionally only where the value came from this vendor.
+
+    `finding` turns on the POSITIONAL filter: a read only counts when it sits
+    where the subject says it sits. Without it this accepted
+    `subscription.currency` as a read of `deleted_discount.coupon.currency` --
+    the same word at a different place -- which was twelve of the thirteen
+    impacts the scanner reported across 22 real repositories on 2026-08-21.
+    See `dependence.read_sits_where_subject_says`.
 
     `traced_only` is the difference between dependence and coincidence. Without
     it this returned every `.name`, `.id` and `.user` in the file: Langfuse's
@@ -191,6 +269,11 @@ def _reads_of(module: Module, leaf: str, bindings: Set[str],
         chain = origin.get(read.base)
         if traced_only and chain is None:
             continue
+        if finding is not None and not read_sits_where_subject_says(
+                finding, (read.base,) + tuple(read.path), leaf):
+            continue
+        if origins is not None and chain is not None:
+            origins[read.line] = chain
         proof_chain = [f"reads `{read.base}.{'.'.join(read.path)}`"]
         if chain is not None:
             proof_chain.append(
@@ -286,16 +369,34 @@ def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], s
         return sends, ""
 
     # Route 1: the value is traced to a vendor call and the field is read off
-    # it. Dependence end to end, and it needs nothing else.
-    traced = _reads_of(module, leaf, bindings, lines, traced_only=True)
-    if traced:
-        return traced, ""
+    # it. Dependence end to end -- but "the field" is a POSITION, not a word.
+    # This route used to return on the word alone, and twelve of the thirteen
+    # impacts it produced across 22 real repositories were the same word at a
+    # different place: `subscription.currency` returned as a read of
+    # `deleted_discount.coupon.currency`. Two questions now, and neither is
+    # the other: does the read sit where the subject says (position), and does
+    # the call it came from reach an operation this change touches (reach).
+    origins: Dict[int, Tuple[str, ...]] = {}
+    traced = _reads_of(module, leaf, bindings, lines, traced_only=True,
+                       finding=finding, origins=origins)
+    reaching = [proof for proof in traced
+                if _chain_reaches_change(origins.get(proof.line, ()), finding)]
+    if reaching:
+        return reaching, ""
 
     # Route 2: the field is read somewhere, AND this file calls an operation
     # that carries it. Needed because most reads happen on a function
     # parameter whose origin is in the caller and not visible here.
-    reads = _reads_of(module, leaf, bindings, lines)
+    reads = _reads_of(module, leaf, bindings, lines, finding=finding)
     if not reads:
+        if traced:
+            origin_chain = ".".join(origins.get(traced[0].line, ()) or ("?",))
+            return [], (f"reads `{leaf}` off `{origin_chain}(...)`, which "
+                        f"reaches no operation this change touches")
+        ancestry = subject_ancestry(finding)
+        if ancestry:
+            return [], (f"never reads `{leaf}` at `{'.'.join(ancestry)}`, "
+                        f"where `{wire_subject(finding)}` sits")
         return [], f"never reads `{leaf}` off a value from this vendor"
     calls = _operation_calls(module, bindings, method, path, lines)
     if not calls:

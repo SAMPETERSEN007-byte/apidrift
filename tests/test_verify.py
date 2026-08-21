@@ -885,3 +885,291 @@ class TestAWrittenHostIsDecisive(unittest.TestCase):
                   'def charge(host, body):\n'
                   '    return requests.post(f"https://{host}/v1/charges", json=body)\n')
         self.assertEqual(verdict_of(source, self._finding(), STRIPE), CONFIRMED)
+
+
+class TestAReadIsAPositionNotAWord(unittest.TestCase):
+    """A word is not a field. `subscription.currency` is not `coupon.currency`.
+
+    Measured 2026-08-21 by scanning 22 real repositories at a three-year
+    window -- the first time the scanner was ever pointed at a window long
+    enough to fire. It produced thirteen impacts and twelve of them were this:
+    a read matched on its LEAF NAME while sitting somewhere the change never
+    touched. Every case below is verbatim from that run, with the source line
+    that produced it.
+
+    Seventh instance of this project's recurring defect and the first inside
+    the PROVER rather than the checker. The prover asked "is this identifier
+    read off something from this vendor?"; the caller's question is "is the
+    value I read the value that changed?".
+    """
+
+    def _js(self, source, finding_obj):
+        return verify_source(source, "billing.ts", finding_obj, STRIPE)
+
+    FORMBRICKS = ('import Stripe from "stripe";\n'
+                  'const stripe = new Stripe(k, { apiVersion: undefined });\n'
+                  'const subscription = await stripe.subscriptions.retrieve(id);\n'
+                  'const currency = subscription.currency ?? "usd";\n')
+
+    LANGFUSE = ('import Stripe from "stripe";\n'
+                'const stripe = new Stripe(k);\n'
+                'const subscription = await stripe.subscriptions.retrieve(id);\n'
+                'const start = subscription.current_period_start * 1000;\n'
+                'const who = subscription.customer?.id;\n')
+
+    def test_currency_on_a_subscription_is_not_currency_on_a_coupon(self):
+        """formbricks create-setup-checkout-session.ts:31, four times over."""
+        removed = finding(kind="response_field_removed",
+                          subject="<deleted_discount>.coupon.currency",
+                          path="/v1/customers/{customer}/discount",
+                          method="delete",
+                          ops=("DELETE /v1/customers/{customer}/discount",))
+        verdict, reason, _, _ = self._js(self.FORMBRICKS, removed)
+        self.assertNotEqual(CONFIRMED, verdict, reason)
+
+    def test_customer_on_a_subscription_is_not_customer_on_a_discount(self):
+        """langfuse handleCloudSpendAlertJob.ts:118."""
+        removed = finding(kind="response_field_removed",
+                          subject="<invoice>.discount.customer",
+                          path="/v1/invoices/{invoice}", method="get",
+                          ops=("GET /v1/invoices/{invoice}",))
+        verdict, reason, _, _ = self._js(self.LANGFUSE, removed)
+        self.assertNotEqual(CONFIRMED, verdict, reason)
+
+    def test_position_decides_even_when_the_operation_IS_reached(self):
+        """The case reach cannot catch, which is why both questions are asked.
+
+        `subscription.discount.customer` genuinely touches the subscription
+        operations this file calls. Only position refutes it.
+        """
+        removed = finding(kind="schema_field_removed",
+                          subject="subscription.discount.customer",
+                          path="/v1/subscriptions/{subscription_exposed_id}",
+                          method="get",
+                          ops=("GET /v1/subscriptions/{subscription_exposed_id}",))
+        verdict, reason, _, _ = self._js(self.LANGFUSE, removed)
+        self.assertNotEqual(CONFIRMED, verdict, reason)
+
+    def test_id_off_a_customer_is_not_id_off_a_price(self):
+        """langfuse:120. `id` is the most reusable word in any API."""
+        removed = finding(kind="response_field_removed",
+                          subject="<invoiceitem>.price.id",
+                          path="/v1/invoiceitems/{invoiceitem}", method="get",
+                          ops=("GET /v1/invoiceitems/{invoiceitem}",))
+        verdict, reason, _, _ = self._js(self.LANGFUSE, removed)
+        self.assertNotEqual(CONFIRMED, verdict, reason)
+
+    def test_the_one_that_is_REAL_still_confirms(self):
+        """The control, and the reason this is a filter and not a deletion.
+
+        Stripe removed `current_period_start` from the subscription object and
+        moved it onto the subscription ITEM. Langfuse's cloud spend alerts read
+        it off the subscription; the line computes `new Date(undefined * 1000)`
+        today. Hand-verified against `stripe/openapi` HEAD on 2026-08-21:
+        absent from `subscription`, present on `subscription_item`.
+        """
+        removed = finding(kind="schema_field_removed",
+                          subject="subscription.current_period_start",
+                          path="/v1/accounts/{account}", method="delete",
+                          ops=("GET /v1/subscriptions/{subscription_exposed_id}",))
+        verdict, reason, _, proofs = self._js(self.LANGFUSE, removed)
+        self.assertEqual(CONFIRMED, verdict, reason)
+        self.assertTrue(any(p.line == 4 for p in proofs),
+                        [(p.line, p.text) for p in proofs])
+
+    def test_a_read_at_the_named_position_confirms(self):
+        """Position REQUIRES the ancestry; it does not forbid the finding."""
+        source = ('import Stripe from "stripe";\n'
+                  'const stripe = new Stripe(k);\n'
+                  'const inv = await stripe.invoices.retrieve(id);\n'
+                  'return inv.discount.customer;\n')
+        removed = finding(kind="response_field_removed",
+                          subject="<invoice>.discount.customer",
+                          path="/v1/invoices/{invoice}", method="get",
+                          ops=("GET /v1/invoices/{invoice}",))
+        verdict, reason, _, _ = verify_source(source, "billing.ts", removed, STRIPE)
+        self.assertEqual(CONFIRMED, verdict, reason)
+
+    def test_reach_abstains_rather_than_refusing_a_truncated_list(self):
+        """`affected_ops` caps at 200 while `card.iin` touches 551.
+
+        Answering "not reached" from a list known to be partial manufactures a
+        false negative out of a display cap, and nothing downstream can see it.
+        """
+        from apidrift.js_dependence import _chain_reaches_change
+        partial = finding(kind="schema_field_removed", subject="card.iin",
+                          ops=("POST /v1/issuing/cards",))
+        partial.affected_op_count = 551
+        self.assertTrue(_chain_reaches_change(
+            ("stripe", "subscriptions", "retrieve"), partial))
+        partial.affected_op_count = 1
+        self.assertFalse(_chain_reaches_change(
+            ("stripe", "subscriptions", "retrieve"), partial))
+
+
+class TestSubjectAncestry(unittest.TestCase):
+    """The subject's grammar decides what a caller writes, and the KIND
+    decides the grammar. Getting it backwards makes the check vacuous on
+    exactly the population it exists for."""
+
+    def test_a_schema_finding_writes_its_schema_name_bare(self):
+        from apidrift.dependence import subject_ancestry
+        self.assertEqual((), subject_ancestry(finding(
+            kind="schema_field_removed",
+            subject="subscription.current_period_start")))
+        self.assertEqual(("discount",), subject_ancestry(finding(
+            kind="schema_field_removed",
+            subject="subscription.discount.customer")))
+
+    def test_a_response_finding_brackets_it_and_wire_subject_removes_it(self):
+        from apidrift.dependence import subject_ancestry
+        self.assertEqual(("discount",), subject_ancestry(finding(
+            kind="response_field_removed",
+            subject="<invoice>.discount.customer")))
+        self.assertEqual((), subject_ancestry(finding(
+            kind="response_field_removed", subject="<invoice>.customer")))
+
+    def test_an_endpoint_subject_is_a_path_and_carries_no_ancestry(self):
+        from apidrift.dependence import subject_ancestry
+        self.assertEqual((), subject_ancestry(finding(
+            kind="endpoint_removed", subject="/guilds/{id}/bulk-ban")))
+
+    def test_a_reached_operation_is_required_when_the_list_is_complete(self):
+        """Reach must be able to say NO, or it is decoration.
+
+        The complement of the abstention test above: with a complete list, a
+        call that reaches none of the changed operations is not a proof.
+        """
+        from apidrift.js_dependence import _chain_reaches_change
+        complete = finding(kind="response_field_removed",
+                           subject="<invoice>.discount.customer",
+                           ops=("GET /v1/invoices/{invoice}",))
+        complete.affected_op_count = 1
+        self.assertFalse(_chain_reaches_change(
+            ("stripe", "subscriptions", "retrieve"), complete))
+        self.assertTrue(_chain_reaches_change(
+            ("stripe", "invoices", "retrieve"), complete))
+
+    def test_a_python_caller_walking_a_body_by_subscript_is_positioned(self):
+        """`body["discount"]["customer"]` is a position, not two words.
+
+        Subscripts and `.get()` are how a Python caller walks a JSON body, so
+        a chain that stopped at the first `[` could not see where a read sits
+        -- and would then accept every read of the leaf anywhere in the file.
+        """
+        from apidrift.dependence import read_position
+        import ast
+        tree = ast.parse('x = body["discount"]["customer"]\n'
+                         'y = body.get("coupon", {}).get("currency")\n')
+        positions = [read_position(n) for n in ast.walk(tree)
+                     if isinstance(n, (ast.Subscript, ast.Call))]
+        self.assertIn(("body", "discount", "customer"), positions)
+        self.assertIn(("body", "coupon", "currency"), positions)
+
+        source = ('import stripe\n'
+                  'inv = stripe.Invoice.retrieve(i)\n'
+                  'who = inv["discount"]["customer"]\n'
+                  'cur = inv["currency"]\n')
+        removed = finding(kind="response_field_removed",
+                          subject="<invoice>.discount.customer",
+                          path="/v1/invoices/{invoice}", method="get",
+                          ops=("GET /v1/invoices/{invoice}",))
+        verdict, reason, _, proofs = verify_source(source, "bill.py", removed, STRIPE)
+        self.assertEqual(CONFIRMED, verdict, reason)
+        self.assertEqual([3], [p.line for p in proofs])
+
+
+class TestAMemberChainNeedsProvenance(unittest.TestCase):
+    """A chain is a vendor call only if its ROOT came from the vendor.
+
+    The largest defect the fourth adversarial audit found (2026-08-21, 74
+    impacts across 22 real repositories). `find_sdk_calls` matched any member
+    chain whose spelling began with one of the finding's idioms, so ordinary
+    local objects were reported as API calls — and, worse, were then used as
+    the ANCHOR that turned an unrelated field read into an impact.
+
+    JavaScript never had this hole: `_vendor_bindings` requires the root be
+    imported from one of the vendor's SDK packages. These are the same gate in
+    Python's terms, and every case is verbatim from the audit.
+
+    🚨 Every fixture carries `import stripe`. Without it `verify_source` stops
+    at NO_VENDOR and never reaches `prove()`, so these tests passed while the
+    gate they exist for was switched off — which the mutation harness caught
+    and a green suite did not.
+    """
+
+    ENDPOINT = dict(kind="endpoint_removed", subject="/projects/{project_id}/collaborators",
+                    path="/projects/{project_id}/collaborators", method="get")
+
+    def _endpoint_finding(self, sigs):
+        return finding(sigs=sigs, ops=("GET /projects/{project_id}/collaborators",),
+                       **self.ENDPOINT)
+
+    def test_a_local_list_append_is_not_an_api_call(self):
+        """onyx utils.py:244 — `collaborators` is a `List[UserInfo]`."""
+        source = ("import stripe\n"
+                  "\n"
+                  "def gather():\n"
+                  "    collaborators = []\n"
+                  "    collaborators.append(info)\n"
+                  "    return collaborators\n")
+        verdict, reason, _, _ = verify_source(
+            source, "utils.py", self._endpoint_finding(("collaborators",)), STRIPE)
+        self.assertNotEqual(CONFIRMED, verdict, reason)
+
+    def test_a_dict_get_is_not_an_api_call(self):
+        """posthog github_integration_base.py:140 — `permissions` is a dict."""
+        source = ("import stripe\n"
+                  "\n"
+                  "def check(repo):\n"
+                  "    permissions = repo.get('permissions')\n"
+                  "    return permissions.get('push')\n")
+        verdict, reason, _, _ = verify_source(
+            source, "base.py", self._endpoint_finding(("permissions",)), STRIPE)
+        self.assertNotEqual(CONFIRMED, verdict, reason)
+
+    def test_the_standard_library_is_not_an_api_call(self):
+        """posthog github_grants.py:110 — `secrets` is the stdlib module,
+        reported three times over as GitHub's environment-secret endpoints."""
+        source = ("import secrets\n"
+                  "import stripe\n"
+                  "\n"
+                  "def make():\n"
+                  "    return secrets.token_urlsafe(32)\n")
+        verdict, reason, _, _ = verify_source(
+            source, "grants.py", self._endpoint_finding(("secrets.",)), STRIPE)
+        self.assertNotEqual(CONFIRMED, verdict, reason)
+
+    def test_a_real_sdk_chain_still_proves_the_call(self):
+        """The control. The gate must remove coincidence, not evidence."""
+        source = ("import stripe\n"
+                  "def load(i):\n"
+                  "    return stripe.checkout.Session.create(i)\n")
+        from apidrift.dependence import find_sdk_calls, _assignments_of
+        import ast
+        tree = ast.parse(source)
+        proofs = find_sdk_calls(tree, ["stripe.checkout"], source.splitlines(),
+                                STRIPE, _assignments_of(tree))
+        self.assertEqual(1, len(proofs), proofs)
+
+    def test_a_client_traced_through_an_assignment_still_proves_it(self):
+        """Provenance is not spelling: the root may be any local name."""
+        source = ("import stripe\n"
+                  "client = stripe.StripeClient(key)\n"
+                  "def load(i):\n"
+                  "    return client.checkout.sessions.create(i)\n")
+        from apidrift.dependence import find_sdk_calls, _assignments_of
+        import ast
+        tree = ast.parse(source)
+        proofs = find_sdk_calls(tree, ["client.checkout"], source.splitlines(),
+                                STRIPE, _assignments_of(tree))
+        self.assertEqual(1, len(proofs), proofs)
+
+    def test_without_a_vendor_nothing_is_proven(self):
+        """An unprovenanced chain is what this function must stop accepting,
+        so the vendor-less call returns nothing rather than everything."""
+        from apidrift.dependence import find_sdk_calls
+        import ast
+        source = "collaborators.append(x)\n"
+        self.assertEqual([], find_sdk_calls(ast.parse(source), ["collaborators"],
+                                            source.splitlines()))

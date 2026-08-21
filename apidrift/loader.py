@@ -393,6 +393,40 @@ def _nullability_wrapper_arm(
     return real[0]
 
 
+def _nullable_wrapper_payload(node: Any, resolver: "Resolver") -> Optional[Any]:
+    """The payload arm of a property whose union expresses only nullability.
+
+    OpenAPI 3.1 DELETED the `nullable` keyword. `{type: string, nullable: true}`
+    and `{anyOf: [{type: string}, {type: "null"}]}` are the same field written
+    in two dialects of the same language, and a vendor migrating 3.0 -> 3.1
+    changes every nullable field in the document at once.
+
+    The operation-level flattener has always known this
+    (`_nullability_wrapper_arm`). The SCHEMA view did not, and the schema view
+    is what the schema-level diff compares: OpenAI's migration reported
+    `string -> anyOf` on `ChatCompletionResponseMessage.content` and
+    `ChatCompletionStreamResponseDelta.content` as BREAKING type changes, and
+    those two fields alone were 75 of the 295 impacts a 22-repository scan
+    produced on 2026-08-21. Nothing on the wire moved.
+
+    Delegates to `_nullability_wrapper_arm` rather than restating its rule --
+    one opinion, one implementation. Both of its guards therefore hold here:
+    a union with two or more real arms is left alone (losing one of those is a
+    payload alternative genuinely disappearing), and nullability must be
+    DECLARED by a `null` member or by `nullable: true`, so a one-member `oneOf`
+    that has simply not grown its second arm yet stays a real union.
+    """
+    if not isinstance(node, dict) or "properties" in node:
+        return None
+    for keyword in ("oneOf", "anyOf"):
+        members = node.get(keyword)
+        if isinstance(members, list) and members:
+            arm = _nullability_wrapper_arm(node, members, resolver, set())
+            if arm is not None:
+                return arm
+    return None
+
+
 def flatten_schema(
     schema: Any,
     resolver: Resolver,
@@ -949,6 +983,21 @@ def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
                 target = _ref_name(prop)
                 resolved, _ = resolver.resolve(prop, None) if not target else (prop, None)
                 node = prop if target else (resolved if isinstance(resolved, dict) else {})
+                # 3.0 spelled nullability with a keyword, 3.1 spells it with
+                # a union arm. Collapse the union so the two dialects compare
+                # equal -- and so a field that genuinely BECAME nullable still
+                # shows up, which the previous code could not see either.
+                wrapped_nullable = False
+                if not target:
+                    arm = _nullable_wrapper_payload(node, resolver)
+                    if arm is not None:
+                        wrapped_nullable = True
+                        target = _ref_name(arm)
+                        if target:
+                            node = arm
+                        else:
+                            unwrapped, _ = resolver.resolve(arm, None)
+                            node = unwrapped if isinstance(unwrapped, dict) else {}
                 if not target and isinstance(node, dict) and "allOf" in node:
                     # An `allOf` was merged only for a NAMED schema, never for
                     # a property written as one. So a property that composes a
@@ -971,7 +1020,9 @@ def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
                     item=_item_type(node, resolver) if not target else None,
                     item_enum=_item_enum(node, resolver) if not target else None,
                     required=str(prop_name) in required,
-                    nullable=_is_nullable(node) if isinstance(node, dict) else False,
+                    nullable=(wrapped_nullable
+                              or (_is_nullable(node) if isinstance(node, dict)
+                                  else False)),
                     enum=(_effective_enum(node, resolver)
                           if isinstance(node, dict) and not target else None),
                     shape=(tuple(sorted(inline_props))

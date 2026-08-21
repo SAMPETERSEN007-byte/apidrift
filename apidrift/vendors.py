@@ -20,6 +20,26 @@ class Vendor:
     # Literals that tie a source file to THIS vendor's API. Without one of
     # these, a matching symbol is a coincidence, not a customer.
     evidence: Tuple[str, ...] = ()
+    # 🚨 Does this vendor serve DATED API versions, so that a caller is pinned
+    # to the version its SDK was built against rather than to HEAD?
+    #
+    # This is the difference between "the spec changed" and "your code broke",
+    # and getting it wrong invalidated the most convincing impact this tool has
+    # ever produced. Stripe moved `current_period_start` off the subscription
+    # object in `2025-03-31.basil`; langfuse reads it at
+    # `handleCloudSpendAlertJob.ts:96` and is NOT broken, because
+    # `stripe-node@17.4.0` sends `2024-11-20.acacia` and Stripe still serves
+    # that shape. Two independent auditors refuted it on 2026-08-21 and both
+    # were right. The whole point of a dated API version is that the vendor
+    # does not break a pinned caller, so a HEAD-to-HEAD spec diff says nothing
+    # about one.
+    #
+    # The spec is still worth diffing for these vendors -- it is exactly what
+    # the caller meets on the day the SDK is upgraded -- but a claim about a
+    # REPOSITORY needs the caller's version, and the SDK's built-in default is
+    # not in the document. Where it cannot be established, `scan` must report
+    # UNMEASURED rather than an impact.
+    versioned: bool = False
 
 
 VENDORS: Dict[str, Vendor] = {
@@ -121,6 +141,7 @@ VENDORS: Dict[str, Vendor] = {
     ),
 
     "square": Vendor(
+        versioned=True,   # Square-Version; the SDK pins the release it shipped with
         key="square", name="Square", repo="square/connect-api-specification",
         spec_path="api.json", docs_url="https://developer.squareup.com/reference/square",
         version_prefixes=("/v2",),
@@ -163,6 +184,7 @@ VENDORS: Dict[str, Vendor] = {
         evidence=("mistralai", "from mistral", "api.mistral.ai", "MISTRAL_API_KEY"),
     ),
     "klaviyo": Vendor(
+        versioned=True,   # a `revision` header is REQUIRED and the SDK supplies it
         key="klaviyo", name="Klaviyo", repo="klaviyo/openapi",
         spec_path="openapi/stable.json", docs_url="https://developers.klaviyo.com/en/reference/api_overview",
         version_prefixes=("/api",),
@@ -247,6 +269,7 @@ VENDORS: Dict[str, Vendor] = {
     ),
 
     "stripe": Vendor(
+        versioned=True,   # Stripe-Version; stripe-node and stripe-python each pin one
         key="stripe",
         name="Stripe",
         repo="stripe/openapi",
@@ -277,6 +300,7 @@ VENDORS: Dict[str, Vendor] = {
         evidence=("import twilio", "from twilio", "require('twilio')", 'require("twilio")', "api.twilio.com", "TWILIO_AUTH_TOKEN", "TWILIO_ACCOUNT_SID"),
     ),
     "plaid": Vendor(
+        versioned=True,   # Plaid-Version; the SDKs pin the release they shipped with
         key="plaid",
         name="Plaid",
         repo="plaid/plaid-openapi",

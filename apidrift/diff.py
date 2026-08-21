@@ -629,7 +629,8 @@ def _security_tightened(
                   f"satisfy this operation")
 
 
-def _diff_operation(old: Operation, new: Operation) -> List[Finding]:
+def _diff_operation(old: Operation, new: Operation,
+                    old_spec: Optional[Spec] = None) -> List[Finding]:
     out: List[Finding] = []
     # Where the request is SENT, before anything about what is in it. Only the
     # document-level `servers` was ever read, so an operation served from
@@ -694,7 +695,21 @@ def _diff_operation(old: Operation, new: Operation) -> List[Finding]:
         # body, which has no named schema for the other pass to find.
         out.extend(_diff_fields(old_resp, new_resp, new, "response", status))
 
+    # A document that names NO security schemes at all has no vocabulary for
+    # auth, and its silence is an absence of DOCUMENTATION, not an absence of
+    # authentication. OpenAI's 2023 spec declared neither `securitySchemes` nor
+    # `security`; the 2026 one declares document-level `ApiKeyAuth`. The API
+    # required a key throughout. Comparing the two scored a new auth
+    # requirement on every operation in the document at once -- 23 of the 295
+    # impacts a 22-repository scan produced on 2026-08-21, and the same shape
+    # as `unreachable` on a dereferenced document: a precondition that holds
+    # for 100% of the old document's operations is a broken instrument, not a
+    # result. The control is a COUNT, so this can only fire where there was
+    # genuinely nothing to compare against.
+    undocumented_before = old_spec is not None and not old_spec.security_schemes
     tightened, why = _security_tightened(old.security, new.security)
+    if tightened and undocumented_before:
+        tightened = False
     if tightened:
         out.append(_mk(
             new, "security_requirement_added", BREAKING, why,
@@ -954,7 +969,7 @@ def diff_specs(vendor: str, old: Spec, new: Spec, meta: Dict[str, str]) -> DiffR
             # Skipping it meant a vendor who renamed a path parameter AND
             # dropped a required field in the same release had the field
             # removal go unreported entirely.
-            findings.extend(_diff_operation(op, new_op))
+            findings.extend(_diff_operation(op, new_op, old))
             if caller_visible_path(key) == caller_visible_path(new_op.key):
                 continue      # a parameter was renamed; the URL is unchanged
             findings.append(_mk(
@@ -970,7 +985,8 @@ def diff_specs(vendor: str, old: Spec, new: Spec, meta: Dict[str, str]) -> DiffR
         ))
 
     for key in sorted(old_keys & new_keys):
-        findings.extend(_diff_operation(old.operations[key], new.operations[key]))
+        findings.extend(_diff_operation(old.operations[key],
+                                        new.operations[key], old))
 
     findings.extend(_diff_schema_views(old, new, result.suppressed))
 

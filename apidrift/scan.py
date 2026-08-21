@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,7 +29,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .classify import is_generated_path, is_vendored_path
 from .dependence import prove_relevance
-from .js_dependence import is_js
+from .js_dependence import _SDK_PACKAGES, is_js
 from .js_dependence import prove_relevance as prove_relevance_js
 from .diff import (ADDITIVE_LABEL, BREAKING, ENDPOINT_KINDS, Finding,
                    label_for)
@@ -78,6 +79,44 @@ OTHER_SOURCE_SUFFIXES = {
 # statement about where the API is called and useless as advice.
 _TEST_MARKERS = ("/test_", "/tests/", "/test/", "_test.py", "/conftest.py",
                  "/examples/", "/example/", "/docs/", "/samples/", "/demo")
+
+
+def reaches_through_sdk(source: str, vendor: Vendor) -> bool:
+    """Does this file call the vendor through its SDK rather than raw HTTP?
+
+    It matters only for a vendor that serves DATED API versions. The SDK sends
+    the version it was built against, so the vendor keeps serving that shape
+    however far HEAD has moved -- which is the entire purpose of a dated
+    version. A caller writing its own `fetch` sends no version header and gets
+    the account default, so that one CAN drift.
+
+    Refuted the most convincing impact this tool ever produced: langfuse reads
+    `subscription.current_period_start`, removed from Stripe's subscription
+    object in `2025-03-31.basil`, through `stripe-node@17.4.0`, which sends
+    `2024-11-20.acacia`. Two independent auditors killed it on 2026-08-21 and
+    both were right.
+
+    Asked as an IMPORT of the SDK package, not as a substring of the vendor's
+    evidence markers. The first version of this looked for `"import stripe"`
+    and langfuse writes `import Stripe from "stripe"` -- the marker that
+    actually matched its file was `"stripe."`, which is a method call and not
+    an import at all, so the check passed straight over the case it was written
+    for.
+    """
+    for package in _SDK_PACKAGES.get(vendor.key, ()):
+        quoted = re.escape(package)
+        if re.search(rf"""from\s+['"]{quoted}(/[^'"]*)?['"]""", source):
+            return True
+        if re.search(rf"""require\(\s*['"]{quoted}(/[^'"]*)?['"]""", source):
+            return True
+        if re.search(rf"""import\s+['"]{quoted}(/[^'"]*)?['"]""", source):
+            return True
+    key = re.escape(vendor.key)
+    if re.search(rf"^\s*import\s+{key}\b", source, re.M):
+        return True
+    if re.search(rf"^\s*from\s+{key}(\.\w+)*\s+import\b", source, re.M):
+        return True
+    return False
 
 
 def _is_incidental(rel_path: str) -> bool:
@@ -164,10 +203,26 @@ class ScanResult:
     # {vendor_key: [spec paths]} with no version before the window opened.
     # Nothing behind them could be compared.
     short_history: Dict[str, List[str]] = field(default_factory=dict)
+    # Impacts whose cited line is in a test, fixture, example or doc. The claim
+    # may be perfectly true and it is still not a broken product: a unit test
+    # asserting on a mocked field, or a vendor URL inside a `parametrize`
+    # decorator proving the code does NOT match that vendor, is not a reason to
+    # fail anybody's build. Eight of 74 audited impacts were exactly this
+    # (2026-08-21). Reported in their own section; never in the exit status.
+    incidental: List[Impact] = field(default_factory=list)
+    # {vendor_key: [files]} that reach a DATED-VERSION vendor through its SDK.
+    # The SDK pins the API version it shipped with, so HEAD-to-HEAD spec drift
+    # does not describe what these files receive. Reported, never counted as
+    # clean and never counted as broken -- see `Vendor.versioned`.
+    pinned: Dict[str, List[str]] = field(default_factory=dict)
 
     @property
     def unmeasured_files(self) -> int:
         return sum(sum(langs.values()) for langs in self.unmeasured.values())
+
+    @property
+    def pinned_files(self) -> int:
+        return sum(len(files) for files in self.pinned.values())
     window_days: int = 90
     asof: str = ""
 
@@ -193,8 +248,12 @@ class ScanResult:
             "additions_by_kind": self.additions_by_kind,
             "unmeasured": self.unmeasured,
             "short_history": self.short_history,
+            "pinned": self.pinned,
+            "pinned_files": self.pinned_files,
             "unmeasured_files": self.unmeasured_files,
             "impacts": [i.as_dict() for i in self.impacts],
+            "incidental_count": len(self.incidental),
+            "incidental": [i.as_dict() for i in self.incidental],
             "opportunities": [o.as_dict() for o in self.opportunities],
         }
 
@@ -403,8 +462,21 @@ def scan_repo(
         result.findings_considered += len(relevant)
         before = len(result.impacts)
 
+        # A dated-version vendor reached through its SDK is pinned to the
+        # version that SDK shipped with, and this diff runs HEAD to HEAD.
+        # Those files are UNMEASURED for breakage, which is not the same as
+        # unaffected and emphatically not the same as broken.
+        provable = files
+        if vendor.versioned:
+            pinned = [rel for rel, source in files
+                      if reaches_through_sdk(source, vendor)]
+            if pinned:
+                result.pinned[key] = sorted(pinned)
+                provable = [(rel, src) for rel, src in files
+                            if rel not in set(pinned)]
+
         for finding in relevant:
-            for rel, source in files:
+            for rel, source in provable:
                 if not can_possibly_match(source, finding):
                     continue
                 verdict, reason, evidence, sites = verify_source(
@@ -470,6 +542,10 @@ def scan_repo(
                      f"opportunit"
                      f"{'y' if len(result.opportunities) - opportunities_before == 1 else 'ies'}\n")
 
+    # Split before sorting so neither list can be read as the other.
+    result.incidental = [i for i in result.impacts if _is_incidental(i.file)]
+    result.impacts = [i for i in result.impacts if not _is_incidental(i.file)]
+    result.incidental.sort(key=lambda i: (i.vendor, i.file, i.line, i.subject))
     result.impacts.sort(key=lambda i: (i.vendor, i.file, i.line, i.subject))
     result.opportunities.sort(
         key=lambda i: (_ADDITION_RANK.get(i.kind, 9), i.vendor, i.subject))
@@ -707,11 +783,47 @@ def _opportunity_lines(result: ScanResult) -> List[str]:
     return out
 
 
+def _pinned_lines(result: ScanResult) -> List[str]:
+    """Say what could not be judged, every time. `clean` may not be printed
+    while a pinned file exists — the same rule that already governs an
+    unparseable language, applied to an unknowable API version."""
+    if not result.pinned:
+        return []
+    out = ["", "PINNED TO AN SDK'S OWN API VERSION — these files were NOT "
+           "judged for breakage:"]
+    for key, files in sorted(result.pinned.items()):
+        vendor = get(key)
+        shown = ", ".join(files[:3])
+        more = f" and {len(files) - 3} more" if len(files) > 3 else ""
+        out.append(f"  {vendor.name}: {len(files)} file(s) — {shown}{more}")
+    out.append("  This vendor serves dated API versions and its SDK sends the "
+               "one it shipped with,")
+    out.append("  so drift at HEAD does not describe what these files receive. "
+               "Unmeasured, not safe.")
+    return out
+
+
+def _incidental_lines(result: ScanResult) -> List[str]:
+    """Shown, never counted. Silence here would be a different lie."""
+    if not result.incidental:
+        return []
+    out = ["", f"IN TEST / EXAMPLE / DOC FILES — {len(result.incidental)} "
+           f"change(s) land on code that is not the product. Not in the exit "
+           f"status:"]
+    for impact in result.incidental[:10]:
+        out.append(f"  {impact.file}:{impact.line}: {impact.vendor_name} "
+                   f"{impact.label} — {impact.subject}")
+    if len(result.incidental) > 10:
+        out.append(f"  … and {len(result.incidental) - 10} more.")
+    return out
+
+
 def to_text(result: ScanResult) -> str:
     """Terminal/CI output: one line per impact, in the file:line:message form
     every editor and log scraper already knows how to jump to."""
     if not result.impacts:
-        if result.unmeasured or result.short_history:
+        if (result.unmeasured or result.short_history or result.pinned
+                or result.incidental):
             head = (f"apidrift: no impact found "
                     f"({result.findings_considered} breaking changes checked) "
                     f"— but this repo is NOT clean-checked, see below")
@@ -722,6 +834,8 @@ def to_text(result: ScanResult) -> str:
             head = (f"apidrift: clean — {result.findings_considered} breaking "
                     f"changes checked, none reach this repo")
         return "\n".join([head] + _short_history_lines(result)
+                          + _incidental_lines(result)
+                          + _pinned_lines(result)
                           + _unmeasured_lines(result)
                           + _opportunity_lines(result)) + "\n"
     out = []
@@ -735,6 +849,8 @@ def to_text(result: ScanResult) -> str:
     out.append(f"apidrift: {len(result.breaking)} breaking change(s) land on "
                f"this repository")
     out.extend(_short_history_lines(result))
+    out.extend(_incidental_lines(result))
+    out.extend(_pinned_lines(result))
     out.extend(_unmeasured_lines(result))
     out.extend(_opportunity_lines(result))
     return "\n".join(out) + "\n"

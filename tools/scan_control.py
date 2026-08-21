@@ -60,9 +60,25 @@ def _wire_leaf(subject: str) -> str:
     writes, `<Name>` is a schema name and is not. Stripping the brackets and
     taking the final dotted segment yields the field, not the schema.
     """
+    return (_wire_path(subject) or [""])[-1]
+
+
+def _wire_path(subject: str) -> List[str]:
+    """Every step of a subject that is on the wire, in order.
+
+    🚨 The leaf alone is not enough to build a fixture with, and building one
+    from it wrote a read at the WRONG POSITION. Stripe's
+    `<radar.payment_evaluation>.insights.card_issuer_decline` produced
+    `record.card_issuer_decline`, which is not a read of that field at all --
+    the field is at `record.insights.card_issuer_decline`. The control passed
+    for as long as the prover made the same mistake, and went SILENT the moment
+    the prover learned that a read is a position and not a word. A control
+    that chooses its stimulus the way the mechanism under test would is not
+    measuring that mechanism.
+    """
     import re as _re
     plain = _re.sub(r"<[^<>]*>", "", subject)
-    return plain.replace("[]", "").split(".")[-1].strip()
+    return [step for step in plain.replace("[]", "").split(".") if step.strip()]
 
 
 def _pick(findings: List[Dict[str, Any]], vendor_key: str) -> Optional[Dict[str, Any]]:
@@ -91,6 +107,7 @@ def _pick(findings: List[Dict[str, Any]], vendor_key: str) -> Optional[Dict[str,
         if not segments:
             continue
         return {"finding": finding, "leaf": leaf,
+                "wire_path": _wire_path(finding.get("subject") or ""),
                 "resource": segments[-1], "path": path,
                 "method": finding.get("method", "GET").lower()}
     return None
@@ -102,6 +119,9 @@ def _write_fixture(root: Path, vendor_key: str, case: Dict[str, Any]) -> Dict[st
     src = root / "src"
     src.mkdir(parents=True, exist_ok=True)
     resource, leaf, path = case["resource"], case["leaf"], case["path"]
+    # The read must sit where the subject says it sits, or this fixture is not
+    # a dependence and finding it would prove nothing.
+    access = ".".join(case.get("wire_path") or [leaf])
 
     python = (
         f"{client['py_import']}\n"
@@ -109,7 +129,7 @@ def _write_fixture(root: Path, vendor_key: str, case: Dict[str, Any]) -> Dict[st
         f"def load(ident):\n"
         f"    # {path}\n"
         f"    record = {client['py_call'].format(resource=resource)}\n"
-        f"    return record.{leaf}\n"
+        f"    return record.{access}\n"
     )
     (src / "app.py").write_text(python)
 
@@ -119,12 +139,39 @@ def _write_fixture(root: Path, vendor_key: str, case: Dict[str, Any]) -> Dict[st
         f"export async function load(ident: string) {{\n"
         f"  // {path}\n"
         f"  const record = await {client['ts_call'].format(resource=resource)};\n"
-        f"  return record.{leaf};\n"
+        f"  return record.{access};\n"
         f"}}\n"
     )
     (src / "app.ts").write_text(typescript)
-    return {"src/app.py": python.splitlines().index(f"    return record.{leaf}") + 1,
-            "src/app.ts": typescript.splitlines().index(f"  return record.{leaf};") + 1}
+
+    # 🚨 A vendor that serves DATED API versions does not break a caller on an
+    # SDK, because the SDK sends the version it shipped with. The two files
+    # above are therefore UNMEASURED for Stripe and Plaid, and asking them to
+    # fire would be asking the tool to make a claim that is not true. The
+    # population that CAN still drift is the caller writing its own request,
+    # so that is what the control demands of a versioned vendor -- and it
+    # separately demands that the SDK files land in the `pinned` bucket rather
+    # than going quiet, because silence and abstention are not the same result.
+    host = _api_host(vendor_key)
+    raw = (f"import requests\n"
+           f"\n"
+           f"def load(ident):\n"
+           f"    record = requests.get(\n"
+           f'        "https://{host}{path}".replace("{{ident}}", ident)\n'
+           f"    ).json()\n"
+           f"    return record{''.join(f'[{step!r}]' for step in (case.get('wire_path') or [leaf]))}\n")
+    (src / "raw.py").write_text(raw)
+    return {"src/app.py": python.splitlines().index(f"    return record.{access}") + 1,
+            "src/app.ts": typescript.splitlines().index(f"  return record.{access};") + 1}
+
+
+def _api_host(vendor_key: str) -> str:
+    """The vendor's API host, from its own evidence markers."""
+    for marker in get(vendor_key).evidence:
+        if "." in marker and "/" not in marker and " " not in marker \
+                and not marker.endswith("."):
+            return marker
+    return f"api.{vendor_key}.com"
 
 
 def run(findings_path: Path, cache: Path, asof: str, days: int,
@@ -151,7 +198,7 @@ def run(findings_path: Path, cache: Path, asof: str, days: int,
 
     print("Each row: a REAL breaking change, written into a fixture repo as a\n"
           "genuine dependence, in two languages. Both must be found.\n")
-    header = f"{'vendor':10} {'field':26} {'python':>10} {'typescript':>12}"
+    header = f"{'vendor':10} {'field':26} {'raw/py':>10} {'sdk':>12}"
     print(header)
     print("-" * len(header))
     failures: List[str] = []
@@ -171,7 +218,33 @@ def run(findings_path: Path, cache: Path, asof: str, days: int,
             result = scan_repo(root=tmp, since=since, vendor_keys=[key],
                                cache_dir=cache, fetch=False, asof=asof,
                                window_days=days, progress=None)
-            hit = {impact.file for impact in result.breaking}
+            # Must be THIS finding. Accepting any breaking impact on the file
+            # let an unrelated change carry the control: the TypeScript half
+            # reported FIRED on a fixture whose read was at the wrong position,
+            # because a different Stripe finding also landed on `app.ts`.
+            # Compared on the WIRE form: `scan` reports an Impact's subject
+            # with the schema annotations already stripped, so
+            # `<radar.payment_evaluation>.insights.card_issuer_decline` arrives
+            # as `radar.payment_evaluation.insights.card_issuer_decline` and an
+            # equality test on the raw subject can never match.
+            wanted = _wire_path(case["finding"].get("subject") or "")
+            hit = {impact.file for impact in result.breaking
+                   if _wire_path(impact.subject)[-len(wanted):] == wanted}
+            pinned = set(result.pinned.get(key, ()))
+            if get(key).versioned:
+                # The SDK files must be ABSTAINED ON, by name, and the raw
+                # caller must fire. Either half missing is a failure: a quiet
+                # SDK file that is not in `pinned` is the tool going silent for
+                # a reason it cannot state.
+                py = "FIRED" if "src/raw.py" in hit else "SILENT"
+                ts = "PINNED" if {"src/app.py", "src/app.ts"} <= pinned else "LEAKED"
+                print(f"{key:10} {case['leaf'][:26]:26} {py:>10} {ts:>12}")
+                if py != "FIRED":
+                    failures.append(f"{key}: the RAW-HTTP control did not fire")
+                if ts != "PINNED":
+                    failures.append(f"{key}: an SDK file was neither judged "
+                                    f"nor recorded as pinned")
+                continue
             py = "FIRED" if "src/app.py" in hit else "SILENT"
             ts = "FIRED" if "src/app.ts" in hit else "SILENT"
             print(f"{key:10} {case['leaf'][:26]:26} {py:>10} {ts:>12}")
