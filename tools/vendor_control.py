@@ -230,12 +230,50 @@ def inject_request_enum_value_removed(doc) -> Optional[Tuple[dict, str, Callable
     return None
 
 
+def inject_schema_field_type_changed(doc) -> Optional[Tuple[dict, str, Callable]]:
+    """A NAMED schema's plain string property becomes an integer.
+
+    Every rule that decides whether two notations describe the same thing runs
+    through this class's shape comparison -- the `allOf` wrapper, the array
+    element, the named-versus-inline equivalence -- and a suppressor that went
+    one step too far would swallow a real type change while leaving all five
+    other controls green. A vendor whose spec has no named schema with a plain
+    string property says n/a rather than passing silently.
+    """
+    schemas = ((doc.get("components") or {}).get("schemas")
+               or doc.get("definitions") or {})
+    if not isinstance(schemas, dict):
+        return None
+    for name in sorted(schemas):
+        node = schemas.get(name)
+        props = node.get("properties") if isinstance(node, dict) else None
+        if not isinstance(props, dict):
+            continue
+        for prop_name in sorted(props):
+            prop = props[prop_name]
+            if not isinstance(prop, dict) or prop.get("type") != "string":
+                continue
+            if prop.get("enum"):
+                continue
+            out = copy.deepcopy(doc)
+            live = ((out.get("components") or {}).get("schemas")
+                    or out.get("definitions"))[name]
+            live["properties"][prop_name] = {"type": "integer"}
+            want = f"{name}.{prop_name}"
+            return out, want, lambda f, w=want, leaf=prop_name: (
+                f.kind.endswith("field_type_changed")
+                and ((f.root_cause or f.subject) == w
+                     or (f.root_cause or f.subject).split(".")[-1] == leaf))
+    return None
+
+
 CONTROLS: Tuple[Tuple[str, Callable], ...] = (
     ("endpoint_removed", inject_endpoint_removed),
     ("response_field_removed", inject_response_field_removed),
     ("request_field_added_required", inject_request_field_added_required),
     ("param_type_changed", inject_param_type_changed),
     ("request_enum_value_removed", inject_request_enum_value_removed),
+    ("schema_field_type_changed", inject_schema_field_type_changed),
 )
 
 

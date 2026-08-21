@@ -460,6 +460,27 @@ class TestRefEquivalence(unittest.TestCase):
         kinds_found = {f.kind for f in run(old, new).findings}
         self.assertNotIn("schema_field_type_changed", kinds_found)
 
+    def test_a_single_arm_allof_over_a_UNION_is_not_a_type_change(self):
+        """The wrapper case that only the reference identity can decide.
+
+        A `oneOf` has no properties, so merging the wrapper's arms leaves an
+        opaque union on one side and `->Choice` on the other, with no shape on
+        either to compare. Nothing but recognising that the wrapper still
+        points at `Choice` settles it.
+        """
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        for document in (old, new):
+            document["components"]["schemas"]["Choice"] = {"oneOf": [
+                {"$ref": "#/components/schemas/Card"},
+                {"$ref": "#/components/schemas/Bank"}]}
+        old["components"]["schemas"]["Card"]["properties"]["src"] = {
+            "$ref": "#/components/schemas/Choice"}
+        new["components"]["schemas"]["Card"]["properties"]["src"] = {
+            "deprecated": True,
+            "allOf": [{"$ref": "#/components/schemas/Choice"}]}
+        self.assertNotIn("schema_field_type_changed",
+                         {f.kind for f in run(old, new).findings})
+
     def test_retargeting_a_ref_to_an_identical_shape_is_not_breaking(self):
         old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
         shape = {"type": "object",
@@ -518,6 +539,191 @@ class TestRefEquivalence(unittest.TestCase):
             "$ref": "#/components/schemas/Bank"}
         self.assertIn("schema_field_type_changed",
                       {f.kind for f in run(old, new).breaking})
+
+
+class TestAllOfWrapperWithProseArm(unittest.TestCase):
+    """`$ref` + siblings rewritten as `allOf: [$ref, {prose}]` is notation.
+
+    A `$ref` sibling is ignored in OpenAPI 3.0, so the only way to attach a
+    description is a wrapper -- and the description lands in a SECOND arm, not
+    outside the wrapper. Only the single-arm form was recognised, so PayPal
+    regenerating its checkout spec turned 296 properties into `->X` becoming a
+    bare `object` and 37 more into `->X_list` becoming a bare `array`.
+    """
+
+    def _wrapped(self, arm):
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        old["components"]["schemas"]["Card"]["properties"]["src"] = {
+            "$ref": "#/components/schemas/Bank", "description": "the source"}
+        new["components"]["schemas"]["Card"]["properties"]["src"] = {
+            "allOf": [{"$ref": "#/components/schemas/Bank"}, arm]}
+        return old, new
+
+    def test_a_prose_only_second_arm_is_not_a_type_change(self):
+        old, new = self._wrapped({"description": "the source", "title": "src"})
+        self.assertNotIn("schema_field_type_changed", kinds(run(old, new)))
+
+    def test_a_prose_wrapped_UNION_is_not_a_type_change(self):
+        """The case only the reference identity can save.
+
+        A `oneOf` has no properties to merge, so collapsing the wrapper by
+        merging its arms leaves an opaque `oneOf` on one side and `->Choice` on
+        the other, with no shape on either to compare. Recognising that the
+        wrapper still points at `Choice` is the only thing that decides it.
+        """
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        for doc in (old, new):
+            doc["components"]["schemas"]["Choice"] = {"oneOf": [
+                {"$ref": "#/components/schemas/Card"},
+                {"$ref": "#/components/schemas/Bank"}]}
+        old["components"]["schemas"]["Card"]["properties"]["src"] = {
+            "$ref": "#/components/schemas/Choice", "description": "either"}
+        new["components"]["schemas"]["Card"]["properties"]["src"] = {
+            "allOf": [{"$ref": "#/components/schemas/Choice"},
+                      {"description": "either"}]}
+        self.assertNotIn("schema_field_type_changed", kinds(run(old, new)))
+
+    def test_an_arm_that_carries_a_contract_is_still_read(self):
+        """The suppression is about PROSE. An arm with properties is content.
+
+        Without this the rule would collapse every `allOf` onto its first
+        reference and quietly delete whatever the other arms said.
+        """
+        old, new = self._wrapped({"properties": {"extra": {"type": "string"}}})
+        from apidrift.loader import _ref_name
+        self.assertIsNone(
+            _ref_name(new["components"]["schemas"]["Card"]["properties"]["src"]),
+            "an arm carrying properties must not be treated as prose")
+
+    def test_the_wrapper_still_compares_the_TARGETS(self):
+        """Seeing through the wrapper is not the same as ignoring it."""
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        old["components"]["schemas"]["Card"]["properties"]["src"] = {
+            "$ref": "#/components/schemas/Bank"}
+        new["components"]["schemas"]["Card"]["properties"]["src"] = {
+            "allOf": [{"$ref": "#/components/schemas/Widget"},
+                      {"description": "now something else"}]}
+        new["components"]["schemas"]["Widget"] = {
+            "type": "object", "properties": {"colour": {"type": "string"}}}
+        self.assertIn("schema_field_type_changed", kinds(run(old, new)),
+                      "the wrapper points somewhere else and that IS a break")
+
+
+class TestAllOfCarriesTheArmsEnum(unittest.TestCase):
+    """`readOnly` is not prose, so the wrapper is merged rather than seen past.
+
+    The merge carried properties, required and an unambiguous union, and
+    dropped `enum` on the floor. PayPal attaches `readOnly` to a reference that
+    way, so thirty card brands merged down to the bare word "string" and the
+    identical property written as a plain `$ref` compared unequal to it.
+    """
+
+    def _docs(self, old_prop, new_prop, extra=None):
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        for document in (old, new):
+            document["components"]["schemas"]["Brand"] = {
+                "type": "string", "enum": ["visa", "amex"]}
+            document["components"]["schemas"].update(
+                copy.deepcopy(extra) or {})
+        old["components"]["schemas"]["Card"]["properties"]["brand"] = old_prop
+        new["components"]["schemas"]["Card"]["properties"]["brand"] = new_prop
+        return old, new
+
+    def test_a_readonly_arm_over_an_enum_ref_is_not_a_type_change(self):
+        old, new = self._docs(
+            {"$ref": "#/components/schemas/Brand", "readOnly": True},
+            {"allOf": [{"$ref": "#/components/schemas/Brand"},
+                       {"readOnly": True}]})
+        self.assertNotIn("schema_field_type_changed", kinds(run(old, new)))
+
+    def test_arms_with_disagreeing_enums_do_not_invent_one(self):
+        """An `allOf` of two enums is their INTERSECTION, which this shape
+        cannot represent. Picking one arm's answer would silently widen it."""
+        old, new = self._docs(
+            {"$ref": "#/components/schemas/Brand"},
+            {"allOf": [{"$ref": "#/components/schemas/Brand"},
+                       {"$ref": "#/components/schemas/Narrow"}]},
+            {"Narrow": {"type": "string", "enum": ["visa"]}})
+        self.assertIn("schema_field_type_changed", kinds(run(old, new)),
+                      "the intersection is narrower and must not be papered over")
+
+
+class TestArrayElementNotation(unittest.TestCase):
+    """A named list schema and the same list inlined are one array.
+
+    `_item_shape` resolved a NAMED element to `("scalar", "string")` and left an
+    inline one as the bare string `"string"`, so the two notations could never
+    compare equal however identical the elements were. PayPal inlined
+    `products_list`, `labels_list`, `dispute_categories_list` and
+    `callback_events_list` in one release.
+    """
+
+    def _named_then_inline(self, element, inline_element=None):
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        old["components"]["schemas"]["Items"] = {
+            "type": "array", "items": {"$ref": "#/components/schemas/Element"}}
+        old["components"]["schemas"]["Element"] = copy.deepcopy(element)
+        old["components"]["schemas"]["Card"]["properties"]["tags"] = {
+            "$ref": "#/components/schemas/Items"}
+        new["components"]["schemas"]["Card"]["properties"]["tags"] = {
+            "type": "array",
+            "items": copy.deepcopy(inline_element or element)}
+        return old, new
+
+    def test_inlining_an_array_of_strings_is_not_a_type_change(self):
+        old, new = self._named_then_inline({"type": "string"})
+        self.assertNotIn("schema_field_type_changed", kinds(run(old, new)))
+
+    def test_inlining_an_array_of_an_enum_keeps_its_values(self):
+        old, new = self._named_then_inline(
+            {"type": "string", "enum": ["a", "b"]})
+        self.assertNotIn("schema_field_type_changed", kinds(run(old, new)))
+
+    def test_the_elements_are_still_compared(self):
+        """Symmetry is not blindness: a real element change still fires."""
+        old, new = self._named_then_inline({"type": "string"},
+                                           {"type": "integer"})
+        self.assertIn("schema_field_type_changed", kinds(run(old, new)),
+                      "array of string -> array of integer is a break")
+
+    def test_the_element_VALUES_are_still_compared(self):
+        old, new = self._named_then_inline(
+            {"type": "string", "enum": ["a", "b"]},
+            {"type": "string", "enum": ["a", "c"]})
+        self.assertIn("schema_field_type_changed", kinds(run(old, new)),
+                      "the element enum changed and that is not notation")
+
+
+class TestPropertyLevelAllOf(unittest.TestCase):
+    """An `allOf` written AT A PROPERTY was never merged, only named schemas.
+
+    So a property composing a reference with an overlay read as a bare `object`
+    with no fields, and the same thing written as a plain `$ref` read as
+    `->Name`: unequal on notation with no shape on either side to compare them
+    by. Klaviyo turned `allOf: [{$ref: X}, {properties: ...}]` into `$ref: X`
+    and Cloudflare did the reverse in the same window.
+    """
+
+    def _overlay(self, overlay_props):
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        old["components"]["schemas"]["Card"]["properties"]["acct"] = {
+            "allOf": [{"$ref": "#/components/schemas/Bank"},
+                      {"type": "object", "properties": overlay_props}]}
+        new["components"]["schemas"]["Card"]["properties"]["acct"] = {
+            "$ref": "#/components/schemas/Bank"}
+        return old, new
+
+    def test_an_overlay_that_adds_nothing_visible_is_not_a_type_change(self):
+        # The overlay only refines a property `Bank` already declares, so the
+        # names a consumer sees are the same on both sides.
+        old, new = self._overlay({"routing": {"type": "string",
+                                              "maxLength": 9}})
+        self.assertNotIn("schema_field_type_changed", kinds(run(old, new)))
+
+    def test_an_overlay_that_adds_a_field_is_still_a_change(self):
+        old, new = self._overlay({"sortcode": {"type": "string"}})
+        self.assertIn("schema_field_type_changed", kinds(run(old, new)),
+                      "the old side carried a field the new side does not")
 
 
 class TestProvenanceSeverity(unittest.TestCase):

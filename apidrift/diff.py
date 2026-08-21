@@ -1041,14 +1041,16 @@ def _field_shape(field: Field, spec: Spec) -> Optional[Tuple]:
             # Resolved on both sides or not at all. Answering "array" here
             # while the inline form answered None made the same array compare
             # unequal to itself purely on notation.
-            return ("array", _item_shape(view.item, spec)) if view.item else None
+            return (("array", _item_shape(view.item, spec, view.item_enum))
+                    if view.item else None)
         return ("scalar", view.kind)
     if field.enum:
         return ("enum", field.enum)
     if field.shape:
         return ("object", field.shape)
     if field.type == "array":
-        return ("array", _item_shape(field.item, spec)) if field.item else None
+        return (("array", _item_shape(field.item, spec, field.item_enum))
+                if field.item else None)
     if field.type in ("object", "any", "oneOf", "anyOf"):
         # Too coarse to call equivalent without more resolution.
         return None
@@ -1222,15 +1224,24 @@ def _shape_at_parents(name: str, view, parents: Set[str],
                if p in old.schemas and p in new.schemas)
 
 
-def _item_shape(item: Optional[str], spec: Spec) -> Optional[object]:
+def _item_shape(item: Optional[str], spec: Spec,
+                item_enum: Optional[Tuple[str, ...]] = None) -> Optional[object]:
     """What an array's elements are, resolved past the element's NAME.
 
     `("array", "->Card")` versus `("array", "->CardV2")` compares unequal on
     two names for the same body, which is the very thing this module keeps
     having to unlearn. Resolve the element to its own shape instead.
+
+    Both notations have to come out in the SAME encoding or the resolution
+    buys nothing: a named element resolved to `("scalar", "string")` while an
+    inline one stayed the bare string `"string"`, so an array of a named string
+    and an array of an inline string compared unequal on notation alone. PayPal
+    inlined four list schemas in this window and every one read as a break.
     """
-    if item is None or not item.startswith("->"):
-        return item
+    if item is None:
+        return None
+    if not item.startswith("->"):
+        return ("enum", item_enum) if item_enum else ("scalar", item)
     view = spec.schemas.get(item[2:])
     if view is None:
         return item

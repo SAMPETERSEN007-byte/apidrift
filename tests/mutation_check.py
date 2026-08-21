@@ -477,9 +477,9 @@ MUTATIONS = [
     (
         "single-arm allOf wrapper read as a different type",
         "apidrift/loader.py",
-        "    arms = node.get(\"allOf\")\n    if isinstance(arms, list) and len(arms) == 1 and \"properties\" not in node:",
+        "    arms = node.get(\"allOf\")\n    if isinstance(arms, list) and arms and \"properties\" not in node:",
         "    arms = node.get(\"allOf\")\n    if False:",
-        ["test_allof_wrapper_around_a_ref_is_not_a_type_change"],
+        ["test_a_single_arm_allof_over_a_UNION_is_not_a_type_change"],
     ),
     (
         "schema rename reported as a type change",
@@ -764,7 +764,7 @@ MUTATIONS = [
     (
         "every array compares equal regardless of item type",
         "apidrift/diff.py",
-        "    if field.type == \"array\":\n        return (\"array\", _item_shape(field.item, spec)) if field.item else None",
+        "    if field.type == \"array\":\n        return ((\"array\", _item_shape(field.item, spec, field.item_enum))\n                if field.item else None)",
         "    if field.type == \"array\":\n        return (\"array\", None)",
         ["test_an_array_whose_ITEM_type_changed_is_NOT_the_same_shape"],
     ),
@@ -1283,10 +1283,9 @@ MUTATIONS = [
     (
         "the checker reads a multi-arm allOf as an empty schema again",
         "tests/measure_precision.py",
-        "    if isinstance(prop.get(\"allOf\"), list) and prop[\"allOf\"]:\n        return effective_shape(merge_all_of(prop, doc), doc, depth + 1)",
-        "    if isinstance(prop.get(\"allOf\"), list) and len(prop[\"allOf\"]) == 1 and \"properties\" not in prop:\n        return effective_shape(prop[\"allOf\"][0], doc, depth + 1)",
-        ["test_an_allOf_is_read_as_an_intersection_not_as_nothing",
-         "test_a_field_relocated_between_allOf_arms_is_refuted"],
+        "        merged = merge_all_of(prop, doc)\n        if merged.get(\"allOf\") == arms:          # nothing was flattened\n            return UNRESOLVED\n        return effective_shape(merged, doc, depth)",
+        "        return UNRESOLVED",
+        ["test_an_allOf_is_read_as_an_intersection_not_as_nothing"],
     ),
     (
         "nullability stops being part of the shape a caller sees",
@@ -1304,11 +1303,11 @@ MUTATIONS = [
         ["test_dropping_nullable_from_an_allOf_arm_is_confirmed"],
     ),
     (
-        "everything nullable is called a change, whatever the other side says",
+        "nullability stops being part of the value",
         "tests/measure_precision.py",
         "        return (\"nullable\", effective_shape(rest, doc, depth + 1))",
-        "        return (\"nullable\", id(prop))",
-        ["test_nullable_on_both_sides_is_still_refuted"],
+        "        return effective_shape(rest, doc, depth + 1)",
+        ["test_dropping_nullable_from_the_field_itself_is_confirmed"],
     ),
     (
         "the allOf merge takes the first arm instead of intersecting them all",
@@ -1359,6 +1358,122 @@ MUTATIONS = [
         "        was, now = bases(old), bases(new)\n        if was is None or now is None:",
         "        was, now = bases(old) or set(), bases(new) or set()\n        if False:",
         ["test_a_missing_servers_block_is_UNDECIDABLE_not_refuted"],
+    ),
+
+    # ----------------------------------------------------------------
+    # `allOf` notation. Every one of these is a suppression, so each gets a
+    # mutation in BOTH directions: disabled, and firing unconditionally.
+    # ----------------------------------------------------------------
+    (
+        "only a SINGLE-arm allOf sees through to its ref again",
+        "apidrift/loader.py",
+        "        carrying = [arm for arm in arms if not _annotation_only_arm(arm)]",
+        "        carrying = list(arms)",
+        ["test_a_prose_wrapped_UNION_is_not_a_type_change"],
+    ),
+    (
+        "every allOf arm counts as prose, so a contract arm is thrown away",
+        "apidrift/loader.py",
+        '    return all(key in _ANNOTATION_ONLY or key.startswith("x-") for key in node)',
+        '    return "$ref" not in node',
+        ["test_an_arm_that_carries_a_contract_is_still_read"],
+    ),
+    (
+        "an inline array element goes back to a different encoding "
+        "from a named one",
+        "apidrift/diff.py",
+        '        return ("enum", item_enum) if item_enum else ("scalar", item)',
+        "        return item",
+        ["test_inlining_an_array_of_strings_is_not_a_type_change",
+         "test_inlining_an_array_of_an_enum_keeps_its_values"],
+    ),
+    (
+        "array elements stop being compared at all, so every array matches",
+        "apidrift/diff.py",
+        "    if item is None:\n        return None",
+        "    if True:\n        return None",
+        ["test_the_elements_are_still_compared",
+         "test_the_element_VALUES_are_still_compared"],
+    ),
+    (
+        "the allOf merge drops its arms' enum on the floor again",
+        "apidrift/loader.py",
+        '    if len(set(enums)) == 1 and "enum" not in merged:\n'
+        '        merged["enum"] = list(enums[0])',
+        "    if False:\n        pass",
+        ["test_a_readonly_arm_over_an_enum_ref_is_not_a_type_change"],
+    ),
+    (
+        "the allOf merge invents an enum when its arms disagree",
+        "apidrift/loader.py",
+        '    if len(set(enums)) == 1 and "enum" not in merged:',
+        '    if enums and "enum" not in merged:',
+        ["test_arms_with_disagreeing_enums_do_not_invent_one"],
+    ),
+    (
+        "an allOf written at a PROPERTY stops being merged",
+        "apidrift/loader.py",
+        "                    node = _merge_all_of(node, resolver, set())",
+        "                    pass",
+        ["test_an_overlay_that_adds_nothing_visible_is_not_a_type_change"],
+    ),
+    (
+        "the property merge keeps only the first arm, discarding the overlay",
+        "apidrift/loader.py",
+        "                    node = _merge_all_of(node, resolver, set())",
+        '                    node = _merge_all_of({"allOf": node["allOf"][:1]},'
+        " resolver, set())",
+        ["test_an_overlay_that_adds_a_field_is_still_a_change"],
+    ),
+    (
+        "the checker reads only a single-arm allOf again",
+        "tests/measure_precision.py",
+        "    if isinstance(arms, list) and arms:",
+        "    if isinstance(arms, list) and len(arms) == 1:",
+        ["test_prose_wrapped_in_an_allof_is_refuted_on_its_merits"],
+    ),
+    (
+        "the checker's allOf merge reads only the first arm",
+        "tests/measure_precision.py",
+        "    for arm in prop.get(\"allOf\") or []:",
+        "    for arm in (prop.get(\"allOf\") or [])[:1]:",
+        ["test_an_allof_that_really_gains_a_field_is_confirmed"],
+    ),
+    (
+        "the checker compares two admissions of ignorance for equality again",
+        "tests/measure_precision.py",
+        "            if not _informative(before) or not _informative(after):\n"
+        "                return UNDECIDABLE, (\n"
+        "                    f\"the shape is unresolvable on one side \"\n"
+        "                    f\"(old={before}, new={after}) — this checker cannot see it\")\n"
+        "            if before != after:",
+        "            if before != after:",
+        ["test_two_unresolvable_shapes_are_undecidable_not_refuted",
+         "test_an_unreadable_new_side_is_undecidable_not_confirmed"],
+    ),
+    (
+        "the checker abstains on everything, so layer 3 decides nothing",
+        "tests/measure_precision.py",
+        '    return shape not in ("opaque", UNRESOLVED, ("ref-unresolved",))',
+        "    return False",
+        ["test_a_real_type_change_is_still_confirmed",
+         "test_prose_wrapped_in_an_allof_is_refuted_on_its_merits"],
+    ),
+    (
+        "an empty schema goes back to meaning 'I cannot tell'",
+        "tests/measure_precision.py",
+        "    if not (set(prop) - _ANNOTATION_ONLY):\n        return ANY_VALUE",
+        "    if False:\n        return ANY_VALUE",
+        ["test_an_empty_schema_is_a_positive_statement",
+         "test_an_allOf_is_read_as_an_intersection_not_as_nothing"],
+    ),
+    (
+        "an unreadable node claims to accept anything",
+        "tests/measure_precision.py",
+        "    if prop.get(\"type\") is None and not enum:",
+        "    if False:",
+        ["test_a_node_this_cannot_read_is_NOT_a_positive_statement",
+         "test_two_unresolvable_shapes_are_undecidable_not_refuted"],
     ),
 ]
 

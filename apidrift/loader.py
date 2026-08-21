@@ -47,6 +47,12 @@ class Field:
     # For an array field, what its elements are. "array" alone is too coarse to
     # compare -- it makes an array-of-string look like an array-of-object.
     item: Optional[str] = None
+    # For an array whose elements are written INLINE, the values they allow.
+    # `item` records only the element's TYPE, so an array of an inline string
+    # enum and an array of a NAMED string enum carried the identical set of
+    # values and still compared unequal. PayPal inlined
+    # `dispute_categories_list` and `callback_events_list` in this window.
+    item_enum: Optional[Tuple[str, ...]] = None
     # The vendor's own sentence about what this field is for. Never compared:
     # a reworded description is an edit to prose, not to the API. It exists so
     # a SUGGESTION can say what the thing does instead of only naming it --
@@ -245,11 +251,18 @@ def _merge_all_of(schema: Dict[str, Any], resolver: Resolver, seen: Set[str]) ->
     different union is an intersection of unions, which this shape cannot
     represent, and inventing one arm's worth of an answer would be worse than
     keeping the schema opaque -- so that case is left exactly as it was.
+
+    An unambiguous ENUM is carried on exactly the same terms and for the same
+    reason. `allOf: [{"$ref": card_brand}, {"readOnly": true}]` is how PayPal
+    attaches `readOnly` to a reference, and dropping the arm's enum turned
+    thirty card brands into the bare word "string" -- so the identical property
+    written as a plain `$ref` compared unequal to it.
     """
     merged: Dict[str, Any] = {k: v for k, v in schema.items() if k != "allOf"}
     props: Dict[str, Any] = dict(merged.get("properties") or {})
     required: List[str] = list(merged.get("required") or [])
     unions: List[Tuple[str, List[Any]]] = []
+    enums: List[Tuple[str, ...]] = []
     for member in schema.get("allOf") or []:
         resolved, seen2 = resolver.resolve(member, seen)
         if not isinstance(resolved, dict):
@@ -260,6 +273,9 @@ def _merge_all_of(schema: Dict[str, Any], resolver: Resolver, seen: Set[str]) ->
         required.extend(resolved.get("required") or [])
         if "type" not in merged and resolved.get("type"):
             merged["type"] = resolved["type"]
+        values = _enum_of(resolved)
+        if values:
+            enums.append(values)
         for keyword in ("anyOf", "oneOf"):
             arms = resolved.get(keyword)
             if isinstance(arms, list) and arms:
@@ -272,6 +288,8 @@ def _merge_all_of(schema: Dict[str, Any], resolver: Resolver, seen: Set[str]) ->
     if (len(unions) == 1 and "anyOf" not in merged and "oneOf" not in merged):
         keyword, arms = unions[0]
         merged[keyword] = arms
+    if len(set(enums)) == 1 and "enum" not in merged:
+        merged["enum"] = list(enums[0])
     return merged
 
 
@@ -619,16 +637,47 @@ class SchemaView:
     # discriminator property. Unlike the schema names they point at, these are
     # on the wire, so losing one narrows what a caller may send.
     subtypes: Tuple[str, ...] = ()
+    # Same as `Field.item_enum`: the values an inline element allows, so a
+    # named list schema and an inlined one compare on their contents.
+    item_enum: Optional[Tuple[str, ...]] = None
+
+
+#: Keywords that describe a schema without constraining what validates against
+#: it. An `allOf` arm built only from these adds prose, not a contract.
+_ANNOTATION_ONLY = frozenset({
+    "title", "description", "summary", "deprecated", "example", "examples",
+    "externalDocs", "xml",
+})
+
+
+def _annotation_only_arm(node: Any) -> bool:
+    """True when this `allOf` arm says nothing about what validates.
+
+    Deliberately a whitelist. `default`, `readOnly`, `nullable` and every
+    validation keyword fall outside it, so an arm carrying one is treated as
+    carrying a contract even though it might not.
+    """
+    if not isinstance(node, dict) or not node:
+        return False
+    return all(key in _ANNOTATION_ONLY or key.startswith("x-") for key in node)
 
 
 def _ref_name(node: Any) -> Optional[str]:
-    """The schema a property points at, seeing through a single-arm `allOf`.
+    """The schema a property points at, seeing through an `allOf` wrapper.
 
     Vendors wrap `$ref: X` as `allOf: [$ref: X]` when they need to attach a
     sibling keyword such as `deprecated`, because `$ref` siblings are ignored in
     OpenAPI 3.0. The referenced type is unchanged, so reading the wrapper as a
     different type reports a break where none exists. Plaid did this to
     `Transfer.guarantee_decision`.
+
+    The single-arm form was the only one recognised, and the sibling keywords a
+    vendor is trying to attach usually end up in a SECOND arm rather than
+    outside the wrapper: PayPal rewrote `{"$ref": X, "description": ...}` into
+    `{"allOf": [{"$ref": X}, {"description": ...}]}` across its whole checkout
+    spec in one release, and 296 properties read as `->X` becoming a bare
+    `object`. An arm that carries only prose carries no contract, so a wrapper
+    with exactly one arm that says anything is still just that arm.
     """
     if not isinstance(node, dict):
         return None
@@ -636,8 +685,10 @@ def _ref_name(node: Any) -> Optional[str]:
     if isinstance(ref, str) and "/" in ref:
         return ref.rsplit("/", 1)[-1]
     arms = node.get("allOf")
-    if isinstance(arms, list) and len(arms) == 1 and "properties" not in node:
-        return _ref_name(arms[0])
+    if isinstance(arms, list) and arms and "properties" not in node:
+        carrying = [arm for arm in arms if not _annotation_only_arm(arm)]
+        if len(carrying) == 1:
+            return _ref_name(carrying[0])
     return None
 
 
@@ -750,6 +801,29 @@ def _item_type(node: Any, resolver: "Resolver") -> Optional[str]:
     return _type_of(resolved if isinstance(resolved, dict) else items)
 
 
+def _item_enum(node: Any, resolver: "Resolver") -> Optional[Tuple[str, ...]]:
+    """For an array whose elements are written INLINE, the values they allow.
+
+    `_item_type` records the element's TYPE and nothing else, so an array whose
+    elements are a NAMED string enum resolved to that enum while the identical
+    array written inline resolved to the bare word "string". PayPal inlined
+    `dispute_categories_list` and `callback_events_list` without touching a
+    value and both read as type changes.
+
+    Only the inline form is answered here: an element that is a `$ref` is
+    already reachable by name, and resolving it twice by two routes is how an
+    engine ends up disagreeing with itself.
+    """
+    if not isinstance(node, dict) or _type_of(node) != "array":
+        return None
+    items = node.get("items")
+    if not isinstance(items, dict) or _ref_name(items):
+        return None
+    resolved, _ = resolver.resolve(items, None)
+    target = resolved if isinstance(resolved, dict) else items
+    return _effective_enum(target, resolver)
+
+
 def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
     """One entry per named schema, with its own properties resolved one level."""
     raw = ((doc.get("components") or {}).get("schemas")
@@ -783,6 +857,16 @@ def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
                 target = _ref_name(prop)
                 resolved, _ = resolver.resolve(prop, None) if not target else (prop, None)
                 node = prop if target else (resolved if isinstance(resolved, dict) else {})
+                if not target and isinstance(node, dict) and "allOf" in node:
+                    # An `allOf` was merged only for a NAMED schema, never for
+                    # a property written as one. So a property that composes a
+                    # reference with an overlay read as a bare `object` with no
+                    # fields at all, and the same thing written as a plain
+                    # `$ref` read as `->Name` -- unequal on notation, with no
+                    # shape on either side to compare them by. Klaviyo turned
+                    # `allOf: [{$ref: X}, {properties: ...}]` into `$ref: X` and
+                    # Cloudflare did the reverse in the same window.
+                    node = _merge_all_of(node, resolver, set())
                 inline_props = (node.get("properties")
                                 if isinstance(node, dict) else None)
                 blurb = ""
@@ -793,6 +877,7 @@ def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
                 fields[str(prop_name)] = Field(
                     type=(f"->{target}" if target else _type_of(node)),
                     item=_item_type(node, resolver) if not target else None,
+                    item_enum=_item_enum(node, resolver) if not target else None,
                     required=str(prop_name) in required,
                     nullable=_is_nullable(node) if isinstance(node, dict) else False,
                     enum=(_effective_enum(node, resolver)
@@ -810,6 +895,7 @@ def build_schema_views(doc: Dict[str, Any]) -> Dict[str, SchemaView]:
             kind=stype,
             enum=_effective_enum(merged, resolver),
             item=_item_type(merged, resolver),
+            item_enum=_item_enum(merged, resolver),
             subtypes=_discriminator_keys(merged),
         )
     return views

@@ -431,6 +431,36 @@ class TestNullability(unittest.TestCase):
         self.assertEqual(REFUTED, verdict, why)
 
 
+class TestAnyValueIsNotIgnorance(unittest.TestCase):
+    """`{}` accepts any JSON value. That is the DOCUMENT speaking.
+
+    It used to resolve to `("scalar", None, None)` -- the very same tuple the
+    checker returned when it could not read a node at all. One value meaning
+    both "accepts anything" and "I cannot tell" is what let PayPal's narrowing
+    of `payment_source.crypto` from `{}` to a `crypto_request` read as no
+    change, and it is why guarding the comparison on ignorance broke that case
+    until the two were separated.
+    """
+
+    def test_an_empty_schema_is_a_positive_statement(self):
+        from measure_precision import ANY_VALUE, effective_shape
+        self.assertEqual(ANY_VALUE, effective_shape({}, doc()))
+        self.assertEqual(ANY_VALUE, effective_shape(
+            {"title": "anything", "description": "really"}, doc()))
+
+    def test_a_node_this_cannot_read_is_NOT_a_positive_statement(self):
+        from measure_precision import UNRESOLVED, _informative, effective_shape
+        shape = effective_shape({"minLength": 3}, doc())
+        self.assertEqual(UNRESOLVED, shape)
+        self.assertFalse(_informative(shape))
+
+    def test_narrowing_from_any_to_a_shape_is_still_decidable(self):
+        from measure_precision import ANY_VALUE, _informative
+        self.assertTrue(_informative(ANY_VALUE),
+                        "'accepts anything' must be comparable, or every "
+                        "narrowing away from it reads as unknown")
+
+
 class TestParameterEnum(unittest.TestCase):
     """A query parameter's enum lives in `parameters`, not in a schema.
     `vendor_control.py` injected exactly this break into twelve vendors' real
@@ -598,6 +628,74 @@ class TestServerUrlChanged(unittest.TestCase):
             finding("server_url_changed", subject="<server>",
                     root_cause="server", op_key="GET /"), old, new, [], [])
         self.assertEqual(UNDECIDABLE, verdict, why)
+
+class TestSchemaFieldTypeChanged(unittest.TestCase):
+    """The checker has to READ an `allOf`, not fall past it.
+
+    It recognised a single-arm `allOf` and nothing else, so
+    `{"allOf": [{"$ref": X}, {"description": ...}]}` -- the only way to attach
+    prose to a reference in OpenAPI 3.0 -- came out as ("scalar", None, None),
+    this checker's way of saying it saw nothing at all. That answer was then
+    compared for EQUALITY: two of them REFUTED a finding, and one against a
+    resolved shape CONFIRMED one. Both readings shipped, on 344 findings, and
+    both were the checker reporting its own blindness as a verdict.
+    """
+
+    def _f(self, old_prop, new_prop, extra_old=None, extra_new=None):
+        old_schemas = {"Card": {"type": "object",
+                                "properties": {"src": old_prop}}}
+        new_schemas = {"Card": {"type": "object",
+                                "properties": {"src": new_prop}}}
+        old_schemas.update(extra_old or {})
+        new_schemas.update(extra_new or {})
+        return (finding("schema_field_type_changed", root_cause="Card.src",
+                        subject="Card.src"),
+                doc(old_schemas), doc(new_schemas))
+
+    def test_prose_wrapped_in_an_allof_is_refuted_on_its_merits(self):
+        bank = {"Bank": {"type": "object",
+                         "properties": {"id": {"type": "string"}}}}
+        f, old, new = self._f(
+            {"$ref": "#/components/schemas/Bank", "description": "src"},
+            {"allOf": [{"$ref": "#/components/schemas/Bank"},
+                       {"description": "src", "deprecated": True}]},
+            bank, bank)
+        verdict, why = check(f, old, new, [], [])
+        self.assertEqual(REFUTED, verdict, why)
+        self.assertIn("Bank" if "Bank" in why else "object", why)
+
+    def test_an_allof_that_really_gains_a_field_is_confirmed(self):
+        bank = {"Bank": {"type": "object",
+                         "properties": {"id": {"type": "string"}}}}
+        f, old, new = self._f(
+            {"allOf": [{"$ref": "#/components/schemas/Bank"}]},
+            {"allOf": [{"$ref": "#/components/schemas/Bank"},
+                       {"type": "object",
+                        "properties": {"extra": {"type": "string"}}}]},
+            bank, bank)
+        verdict, why = check(f, old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+
+    def test_two_unresolvable_shapes_are_undecidable_not_refuted(self):
+        """A refuter that knows nothing about either side has decided nothing.
+
+        `{}` on both sides says the same thing twice: not that they agree, but
+        that this checker cannot see them. Reporting REFUTED there is the same
+        defect as a suppressor whose precondition holds for every input.
+        """
+        f, old, new = self._f({"externalRef": "a"}, {"externalRef": "b"})
+        verdict, why = check(f, old, new, [], [])
+        self.assertEqual(UNDECIDABLE, verdict, why)
+
+    def test_an_unreadable_new_side_is_undecidable_not_confirmed(self):
+        f, old, new = self._f({"type": "string"}, {"externalRef": "b"})
+        verdict, why = check(f, old, new, [], [])
+        self.assertEqual(UNDECIDABLE, verdict, why)
+
+    def test_a_real_type_change_is_still_confirmed(self):
+        f, old, new = self._f({"type": "string"}, {"type": "integer"})
+        verdict, why = check(f, old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
 
 
 if __name__ == "__main__":

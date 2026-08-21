@@ -136,6 +136,36 @@ def merge_all_of(prop: Dict[str, Any], doc: Dict[str, Any]) -> Dict[str, Any]:
     return merged
 
 
+#: What `effective_shape` returns when it could not resolve the node at all.
+#: An admission of ignorance, never to be compared for equality against another
+#: one -- see `_informative` below.
+UNRESOLVED = ("unresolved",)
+
+#: What a document says when it accepts ANY JSON value: `{}`, or a node
+#: carrying only annotations. This is a POSITIVE statement and must not be
+#: confused with the admission above, which is what `("scalar", None, None)`
+#: did by serving as both. PayPal narrowed `order_request.payment_source.crypto`
+#: from `{}` to a `crypto_request` -- a real narrowing that reads as "I could
+#: not tell" the moment the two share a value.
+ANY_VALUE = ("any",)
+
+#: Keywords that say nothing about the VALUE, only about how to document it.
+_ANNOTATION_ONLY = frozenset({
+    "title", "description", "example", "examples", "deprecated", "readOnly",
+    "writeOnly", "externalDocs", "xml", "default", "$comment"})
+
+
+def _informative(shape: Any) -> bool:
+    """False when the shape is this checker admitting it could not tell.
+
+    Two admissions of ignorance are not evidence that two things are the same,
+    and one admission set against a resolved shape is not evidence that they
+    differ. Both readings shipped: the first REFUTED eight findings, the second
+    CONFIRMED three hundred more of the identical PayPal rewrite.
+    """
+    return shape not in ("opaque", UNRESOLVED, ("ref-unresolved",))
+
+
 def effective_shape(prop: Any, doc: Dict[str, Any], depth: int = 0) -> Any:
     """What a consumer actually sees for this property.
 
@@ -147,8 +177,31 @@ def effective_shape(prop: Any, doc: Dict[str, Any], depth: int = 0) -> Any:
     """
     if not isinstance(prop, dict) or depth > 3:
         return "opaque"
-    if isinstance(prop.get("allOf"), list) and prop["allOf"]:
-        return effective_shape(merge_all_of(prop, doc), doc, depth + 1)
+    # `{}` accepts any JSON value, and so does a node carrying nothing but
+    # annotations. That is the DOCUMENT speaking, not this function failing,
+    # and the two used to return the same tuple.
+    if not (set(prop) - _ANNOTATION_ONLY):
+        return ANY_VALUE
+    arms = prop.get("allOf")
+    if isinstance(arms, list) and arms:
+        # `allOf` is an INTERSECTION: a document must satisfy every arm, so
+        # what a consumer sees is all of them at once. Reading only the node's
+        # own keywords finds no type, no properties and no enum, and the
+        # fall-through then answered UNRESOLVED -- "I know nothing about this
+        # node". PayPal rewrote `$ref` + sibling keywords into exactly that
+        # form across its whole checkout spec in this window.
+        #
+        # Merged rather than evaluated arm-by-arm, because an arm can carry
+        # `nullable` for a sibling `$ref` -- the OpenAPI 3.0 idiom for "a
+        # nullable X" -- and reading arms separately drops it.
+        #
+        # Recursed at the SAME depth on purpose: an `allOf` is a conjunction,
+        # not a level of nesting, and spending budget on it made one schema
+        # resolve differently depending on which notation named it.
+        merged = merge_all_of(prop, doc)
+        if merged.get("allOf") == arms:          # nothing was flattened
+            return UNRESOLVED
+        return effective_shape(merged, doc, depth)
     # Nullability is part of the VALUE a caller may send or receive, and this
     # function never looked at it. Cloudflare dropped `nullable: true` from
     # five email-security REQUEST fields in this window: a caller that was
@@ -175,6 +228,13 @@ def effective_shape(prop: Any, doc: Dict[str, Any], depth: int = 0) -> Any:
             return (key, tuple(sorted(
                 str(effective_shape(a, doc, depth + 1)) for a in prop[key])))
     enum = prop.get("enum")
+    if prop.get("type") is None and not enum:
+        # Keywords this function does not model, and no type or enum to fall
+        # back on. That is ignorance, not a shape, and it used to be spelled
+        # `("scalar", None, None)` -- the very same tuple `{}` produced. One
+        # value meaning both "accepts anything" and "I cannot tell" is what let
+        # a real narrowing read as no change.
+        return UNRESOLVED
     return ("scalar", prop.get("type"), tuple(sorted(map(str, enum))) if enum else None)
 
 
@@ -766,6 +826,12 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
         if not (found_old and found_new):
             return UNDECIDABLE, f"field not resolvable (old={found_old}, new={found_new})"
         before, after = effective_shape(node_old, old), effective_shape(node_new, new)
+        # The same guard the schema-side comparisons already carry, and this
+        # branch was the one site without it. Two admissions of ignorance are
+        # not evidence that two things are the same, and one admission set
+        # against a resolved shape is not evidence that they differ.
+        if not _informative(before) or not _informative(after):
+            return UNDECIDABLE, f"shape not resolvable ({before} -> {after})"
         if before != after:
             return CONFIRMED, f"shape {before} -> {after}"
         return REFUTED, f"same effective shape {before}"
@@ -1058,6 +1124,10 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
             # notation change satisfies it. Ask the consumer's question -- does
             # the shape they receive or send actually differ?
             before, after = effective_shape(o, old), effective_shape(n, new)
+            if not _informative(before) or not _informative(after):
+                return UNDECIDABLE, (
+                    f"the shape is unresolvable on one side "
+                    f"(old={before}, new={after}) — this checker cannot see it")
             if before != after:
                 return CONFIRMED, f"shape {before} -> {after}"
             return REFUTED, f"same effective shape {before}"
@@ -1122,6 +1192,10 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
                 return UNDECIDABLE, f"`{name}` has no schema on one side"
             before = effective_shape(was, old)
             after = effective_shape(now, new)
+            if not _informative(before) or not _informative(after):
+                return UNDECIDABLE, (
+                    f"the shape is unresolvable on one side "
+                    f"(old={before}, new={after}) — this checker cannot see it")
             if before == after:
                 return REFUTED, f"same effective shape {before}"
             return CONFIRMED, f"{before} -> {after}"
