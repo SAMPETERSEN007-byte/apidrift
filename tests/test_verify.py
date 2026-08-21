@@ -201,13 +201,71 @@ class TestVendorEvidence(unittest.TestCase):
 class TestUnprovableLanguages(unittest.TestCase):
     """An unproven lead is an unmeasured claim, not a weaker one."""
 
-    def test_javascript_is_unproven_not_likely(self):
+    def test_javascript_that_really_reads_the_field_is_confirmed(self):
+        """This used to assert UNPROVEN, and it was right to: nothing parsed
+        JavaScript. Now something does, and this source is a complete proof --
+        the client is required from `stripe`, the call is assigned to `c`, and
+        `iin` is read off `c`. Asserting UNPROVEN here now would be asserting
+        that the tool must ignore what it can see."""
         source = ('const stripe = require("stripe")(k);\n'
                   'const c = await stripe.customers.retrieve(id);\n'
                   'return c.iin;\n')
+        verdict, _, _, sites = verify_source(source, "pay.js", finding(), STRIPE)
+        self.assertEqual(verdict, CONFIRMED)
+        self.assertEqual(3, sites[0].line, "and it cites the line of the read")
+
+    def test_javascript_with_the_vendor_but_no_dependence_is_not_confirmed(self):
+        """The invariant the test above used to carry. Co-location is not
+        dependence in any language, and being able to READ JavaScript is not a
+        licence to convict it."""
+        source = ('import Stripe from "stripe";\n'
+                  'const stripe = new Stripe(k);\n'
+                  'const c = await stripe.customers.retrieve(id);\n'
+                  'return c.email;\n')
+        verdict, reason, _, _ = verify_source(source, "pay.js", finding(), STRIPE)
+        self.assertNotEqual(verdict, CONFIRMED, reason)
+
+    def test_a_pinned_api_version_is_not_affected(self):
+        """`new Stripe(k, { apiVersion: '...' })` pins the caller to a version
+        the change did not touch. Named as an open blind spot for months and
+        never modelled; real code pins in exactly this position."""
+        source = ('import Stripe from "stripe";\n'
+                  'const stripe = new Stripe(k, { apiVersion: "2024-06-20" });\n'
+                  'const c = await stripe.customers.retrieve(id);\n'
+                  'return c.iin;\n')
+        verdict, reason, _, _ = verify_source(source, "pay.ts", finding(), STRIPE)
+        self.assertNotEqual(verdict, CONFIRMED)
+        self.assertIn("pins the API version", reason)
+
+    def test_a_READ_does_not_prove_a_REQUEST_side_change(self):
+        """Direction is not decoration: an object key is how you SEND a field
+        and a property access is how you READ one. Confusing the two is a
+        gated false-positive class -- it is why `phasehq/console` was reported
+        broken by a request-side change it only read the response of.
+
+        The finding here is REQUEST-side and the file only ever reads `iin`
+        off the response. Written the other way round -- a request-side file
+        against a response-side finding -- the test passes whether the
+        direction check exists or not, because the read simply is not there.
+        """
+        source = ('import Stripe from "stripe";\n'
+                  'const stripe = new Stripe(k);\n'
+                  'const c = await stripe.customers.retrieve(id);\n'
+                  'return c.iin;\n')
+        verdict, reason, _, _ = verify_source(
+            source, "pay.ts", finding(kind="request_field_removed"), STRIPE)
+        self.assertNotEqual(verdict, CONFIRMED, reason)
+        self.assertIn("never sends", reason)
+
+    def test_javascript_this_cannot_read_is_unproven_not_clean(self):
+        """An unterminated string means the tokeniser stopped early. A file
+        read halfway is not a file that was checked."""
+        source = ('import Stripe from "stripe";\n'
+                  "const s = 'oops\n"
+                  'const c = await stripe.customers.retrieve(id);\n')
         verdict, reason, _, _ = verify_source(source, "pay.js", finding(), STRIPE)
         self.assertEqual(verdict, UNPROVEN)
-        self.assertIn("only Python is parsed", reason)
+        self.assertIn("unreadable", reason)
 
     def test_an_unknown_language_is_also_unproven(self):
         self.assertEqual(verdict_of("card.iin", finding(), path="main.rs"),

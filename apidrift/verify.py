@@ -485,11 +485,24 @@ def verify_source(
                 f"`{vendor.key}` package directory — a checked-in copy of the "
                 f"library, not code the repo author wrote", "", [])
 
-    if not file_path.endswith(PY_EXT):
+    # JavaScript and TypeScript get their own prover, with the same standard.
+    # Every file calling a tracked vendor in eight real repositories was
+    # TypeScript, so "only Python is parsed" was not a caveat on the product --
+    # it was the product, answering every scan with an apology.
+    from .js_dependence import is_js
+    from .js_dependence import prove as prove_js
+
+    language_prover = None
+    if file_path.endswith(PY_EXT):
+        language_prover = prove
+    elif is_js(file_path):
+        language_prover = prove_js
+    if language_prover is None:
         extension = file_path.rsplit(".", 1)[-1] if "." in file_path else "?"
         return (UNPROVEN,
                 f"dependence cannot be established in `.{extension}` — only "
-                f"Python is parsed, and an unproven lead is an unmeasured claim",
+                f"Python and JavaScript/TypeScript are parsed, and an unproven "
+                f"lead is an unmeasured claim",
                 "", [])
 
     evidence = find_vendor_evidence(source, vendor)
@@ -500,8 +513,13 @@ def verify_source(
         return (NO_VENDOR,
                 f"no {vendor.name} import, host or key in the file", "", [])
 
-    proofs, why_not = prove(source, finding, vendor)
+    proofs, why_not = language_prover(source, finding, vendor)
     if not proofs:
+        # A file this cannot READ is not a file it has cleared. The unreadable
+        # state is the tokeniser's own report, never a guess, and it has to
+        # stay distinguishable from "read it and found nothing".
+        if why_not.startswith("unreadable"):
+            return UNPROVEN, why_not, evidence, []
         return NO_DEPENDENCE, why_not, evidence, []
 
     sites = [Site(line=p.line, kind=p.kind, text=p.text, chain=p.chain)

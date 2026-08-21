@@ -150,11 +150,26 @@ class TestUnmeasuredIsNotClean(unittest.TestCase):
                 'stripe.subscriptions.update(id, { cancel_at: t });\n')
         return root
 
-    def test_a_typescript_caller_is_counted_as_unmeasured(self):
+    def test_typescript_is_no_longer_unmeasured(self):
+        """TypeScript is PROVEN now, so counting it as unmeasured would
+        double-report it: once as an impact and once as a blind spot."""
         with tempfile.TemporaryDirectory() as tmp:
             root = self._repo(tmp, python=False, typescript=True)
+            self.assertEqual({}, unmeasurable_callers(root, ["stripe", "plaid"]))
+
+    def test_a_language_that_is_still_unparsed_is_counted(self):
+        """The invariant the TypeScript test used to carry, moved to a language
+        that is still unreadable. It must not disappear along with the blind
+        spot it happened to be written against -- Go, Ruby and the rest are
+        exactly as unmeasured as TypeScript was."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "pay.go").write_text(
+                'import "github.com/stripe/stripe-go"\n'
+                '// api.stripe.com\n')
             found = unmeasurable_callers(root, ["stripe", "plaid"])
-            self.assertEqual(found, {"stripe": {"TypeScript": 1}})
+            self.assertEqual({"stripe": {"Go": 1}}, found)
 
     def test_the_word_clean_is_never_printed_over_an_unmeasured_language(self):
         result = ScanResult(root="/r", findings_considered=64,
@@ -218,3 +233,50 @@ class TestShortHistoryIsNotSafety(unittest.TestCase):
         result = ScanResult(root="/r", findings_considered=64,
                             vendors_detected={"openai": 4})
         self.assertIn("apidrift: clean", to_text(result))
+
+
+class TestOpportunitiesSayWhatWasRejected(unittest.TestCase):
+    """Twelve honest suggestions read as noise when the actionable ones are
+    not accounted for.
+
+    A developer shown `account_capabilities.bizum_payments` and nothing else
+    concludes the tool cannot tell a decision from a notification, and mutes
+    it. The count that was CONSIDERED and did not reach them is the sentence
+    that makes the rest trustworthy.
+    """
+
+    def _result(self, **kw):
+        base = dict(root="/r", vendors_detected={"stripe": 1},
+                    findings_considered=1, additions_considered=154,
+                    additions_by_kind={"endpoint_added": 3,
+                                       "response_field_added": 151})
+        base.update(kw)
+        return ScanResult(**base)
+
+    def test_actionable_additions_that_reached_nobody_are_stated(self):
+        text = to_text(self._result())
+        self.assertIn("0 of 3", text)
+        self.assertIn("resources this repo does not call", text)
+
+    def test_a_passive_field_is_not_called_something_to_adopt(self):
+        opportunity = Impact(
+            vendor="stripe", vendor_name="Stripe", file="a.ts", line=9,
+            kind="response_field_added", label="new field in a response",
+            severity="additive", subject="checkout.session.managed_payments",
+            detail="", old="", new="", operation="")
+        text = to_text(self._result(opportunities=[opportunity]))
+        self.assertIn("Arrives on its own", text)
+        self.assertNotIn("Worth a decision — 1", text)
+
+    def test_a_new_endpoint_is_ranked_above_a_response_field(self):
+        endpoint = Impact(
+            vendor="stripe", vendor_name="Stripe", file="a.ts", line=3,
+            kind="endpoint_added", label="new endpoint", severity="additive",
+            subject="/v1/payment_records", detail="", old="", new="", operation="")
+        passive = Impact(
+            vendor="stripe", vendor_name="Stripe", file="a.ts", line=9,
+            kind="response_field_added", label="new field in a response",
+            severity="additive", subject="x.y", detail="", old="", new="", operation="")
+        text = to_text(self._result(opportunities=[endpoint, passive]))
+        self.assertLess(text.index("/v1/payment_records"), text.index("x.y"),
+                        "a decision must be shown before a notification")

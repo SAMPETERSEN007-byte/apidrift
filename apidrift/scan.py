@@ -28,6 +28,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .classify import is_generated_path, is_vendored_path
 from .dependence import prove_relevance
+from .js_dependence import is_js
+from .js_dependence import prove_relevance as prove_relevance_js
 from .diff import (ADDITIVE_LABEL, BREAKING, ENDPOINT_KINDS, Finding,
                    label_for)
 from .loader import SpecParseError
@@ -50,6 +52,12 @@ SKIP_DIRS = frozenset({
 MAX_FILE_BYTES = 512 * 1024
 
 PY_SUFFIX = ".py"
+
+# Languages dependence can be PROVEN in. Everything else is counted and
+# reported as UNMEASURED. TypeScript joined this list on 2026-08-21 after
+# eight real repositories were scanned and every vendor-calling file in all of
+# them was TypeScript -- the tool's whole output was the apology below.
+PROVABLE_SUFFIXES = (".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
 
 # Dependence is provable only in Python. Everything else is UNMEASURED, which is
 # not the same as unaffected, and the difference is the whole safety of the
@@ -144,6 +152,12 @@ class ScanResult:
     # Never a silent truncation. A capped list that does not say it was capped
     # reads as a census.
     opportunities_dropped: int = 0
+    # {kind: count} of every addition CONSIDERED, whether or not it reached
+    # this repo. Without it the report cannot say "three new endpoints, none on
+    # a resource you call", and that sentence is the difference between advice
+    # and a list: a reader who is shown twelve passive response fields and not
+    # told the actionable ones were checked assumes they were not.
+    additions_by_kind: Dict[str, int] = field(default_factory=dict)
     # {vendor_key: {language: file_count}} — files that call a vendor in a
     # language this tool cannot parse. Reported, never counted as clean.
     unmeasured: Dict[str, Dict[str, int]] = field(default_factory=dict)
@@ -176,6 +190,7 @@ class ScanResult:
             "breaking_count": len(self.breaking),
             "opportunity_count": len(self.opportunities),
             "opportunities_dropped": self.opportunities_dropped,
+            "additions_by_kind": self.additions_by_kind,
             "unmeasured": self.unmeasured,
             "short_history": self.short_history,
             "unmeasured_files": self.unmeasured_files,
@@ -193,7 +208,7 @@ def _relative(root: Path, path: Path) -> str:
 
 
 def candidate_files(root: Path, vendor_keys: Sequence[str] = ()) -> List[Path]:
-    """Every Python file in the checkout that the repo's author plausibly wrote.
+    """Every source file in a provable language that the author plausibly wrote.
 
     A dependency copy is excluded for the same reason it is excluded from a
     lead: `site-packages/stripe/_card.py` breaking is the vendor's problem,
@@ -204,7 +219,7 @@ def candidate_files(root: Path, vendor_keys: Sequence[str] = ()) -> List[Path]:
         dirnames[:] = [d for d in dirnames
                        if d not in SKIP_DIRS and not d.startswith(".")]
         for name in filenames:
-            if not name.endswith(PY_SUFFIX):
+            if not name.endswith(PROVABLE_SUFFIXES):
                 continue
             path = Path(dirpath) / name
             rel = _relative(root, path)
@@ -237,6 +252,8 @@ def unmeasurable_callers(
                        if d not in SKIP_DIRS and not d.startswith(".")]
         for name in filenames:
             suffix = Path(name).suffix.lower()
+            if suffix in PROVABLE_SUFFIXES:
+                continue          # proven, not unmeasured
             language = OTHER_SOURCE_SUFFIXES.get(suffix)
             if not language:
                 continue
@@ -416,12 +433,17 @@ def scan_repo(
             additions = [a for a in diff.additions
                          if a.kind in ADDITIVE_LABEL]
             result.additions_considered += len(additions)
+            for addition in additions:
+                result.additions_by_kind[addition.kind] = (
+                    result.additions_by_kind.get(addition.kind, 0) + 1)
             # Production code first, so a suggestion lands where someone
             # would act on it rather than in a fixture.
             ranked = sorted(files, key=lambda pair: _is_incidental(pair[0]))
             for addition in additions:
                 for rel, source in ranked:
-                    proofs, _ = prove_relevance(source, addition, vendor)
+                    relevance = (prove_relevance_js if is_js(rel)
+                                 else prove_relevance)
+                    proofs, _ = relevance(source, addition, vendor)
                     if not proofs:
                         continue
                     proof = proofs[0]
@@ -555,9 +577,10 @@ def _unmeasured_markdown(result: ScanResult) -> List[str]:
     out = ["", f"## ⚠️ {result.unmeasured_files} caller"
                f"{'' if result.unmeasured_files == 1 else 's'} could not be "
                f"checked", "",
-           "Dependence is proven with Python's `ast` module. These files call "
-           "the same APIs in a language this tool does not parse, so they were "
-           "not examined at all. **Unmeasured is not unaffected.**", "",
+           "Dependence is proven in Python and in JavaScript/TypeScript. "
+           "These files call the same APIs in a language this tool does not "
+           "parse, so they were not examined at all. **Unmeasured is not "
+           "unaffected.**", "",
            "| Vendor | Language | Files |", "|---|---|---:|"]
     for key, langs in sorted(result.unmeasured.items()):
         for lang, n in sorted(langs.items()):
@@ -624,25 +647,63 @@ def _unmeasured_lines(result: ScanResult) -> List[str]:
                 f"{'calls' if n == 1 else 'call'} these APIs in a language "
                 f"this tool cannot parse:",
             *[f"  {p}" for p in parts],
-            "  Dependence is proven in Python only. These files were not "
-            "checked, which is not the same as unaffected."]
+            "  Dependence is proven in Python and JavaScript/TypeScript. "
+            "These files were not checked, which is not the same as "
+            "unaffected."]
+
+
+# A new endpoint or a field you may SEND is a decision. A new field on a
+# response is not -- it arrives whether you act or not. Presenting the two the
+# same way is how twelve honest suggestions read as noise: a developer shown
+# `account_capabilities.bizum_payments` alongside a new endpoint concludes the
+# tool cannot tell the difference, and mutes it.
+_ACTIONABLE_KINDS = ("spec_added", "endpoint_added", "schema_field_added",
+                     "param_added_optional")
 
 
 def _opportunity_lines(result: ScanResult) -> List[str]:
-    if not result.opportunities:
+    if not result.opportunities and not result.additions_by_kind:
         return []
-    out = ["", f"{len(result.opportunities)} thing"
-               f"{'' if len(result.opportunities) == 1 else 's'} this vendor "
-               f"added that you are positioned to use:"]
-    for o in result.opportunities:
-        out.append(f"  {o.vendor_name} {o.label} — {o.subject}")
-        if o.blurb:
-            out.append(f"      {o.blurb[:150]}")
-        out.append(f"      you already call this at {o.file}:{o.line}")
+    actionable = [o for o in result.opportunities if o.kind in _ACTIONABLE_KINDS]
+    passive = [o for o in result.opportunities if o.kind not in _ACTIONABLE_KINDS]
+    out: List[str] = ["", "WHAT THESE VENDORS ADDED, AND WHETHER IT TOUCHES YOU"]
+
+    considered_actionable = sum(result.additions_by_kind.get(k, 0)
+                                for k in _ACTIONABLE_KINDS)
+    out.append("")
+    out.append(f"  Worth a decision — {len(actionable)} of "
+               f"{considered_actionable} new endpoint(s)/request field(s) "
+               f"reach code you have:")
+    if actionable:
+        for o in actionable:
+            out.append(f"    {o.vendor_name} {o.label} — {o.subject}")
+            if o.blurb:
+                out.append(f"        {o.blurb[:150]}")
+            out.append(f"        you already call this at {o.file}:{o.line}")
+    elif considered_actionable:
+        # Saying this out loud is the point. Silence here reads as "nothing was
+        # added", which is a different and much more comforting claim.
+        out.append(f"    none — all {considered_actionable} were added on "
+                   f"resources this repo does not call")
+    else:
+        out.append("    none — these vendors added no new endpoint or request "
+                   "field in this window")
+
+    considered_passive = (result.additions_considered - considered_actionable)
+    if passive or considered_passive:
+        out.append("")
+        out.append(f"  Arrives on its own — {len(passive)} of "
+                   f"{considered_passive} new response field(s) land on "
+                   f"responses you already read. Nothing to do; they are "
+                   f"listed so a schema change is not a surprise:")
+        for o in passive[:8]:
+            out.append(f"    {o.subject}  ({o.file}:{o.line})")
+        if len(passive) > 8:
+            out.append(f"    … and {len(passive) - 8} more")
     if result.opportunities_dropped:
-        out.append(f"  … and {result.opportunities_dropped} more, ranked "
-                   f"lower (mostly new response fields, which arrive whether "
-                   f"you act or not). --opportunity-limit 0 shows all.")
+        out.append(f"  … {result.opportunities_dropped} further suggestions "
+                   f"were ranked lower and not shown. "
+                   f"--opportunity-limit 0 shows all.")
     return out
 
 
@@ -651,7 +712,7 @@ def to_text(result: ScanResult) -> str:
     every editor and log scraper already knows how to jump to."""
     if not result.impacts:
         if result.unmeasured or result.short_history:
-            head = (f"apidrift: no impact found in Python "
+            head = (f"apidrift: no impact found "
                     f"({result.findings_considered} breaking changes checked) "
                     f"— but this repo is NOT clean-checked, see below")
         elif not result.vendors_detected:
