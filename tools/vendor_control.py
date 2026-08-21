@@ -167,6 +167,47 @@ def inject_request_field_added_required(doc) -> Optional[Tuple[dict, str, Callab
     return None
 
 
+def inject_nested_request_field_added_required(doc) -> Optional[Tuple[dict, str, Callable]]:
+    """The adversarial half of the two "newly required" suppressors.
+
+    `inject_request_field_added_required` lands at the TOP of a body, where
+    neither suppressor's precondition can hold: the field has no ancestors and
+    no old occurrence. That control therefore says nothing about whether the
+    suppressors over-fire. This one puts the requirement on an object that
+    ALREADY EXISTED in the old body and that no old route made mandatory, which
+    is the exact shape `_subtree_is_new` must NOT swallow. Without it, changing
+    `any(...)` to `True` in that rule is invisible to every control here.
+    """
+    for path, method, op in _operations(doc):
+        schema = _body_of(doc, op, "request")
+        resolved = _resolve(doc, schema)
+        if not isinstance(resolved, dict) or resolved.get("type") != "object":
+            continue
+        props = resolved.get("properties")
+        if not isinstance(props, dict):
+            continue
+        host = None
+        for prop_name in sorted(props):
+            child = _resolve(doc, props[prop_name])
+            if isinstance(child, dict) and isinstance(child.get("properties"), dict) \
+                    and child.get("type") == "object":
+                host = prop_name
+                break
+        if host is None:
+            continue
+        out = copy.deepcopy(doc)
+        target = _resolve(out, _body_of(out, out["paths"][path][method], "request"))
+        nested = _resolve(out, target["properties"][host])
+        nested["properties"]["apidrift_nested_control"] = {"type": "string"}
+        nested["required"] = list(nested.get("required") or []) + [
+            "apidrift_nested_control"]
+        return out, f"{host}.apidrift_nested_control", lambda f: (
+            "apidrift_nested_control" in f.subject
+            and f.kind in ("request_field_added_required",
+                           "schema_field_added_required"))
+    return None
+
+
 def inject_response_field_removed(doc) -> Optional[Tuple[dict, str, Callable]]:
     for path, method, op in _operations(doc):
         schema = _body_of(doc, op, "response")
@@ -271,6 +312,8 @@ CONTROLS: Tuple[Tuple[str, Callable], ...] = (
     ("endpoint_removed", inject_endpoint_removed),
     ("response_field_removed", inject_response_field_removed),
     ("request_field_added_required", inject_request_field_added_required),
+    ("nested_request_field_added_required",
+     inject_nested_request_field_added_required),
     ("param_type_changed", inject_param_type_changed),
     ("request_enum_value_removed", inject_request_enum_value_removed),
     ("schema_field_type_changed", inject_schema_field_type_changed),

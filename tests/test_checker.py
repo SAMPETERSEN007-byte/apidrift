@@ -1019,6 +1019,117 @@ class TestRequiredInsideANewParent(unittest.TestCase):
             finding("request_field_added_required", subject="limits.accounts",
                     root_cause="limits.accounts", op_key="POST /things"),
             old, new, [], [])
+class TestNewlyRequired(unittest.TestCase):
+    """The checker asked the ENGINE's question here: "does `leaf` appear in a
+    `required:` array at the one node my dotted path reaches?"
+
+    Sixth instance of the shared question, and its symptoms ran both ways: 103
+    of 158 findings in this class came back "could not resolve the parent
+    object" -- undecidable because the path carried a SCHEMA name the walk
+    tried to follow as a property -- while the ones it did decide included both
+    false confirmations (Cloudflare's renamed union arms) and false refutations
+    (anything composed with `allOf`, whose obligations it never merged).
+    """
+
+    def _op(self, schema):
+        return {"/things": {"post": {
+            "requestBody": {"required": True,
+                            "content": {"application/json": {"schema": schema}}},
+            "responses": resp({"type": "object"})}}}
+
+    def _obj(self, props, required):
+        return {"type": "object", "properties": props, "required": required}
+
+    def _check(self, old_schema, new_schema, subject, schemas=None):
+        return check(finding("request_field_added_required", subject=subject,
+                             root_cause=subject, op_key="POST /things"),
+                     doc(schemas, self._op(old_schema)),
+                     doc(schemas, self._op(new_schema)), [], [])
+
+    def test_a_requirement_inside_a_NEW_object_is_refuted(self):
+        verdict, why = self._check(
+            self._obj({"amount": {"type": "integer"}}, ["amount"]),
+            self._obj({"amount": {"type": "integer"},
+                       "limits": self._obj({"accounts": {"type": "integer"}},
+                                           ["accounts"])}, ["amount"]),
+            "limits.accounts")
+        self.assertEqual(REFUTED, verdict, why)
+        self.assertIn("does not exist in the OLD", why)
+
+    def test_a_requirement_added_to_an_EXISTING_object_is_confirmed(self):
+        """The control. Without it the rule above is a deletion."""
+        verdict, why = self._check(
+            self._obj({"limits": self._obj({"accounts": {"type": "integer"}}, [])}, []),
+            self._obj({"limits": self._obj({"accounts": {"type": "integer"}},
+                                           ["accounts"])}, []),
+            "limits.accounts")
+        self.assertEqual(CONFIRMED, verdict, why)
+
+    def test_an_obligation_carried_through_allOf_is_seen(self):
+        """Cloudflare's `PUT /accounts/{id}/workers/domains` new body is
+        `allOf: [workers_Domain, {required: [hostname, service]}]`. Reading the
+        root's own `required` array finds nothing there, so three real breaks
+        -- `cert_id`, `id`, `zone_name` -- were REFUTED as "required new=False".
+        """
+        schemas = {"Domain": self._obj({"cert_id": {"type": "string"}},
+                                       ["cert_id"])}
+        verdict, why = self._check(
+            self._obj({"zone_id": {"type": "string"}}, ["zone_id"]),
+            {"allOf": [{"$ref": "#/components/schemas/Domain"},
+                       {"type": "object", "required": ["zone_id"]}]},
+            "cert_id", schemas=schemas)
+        self.assertEqual(CONFIRMED, verdict, why)
+
+    def test_an_obligation_every_union_arm_ALREADY_had_is_refuted(self):
+        """Cloudflare renamed all thirteen identity-provider arms in one
+        release and added a fourteenth. Every arm required `config` before and
+        after, so no body changed status -- only the flattener's key did."""
+        arm = self._obj({"config": {"type": "object"}}, ["config"])
+        schemas = {"AzureAD": arm, "AzureADV2": dict(arm), "Cloudflare": dict(arm)}
+        verdict, why = self._check(
+            {"anyOf": [{"$ref": "#/components/schemas/AzureAD"}]},
+            {"anyOf": [{"$ref": "#/components/schemas/AzureADV2"},
+                       {"$ref": "#/components/schemas/Cloudflare"}]},
+            "<identity-providers><AzureADV2>.config", schemas=schemas)
+        self.assertEqual(REFUTED, verdict, why)
+        self.assertIn("ALREADY required", why)
+
+    def test_an_obligation_only_ONE_new_arm_carries_is_UNDECIDABLE(self):
+        """Not refuted. `anyOf` is a disjunction, so a name required by one arm
+        is not required of the body -- but the caller who was using THAT arm
+        does break, and deciding it needs an old-arm/new-arm correspondence the
+        documents do not state. Over-refuting is over-confirming with the sign
+        flipped.
+        """
+        schemas = {"Loose": self._obj({"id": {"type": "string"}}, []),
+                   "Strict": self._obj({"id": {"type": "string"}}, ["id"])}
+        verdict, why = self._check(
+            {"anyOf": [{"$ref": "#/components/schemas/Loose"}]},
+            {"anyOf": [{"$ref": "#/components/schemas/Strict"},
+                       {"$ref": "#/components/schemas/Loose"}]},
+            "<shape-abc>.id", schemas=schemas)
+        self.assertEqual(UNDECIDABLE, verdict, why)
+
+    def test_a_schema_qualified_path_still_resolves(self):
+        """`<CheckoutForwardRequest>.amount.currency` is the flattener's name
+        for the property `amount.currency`. Walking the angle-bracketed segment
+        as a property name found nothing and returned UNDECIDABLE for 103 of
+        the 158 findings in this class -- undecidable for a purely notational
+        reason, which is not a measurement of anything.
+        """
+        body = {"$ref": "#/components/schemas/Req"}
+        schemas_old = {"Req": self._obj(
+            {"amount": self._obj({"value": {"type": "integer"}}, [])}, [])}
+        schemas_new = {"Req": self._obj(
+            {"amount": self._obj({"value": {"type": "integer"},
+                                  "currency": {"type": "string"}},
+                                 ["currency"])}, [])}
+        verdict, why = check(
+            finding("request_field_added_required",
+                    subject="<Req>.amount.currency",
+                    root_cause="Req.amount.currency", op_key="POST /things"),
+            doc(schemas_old, self._op(body)), doc(schemas_new, self._op(body)),
+            [], [])
         self.assertEqual(CONFIRMED, verdict, why)
 
 

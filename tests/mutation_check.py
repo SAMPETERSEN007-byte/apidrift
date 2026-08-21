@@ -318,8 +318,8 @@ MUTATIONS = [
     (
         "every change marked breaking (false-positive flood)",
         "apidrift/diff.py",
-        '        if where == "request" and f_new.required:\n            out.append(_mk(\n                op, "request_field_added_required"',
-        '        if True:\n            out.append(_mk(\n                op, "request_field_added_required"',
+        '        if where == "request" and f_new.required:',
+        '        if True:',
         ["test_new_response_field_is_not_breaking"],
     ),
     (
@@ -366,21 +366,6 @@ MUTATIONS = [
         "            if not _strip_root_marker(name) or True:",
         ["test_a_body_that_loses_its_fields_is_still_a_break",
          "test_field_removed_from_an_inline_response"],
-    ),
-    (
-        "a requirement inside a brand-new object scored as breaking again",
-        "apidrift/diff.py",
-        "        if _inside_new_subtree(name, old_fields, old_blind):",
-        "        if False:",
-        ["test_a_required_field_inside_a_new_optional_object_is_not_breaking"],
-    ),
-    (
-        "the new-parent rule fires unconditionally, hiding a real tightening",
-        "apidrift/diff.py",
-        "        if _inside_new_subtree(name, old_fields, old_blind):",
-        "        if True:",
-        ["test_a_required_field_added_to_an_EXISTING_object_is_still_breaking",
-         "test_a_new_TOP_LEVEL_required_field_is_still_breaking"],
     ),
     (
         "named-ref prefix seeding removed",
@@ -1585,32 +1570,104 @@ MUTATIONS = [
         ["test_a_response_that_is_a_ref_into_components_responses_resolves"],
     ),
     (
-        "the checker stops asking whether the request parent EXISTED",
-        "tests/measure_precision.py",
-        "                if has_parent and not had_parent:",
-        "                if False:",
-        ["test_a_requirement_inside_a_brand_new_object_is_refuted"],
-    ),
-    (
-        "the new-parent refutation fires whether or not the parent is new",
-        "tests/measure_precision.py",
-        "                if has_parent and not had_parent:",
-        "                if has_parent:",
-        ["test_a_requirement_added_to_an_EXISTING_object_is_confirmed"],
-    ),
-    (
         "an uncollapsed finding loses its field name",
         "tests/measure_precision.py",
-        "        if not leaf:\n            steps = [value for step_kind, value in\n                     subject_tokens(finding.get(\"subject\") or \"\")\n                     if step_kind == \"prop\"]\n            leaf = steps[-1] if steps else \"\"",
-        "        pass",
+        "    parts = body_path(finding.get(\"subject\") or finding.get(\"root_cause\") or \"\")",
+        "    parts = body_path(finding.get(\"root_cause\") or \"\")",
         ["test_a_top_level_required_field_with_no_root_cause_is_confirmed"],
     ),
     (
         "a finding naming no field is refuted rather than abstained on",
         "tests/measure_precision.py",
-        "        if not leaf:\n            return UNDECIDABLE, \"the finding names no field\"",
-        "        if False:\n            return UNDECIDABLE, \"\"",
+        "    if not parts:\n        return UNDECIDABLE, \"the finding names no field path\"",
+        "    if False:\n        return UNDECIDABLE, \"\"",
         ["test_a_finding_naming_no_field_at_all_is_undecidable"],
+    ),
+
+    # ---- "newly required" is a claim about BODIES ------------------------
+    # Both engine suppressors, both directions. Disabling one must redden a
+    # "this is not a break" test; making it fire unconditionally must redden a
+    # "this IS still a break" test. A suppressor with only the first half is a
+    # deletion nobody is checking.
+    (
+        "a requirement inside a brand-new object is a break again",
+        "apidrift/diff.py",
+        "            if old_has_signal and _subtree_is_new(name, bare_old):",
+        "            if False and _subtree_is_new(name, bare_old):",
+        ["test_a_required_field_inside_a_NEW_object_is_not_a_break"],
+    ),
+    (
+        "the new-object rule fires unconditionally, swallowing real tightenings",
+        "apidrift/diff.py",
+        "    return any(a not in bare_old for a in _bare_ancestors(path))",
+        "    return True",
+        ["test_a_required_field_added_to_an_EXISTING_object_is_still_a_break"],
+    ),
+    (
+        "a bulk union-arm rename reads as new obligations again",
+        "apidrift/diff.py",
+        "            if old_has_signal and bare_old.get(_bare(name)) is True:",
+        "            if False:",
+        ["test_renaming_every_union_arm_does_not_make_its_obligations_new"],
+    ),
+    (
+        "the already-required rule fires unconditionally, hiding a real tightening",
+        "apidrift/diff.py",
+        "            if old_has_signal and bare_old.get(_bare(name)) is True:",
+        "            if old_has_signal:",
+        ["test_an_arm_rename_that_ALSO_tightens_is_still_a_break"],
+    ),
+    (
+        "one old route demanding the field counts as all of them demanding it",
+        "apidrift/diff.py",
+        "        bare_old[bare] = val.required and bare_old.get(bare, True)",
+        "        bare_old[bare] = val.required or bare_old.get(bare, False)",
+        ["test_a_field_optional_through_ONE_old_arm_is_still_a_break"],
+    ),
+    (
+        "the suppressors stop abstaining on an old side that flattened to nothing",
+        "apidrift/diff.py",
+        "    old_has_signal = bool(bare_old)",
+        "    old_has_signal = True",
+        ["test_an_old_body_that_flattened_to_NOTHING_suppresses_nothing"],
+    ),
+    (
+        "the checker stops merging allOf, so a composed obligation is invisible",
+        "tests/measure_precision.py",
+        "    for arm in node.get(\"allOf\") or []:\n"
+        "        names |= required_everywhere(arm, doc, depth + 1, seen)",
+        "    for arm in []:\n"
+        "        names |= required_everywhere(arm, doc, depth + 1, seen)",
+        ["test_an_obligation_carried_through_allOf_is_seen"],
+    ),
+    (
+        "the checker unions union arms instead of intersecting them",
+        "tests/measure_precision.py",
+        "            common = got if common is None else (common & got)",
+        "            common = got if common is None else (common | got)",
+        ["test_an_obligation_only_ONE_new_arm_carries_is_UNDECIDABLE"],
+    ),
+    (
+        "the checker walks the flattener's schema markers as property names",
+        "tests/measure_precision.py",
+        '    bare = _MARKER.sub("", subject)',
+        "    bare = subject",
+        ["test_a_schema_qualified_path_still_resolves"],
+    ),
+    (
+        "the checker refutes a per-arm obligation instead of abstaining",
+        "tests/measure_precision.py",
+        '        if any(n.get("oneOf") or n.get("anyOf")\n'
+        "               for n in new_nodes if isinstance(n, dict)):",
+        "        if False:",
+        ["test_an_obligation_only_ONE_new_arm_carries_is_UNDECIDABLE"],
+    ),
+    (
+        "the checker calls every requirement additive, whatever the old body held",
+        "tests/measure_precision.py",
+        "    old_nodes = descend(old_body, parents, old)\n    if not old_nodes:",
+        "    old_nodes = descend(old_body, parents, old)\n    if True:",
+        ["test_a_requirement_added_to_an_EXISTING_object_is_confirmed"],
     ),
 ]
 

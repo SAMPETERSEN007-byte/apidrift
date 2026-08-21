@@ -2187,3 +2187,163 @@ class TestRenameInsideAMultiArmUnion(unittest.TestCase):
         removed = {f.subject for f in run(old, new).findings
                    if f.kind == "schema_removed"}
         self.assertIn("Link", removed)
+class TestNewlyRequiredIsAClaimAboutBodies(unittest.TestCase):
+    """`request_field_added_required` was a claim about the flattener's keys.
+
+    The caller's question is whether a JSON body the OLD document accepted is
+    REJECTED by the NEW one. Two shapes satisfied the key-level test while
+    failing that one, and together they were 107 of the 158 findings of this
+    class across 21 vendors:
+
+      * the enclosing OBJECT is itself new -- Cloudflare added
+        `global_acceleration` with four required members to a body where the
+        property is optional, so nothing that validated before stopped
+        validating;
+      * the obligation was already there and only the KEY moved -- Cloudflare
+        bulk-renamed the thirteen arms of its identity-provider union, every
+        one of which required `config`, `name` and `type` before and after.
+
+    Every test here is paired with a control that must stay a break, because a
+    suppressor with only the quiet half is a deletion nobody is checking.
+    """
+
+    def _body(self, doc, schema):
+        doc["paths"]["/charges"]["post"]["requestBody"]["content"][
+            "application/json"]["schema"] = schema
+        return doc
+
+    def _obj(self, props, required):
+        return {"type": "object", "properties": props, "required": required}
+
+    def test_a_required_field_inside_a_NEW_object_is_not_a_break(self):
+        old = self._body(copy.deepcopy(BASE), self._obj(
+            {"amount": {"type": "integer"}}, ["amount"]))
+        new = self._body(copy.deepcopy(BASE), self._obj(
+            {"amount": {"type": "integer"},
+             "limits": self._obj({"accounts": {"type": "integer"}}, ["accounts"])},
+            ["amount"]))
+        found = [f.subject for f in run(old, new).findings
+                 if f.kind == "request_field_added_required"]
+        self.assertEqual(
+            [], found,
+            "`limits` is optional, so a body without it still validates and "
+            "`limits.accounts` binds nobody who was not already sending `limits`")
+
+    def test_a_required_field_added_to_an_EXISTING_object_is_still_a_break(self):
+        """The control: same shape, except the parent was already there."""
+        old = self._body(copy.deepcopy(BASE), self._obj(
+            {"amount": {"type": "integer"},
+             "limits": self._obj({"accounts": {"type": "integer"}}, [])}, ["amount"]))
+        new = self._body(copy.deepcopy(BASE), self._obj(
+            {"amount": {"type": "integer"},
+             "limits": self._obj({"accounts": {"type": "integer"},
+                                  "cap": {"type": "integer"}}, ["cap"])}, ["amount"]))
+        found = {f.subject for f in run(old, new).findings
+                 if f.kind == "request_field_added_required"}
+        self.assertTrue(
+            any(s.endswith("limits.cap") for s in found),
+            f"anyone already sending `limits` is now rejected; got {found}")
+
+    def test_a_NEW_object_that_is_itself_required_is_reported_on_ITSELF(self):
+        """The other control: the break is not lost, it is reported once.
+
+        When the new object is mandatory, old bodies really are rejected -- for
+        missing the OBJECT. That is the object's finding, on its own shorter
+        path; repeating it on every leaf inside is how one restructure becomes
+        ten findings.
+        """
+        old = self._body(copy.deepcopy(BASE), self._obj(
+            {"amount": {"type": "integer"}}, ["amount"]))
+        new = self._body(copy.deepcopy(BASE), self._obj(
+            {"amount": {"type": "integer"},
+             "limits": self._obj({"accounts": {"type": "integer"}}, ["accounts"])},
+            ["amount", "limits"]))
+        found = {f.subject for f in run(old, new).findings
+                 if f.kind == "request_field_added_required"}
+        self.assertTrue(any(s.endswith("limits") for s in found),
+                        f"the added mandatory object is the finding; got {found}")
+        self.assertFalse(any(s.endswith("limits.accounts") for s in found),
+                         f"and it is not counted again per leaf; got {found}")
+
+    def _union_doc(self, arms, union_name):
+        """A body that is a `$ref` to a NAMED union of NAMED arms.
+
+        The shape matters. Written as a bare inline `anyOf`, the arm marker
+        lands in ROOT position and `_strip_root_marker` erases it, so `_blind`
+        already matches the two sides and the field never reaches the rules
+        under test -- three mutations survived against exactly that mistake.
+        Cloudflare's real shape is a `$ref` to `access_identity-providers-2`,
+        which puts the ROOT marker outside and leaves the arm marker interior
+        and nameable, where it is load-bearing.
+        """
+        doc = copy.deepcopy(BASE)
+        doc["components"]["schemas"].update(arms)
+        doc["components"]["schemas"][union_name] = {
+            "anyOf": [{"$ref": f"#/components/schemas/{n}"} for n in arms]}
+        return self._body(doc, {"$ref": f"#/components/schemas/{union_name}"})
+
+    def test_renaming_every_union_arm_does_not_make_its_obligations_new(self):
+        arm = {"type": "object",
+               "properties": {"config": {"type": "object"},
+                              "name": {"type": "string"}},
+               "required": ["config", "name"]}
+        old = self._union_doc({"AzureAD": copy.deepcopy(arm)}, "IdentityProviders")
+        new = self._union_doc({"AzureADV2": copy.deepcopy(arm)}, "IdentityProvidersV2")
+        found = [f.subject for f in run(old, new).findings
+                 if f.kind in ("request_field_added_required",
+                               "request_field_now_required")]
+        self.assertEqual(
+            [], found,
+            "the arm was renamed; `config` and `name` were obligatory before "
+            f"and after, so no body changed status. Got {found}")
+
+    def test_an_arm_rename_that_ALSO_tightens_is_still_a_break(self):
+        """The control for the rename rule: same rename, one new obligation."""
+        props = {"config": {"type": "object"}, "name": {"type": "string"}}
+        old = self._union_doc(
+            {"AzureAD": {"type": "object", "properties": props,
+                         "required": ["config"]}}, "IdentityProviders")
+        new = self._union_doc(
+            {"AzureADV2": {"type": "object", "properties": props,
+                           "required": ["config", "name"]}}, "IdentityProvidersV2")
+        found = {f.subject for f in run(old, new).findings
+                 if f.kind in ("request_field_added_required",
+                               "request_field_now_required")}
+        self.assertTrue(any(s.endswith("name") for s in found),
+                        f"`name` was optional at old and is now required; got {found}")
+
+    def test_a_field_optional_through_ONE_old_arm_is_still_a_break(self):
+        """An obligation counts as pre-existing only when EVERY old route had
+        it. Required through one arm and optional through another was never an
+        obligation of the body, so tightening the loose arm breaks its callers.
+        """
+        props = {"name": {"type": "string"}}
+        strict = {"type": "object", "properties": props, "required": ["name"]}
+        loose = {"type": "object", "properties": props, "required": []}
+        old = self._union_doc({"ArmA": copy.deepcopy(strict),
+                               "ArmB": copy.deepcopy(loose)}, "Union")
+        new = self._union_doc({"ArmAV2": copy.deepcopy(strict),
+                               "ArmBV2": copy.deepcopy(strict)}, "UnionV2")
+        found = {f.subject for f in run(old, new).findings
+                 if f.kind in ("request_field_added_required",
+                               "request_field_now_required")}
+        self.assertTrue(found, "callers using the loose arm are now rejected")
+
+    def test_an_old_body_that_flattened_to_NOTHING_suppresses_nothing(self):
+        """The precondition control, doctrine 3b.
+
+        Both rules reason from what the OLD flattening contains. On a side that
+        flattened to nothing they are vacuously true of every field, which is a
+        broken instrument rather than a result -- the same failure as the first
+        `unreachable` rule, whose precondition held for 100% of Sentry's
+        schemas. So they abstain when the old side has no signal at all.
+        """
+        old = self._body(copy.deepcopy(BASE), {})
+        new = self._body(copy.deepcopy(BASE), self._obj(
+            {"limits": self._obj({"accounts": {"type": "integer"}}, ["accounts"])},
+            []))
+        found = {f.subject for f in run(old, new).findings
+                 if f.kind == "request_field_added_required"}
+        self.assertTrue(
+            any(s.endswith("limits.accounts") for s in found),
+            f"nothing about an empty old side justifies suppressing; got {found}")

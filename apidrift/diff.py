@@ -248,32 +248,86 @@ def _parent_key(path: str) -> str:
     return path[:mark.start()]
 
 
-def _inside_new_subtree(path: str, old_fields: Dict[str, Field],
-                        old_blind: Set[str]) -> bool:
-    """True when the field's PARENT is itself absent from the old side.
-
-    A required property inside an object that did not exist before cannot break
-    a caller: nobody was sending the parent, and the requirement is unreachable
-    until they do. OpenAI added an optional `moderation` object whose `model` is
-    required; reporting `moderation.model` as a newly required request field
-    says every existing caller is now rejected, which is the opposite of true.
-
-    This is a claim about the PARENT, deliberately: `name not in old_fields` is
-    already true for every field in this loop, so testing the field itself
-    again would decide nothing.
-    """
-    parent = _parent_key(path)
-    if not parent or not _strip_root_marker(parent):
-        return False  # the body root always existed
-    return parent not in old_fields and _blind(parent) not in old_blind
-
-
 def _synthetic_parent(path: str) -> str:
     """The path up to the outermost anonymous arm — i.e. what actually changed."""
     for mark in reversed(list(_ARM.finditer(path))):
         if not _is_nameable(mark.group(1)):
             return path[:mark.start()]
     return path
+
+
+# ---------------------------------------------------------------------------
+# "newly required" is a claim about BODIES, not about a `required:` array
+#
+# The engine's question was "is this dotted key present in the new flattening
+# with required=True and absent from the old one?". That is a claim about the
+# flattener's key space. The caller's question is whether a JSON body that the
+# old document accepted is now REJECTED, and two shapes satisfy the first while
+# failing the second:
+#
+#   1. the enclosing OBJECT is itself new. Cloudflare added `global_acceleration`
+#      to the device-policy body with four required members; every body that
+#      validated before still validates, because the property is optional and
+#      its obligations only bind once you send it. 56 findings.
+#   2. the obligation was ALREADY there, and only the key moved. Cloudflare
+#      bulk-renamed the thirteen arms of its identity-provider union
+#      (`access_schemas-azureAD` -> `access_azureAD-2`) and added a fourteenth.
+#      Every arm required `config`, `name` and `type` before and after; the
+#      flattener saw fourteen new keys. 51 findings.
+#
+# Both are decided below on the BARE path — every schema and union-arm marker
+# erased — because those markers are how the flattener identifies a node and
+# have nothing to do with what a caller sends. The independent checker decides
+# the same class by building the obligation set a validator would enforce
+# (`required_everywhere` in tests/measure_precision.py), which is a different
+# question with a different resolver, and it refutes both shapes unaided with
+# these suppressors switched off.
+# ---------------------------------------------------------------------------
+
+
+def _bare(path: str) -> str:
+    """A field path with every schema/union-arm marker erased.
+
+    `<access_identity-providers-2><access_azureAD-2>.config` is the property
+    `config` of the body: the angle-bracketed segments name a SCHEMA or a
+    union arm, and neither reaches the wire.
+    """
+    return _ARM.sub("", path).replace("..", ".").strip(".")
+
+
+def _subtree_is_new(path: str, bare_old: Dict[str, bool]) -> bool:
+    """Did the object that would carry this obligation exist in the old body?
+
+    Two functions answered this and were stacked, the weaker one first. It
+    tested the raw path, so an arm RENAME made the parent look absent, and it
+    carried no `old_has_signal` precondition, so it also suppressed when the
+    old body had flattened to nothing at all -- doctrine 3b, a refuter whose
+    precondition always holds. This one compares BARE ancestors and is guarded.
+    Keeping both meant the weaker one decided first and the stronger one's
+    three controls went red.
+
+    If some ancestor is absent from the old side, no body the old document
+    accepted could contain it, so the requirement arrives WITH the object
+    rather than being imposed on anything a caller was already sending. If the
+    object is itself mandatory that IS a break -- but it is the object's break,
+    reported on its own shorter path, and counting it again on every leaf
+    inside is how one added sub-object becomes ten findings.
+    """
+    return any(a not in bare_old for a in _bare_ancestors(path))
+
+
+def _bare_ancestors(path: str) -> List[str]:
+    """Every proper ancestor of a bare path, outermost first."""
+    bare = _bare(path)
+    if not bare:
+        return []
+    parts = [p for p in bare.replace("[]", ".[].").split(".") if p]
+    out, prefix = [], ""
+    for part in parts[:-1]:
+        prefix = f"{prefix}[]" if part == "[]" else (
+            f"{prefix}.{part}" if prefix else part)
+        out.append(prefix)
+    return out
 
 
 def _mk(op: Operation, kind: str, severity: str, detail: str, **kw) -> Finding:
@@ -371,6 +425,23 @@ def _diff_fields(
         new_blind.setdefault(_blind(key), []).append((key, val))
     old_blind = {_blind(key) for key in old_fields}
     reshaped: Set[str] = set()
+
+    # The old side's obligations, indexed by BARE path (see `_bare`). The value
+    # is True only when EVERY route the old document offered to that path
+    # already demanded the field -- a field required through one union arm and
+    # optional through another was not an obligation of the body, so tightening
+    # the other arm still breaks the callers who used it.
+    bare_old: Dict[str, bool] = {}
+    for key, val in old_fields.items():
+        if val.type == TRUNCATED:
+            continue  # a marker, not a field: it says nothing about obligations
+        bare = _bare(key)
+        bare_old[bare] = val.required and bare_old.get(bare, True)
+    # CONTROL. Both rules below reason from what the OLD flattening contains,
+    # so on a side that flattened to nothing they would be vacuously true of
+    # every field -- the `unreachable`-rule failure in a new place. An empty
+    # old side is ignorance, not evidence, so abstain.
+    old_has_signal = bool(bare_old)
 
     # Where either side stopped flattening, absence is ignorance, not deletion.
     #
@@ -510,9 +581,11 @@ def _diff_fields(
             continue  # the old side was not walked this far
         if _blind(name) in old_blind:
             continue  # same field reshaped or re-rooted — already accounted for
-        if _inside_new_subtree(name, old_fields, old_blind):
-            continue  # required inside a parent nobody was sending yet
         if where == "request" and f_new.required:
+            if old_has_signal and _subtree_is_new(name, bare_old):
+                continue  # the object carrying the obligation is itself new
+            if old_has_signal and bare_old.get(_bare(name)) is True:
+                continue  # the obligation already bound every old body
             out.append(_mk(
                 op, "request_field_added_required", BREAKING,
                 f"{label} gained required field `{name}`",

@@ -659,6 +659,190 @@ def param_schema(entry: Dict[str, Any]) -> Any:
     return None
 
 
+# --------------------------------------------------------------------------
+# "newly required", asked the VALIDATOR's way
+#
+# The engine's question is "does the string `leaf` appear in a `required: [...]`
+# array at the one node my dotted path reaches?", and this checker asked the
+# same thing at the same node -- the sixth instance of a checker sharing the
+# engine's question. The caller's question is different and it is the only one
+# that decides anything: **is there a JSON body that validated under OLD and is
+# REJECTED under NEW?**
+#
+# Two things follow that the string test cannot see:
+#
+#   * `oneOf`/`anyOf` is a DISJUNCTION. A body need only satisfy one arm, so a
+#     name is genuinely obligatory only when EVERY arm demands it. Unioning the
+#     arms' `required` arrays -- which is what reading one node's array after
+#     the flattener has picked an arm amounts to -- turns a union-arm rename
+#     into a new obligation that no validator would ever enforce.
+#   * A requirement inside an object that DID NOT EXIST in the old document
+#     cannot reject an old body, because no old body could contain that object.
+#     The obligation is additive; it arrives with the object.
+#
+# Both are decided here, from the raw document, with this file's own resolver.
+# --------------------------------------------------------------------------
+
+_MARKER = re.compile(r"<[^>]*>")
+
+
+def body_path(subject: str) -> List[str]:
+    """The property path inside the body, engine-internal markers erased.
+
+    `<CheckoutForwardRequest>.amount.currency` is the flattener's notation for
+    the property `amount.currency` of the body: the angle-bracketed segments
+    name a SCHEMA or an anonymous union arm, neither of which is a property and
+    neither of which reaches the wire. Walking them as property names is why
+    103 findings in this class came back "could not resolve the parent object"
+    -- undecidable for a purely notational reason.
+    """
+    bare = _MARKER.sub("", subject)
+    return [p for p in bare.replace("[]", ".[].").split(".") if p]
+
+
+def required_everywhere(node: Any, doc: Dict[str, Any], depth: int = 0,
+                        seen: frozenset = frozenset()) -> set:
+    """Names that EVERY valid object instance of `node` must carry.
+
+    `allOf` is a conjunction, so its arms' obligations union. `oneOf`/`anyOf`
+    is a disjunction, so only what every arm demands is guaranteed -- the
+    intersection. Deliberately written here rather than imported: the engine's
+    flattener resolves an arm and then reads that arm's `required` array, which
+    is the union answer, and a checker that reuses it agrees with it.
+    """
+    if not isinstance(node, dict) or depth > 10:
+        return set()
+    ref = node.get("$ref")
+    if isinstance(ref, str):
+        name = ref.rsplit("/", 1)[-1]
+        if name in seen:
+            return set()
+        target = schemas_of(doc).get(name)
+        if target is None:
+            return set()
+        return required_everywhere(target, doc, depth + 1, seen | {name})
+    names = {str(r) for r in (node.get("required") or []) if isinstance(r, str)}
+    for arm in node.get("allOf") or []:
+        names |= required_everywhere(arm, doc, depth + 1, seen)
+    for keyword in ("oneOf", "anyOf"):
+        arms = node.get(keyword)
+        if not isinstance(arms, list) or not arms:
+            continue
+        common: Optional[set] = None
+        for arm in arms:
+            got = required_everywhere(arm, doc, depth + 1, seen)
+            common = got if common is None else (common & got)
+        names |= (common or set())
+    return names
+
+
+def descend(node: Any, parts: List[str], doc: Dict[str, Any],
+            depth: int = 0, seen: frozenset = frozenset()) -> List[Any]:
+    """Every schema node a body can present at this property path.
+
+    A list rather than a single node because a union puts the same path in
+    several arms, and a body reaching it through one arm is not governed by the
+    others. Empty means no valid body can carry that path at all.
+    """
+    if not isinstance(node, dict) or depth > 12:
+        return []
+    ref = node.get("$ref")
+    if isinstance(ref, str):
+        name = ref.rsplit("/", 1)[-1]
+        if name in seen:
+            return []
+        target = schemas_of(doc).get(name)
+        if target is None:
+            return []
+        return descend(target, parts, doc, depth + 1, seen | {name})
+    if not parts:
+        return [node]
+    head, rest = parts[0], parts[1:]
+    out: List[Any] = []
+    if head == "[]":
+        items = node.get("items")
+        if items is not None:
+            out.extend(descend(items, rest, doc, depth + 1, seen))
+    else:
+        child = (node.get("properties") or {}).get(head)
+        if child is not None:
+            out.extend(descend(child, rest, doc, depth + 1, seen))
+    for keyword in ("allOf", "oneOf", "anyOf"):
+        for arm in node.get(keyword) or []:
+            out.extend(descend(arm, parts, doc, depth + 1, seen))
+    return out
+
+
+def check_now_required(finding: Dict[str, Any], old: Dict[str, Any],
+                       new: Dict[str, Any], old_body: Any,
+                       new_body: Any) -> Tuple[str, str]:
+    """Is some body that validated under OLD now rejected for missing `leaf`?"""
+    parts = body_path(finding.get("subject") or finding.get("root_cause") or "")
+    if not parts:
+        return UNDECIDABLE, "the finding names no field path"
+    leaf, parents = parts[-1], parts[:-1]
+    if new_body is None:
+        return UNDECIDABLE, "no request body found on the new side"
+
+    new_nodes = descend(new_body, parents, new)
+    if not new_nodes:
+        return UNDECIDABLE, (f"`{'.'.join(parents) or '<body>'}` is not "
+                             f"resolvable in the new request body")
+    if not any(leaf in required_everywhere(n, new) for n in new_nodes):
+        # Not obligatory for every body the new document accepts. Saying
+        # "therefore not a break" would be over-refuting: the obligation may be
+        # real inside ONE arm of a union, and a caller who was using that arm
+        # does break. Deciding that needs a correspondence between the old and
+        # new arms, which the documents do not state -- so this is undecidable
+        # here, not refuted. Over-refuting is the same failure as
+        # over-confirming, one sign flipped.
+        if any(n.get("oneOf") or n.get("anyOf")
+               for n in new_nodes if isinstance(n, dict)):
+            return UNDECIDABLE, (
+                f"`{leaf}` is required by some arm of a union at "
+                f"`{'.'.join(parents) or '<body>'}` but not by every arm — "
+                f"deciding it needs an old-arm/new-arm correspondence the "
+                f"documents do not state")
+        return REFUTED, (f"`{leaf}` is not in the obligations of "
+                         f"`{'.'.join(parents) or '<body>'}` in the NEW "
+                         f"document at all")
+
+    if old_body is None:
+        node = find_operation(old, finding["op_key"])
+        if node is None:
+            return UNDECIDABLE, "the operation is absent from the old document"
+        return REFUTED, ("the operation accepted no request body at old, so no "
+                         "old body can be rejected for a field inside one")
+
+    old_nodes = descend(old_body, parents, old)
+    if not old_nodes:
+        # The enclosing object did not exist in the old document. Nothing a
+        # caller sent could contain it, so the obligation arrives WITH the
+        # object rather than being imposed on anything that already existed.
+        # If the object is itself newly required, that is a break -- but it is
+        # the OBJECT's break, reported on its own shorter path, and counting it
+        # again on every leaf inside is how one restructure becomes fifty
+        # findings.
+        deepest = 0
+        for cut in range(len(parents), -1, -1):
+            if descend(old_body, parents[:cut], old):
+                deepest = cut
+                break
+        missing = parents[deepest] if deepest < len(parents) else leaf
+        return REFUTED, (f"`{'.'.join(parents)}` does not exist in the OLD "
+                         f"request body (`{missing}` is new), so no body that "
+                         f"validated under OLD can contain it — the obligation "
+                         f"is additive")
+
+    if all(leaf in required_everywhere(n, old) for n in old_nodes):
+        return REFUTED, (f"`{leaf}` was ALREADY required of every old body at "
+                         f"`{'.'.join(parents) or '<body>'}` — the obligation "
+                         f"did not change, only the notation did")
+    return CONFIRMED, (f"a body that validated under OLD (reaching "
+                       f"`{'.'.join(parents) or '<body>'}` without `{leaf}`) is "
+                       f"rejected by NEW, which requires it")
+
+
 
 # --------------------------------------------------------------------------
 # schema_removed, asked the CALLER's way
@@ -1464,67 +1648,12 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
         return UNDECIDABLE, f"no independent check for `{kind}`"
 
     if kind in ("request_field_added_required", "request_field_now_required"):
-        # Operation-level: the body is inline, so walk it directly.
-        #
-        # `root` is only set on findings that went through `collapse()`, and an
-        # injected control never does -- so taking the leaf from it alone gave
-        # the empty string, and this branch refuted a break it had been told
-        # was real, with "`` required old=False new=False". Caught by
-        # `vendor_control.py`, which is the entire reason to inject a break
-        # whose answer is known.
-        leaf = root.split(".")[-1].replace("[]", "")
-        if not leaf:
-            steps = [value for step_kind, value in
-                     subject_tokens(finding.get("subject") or "")
-                     if step_kind == "prop"]
-            leaf = steps[-1] if steps else ""
-        if not leaf:
-            return UNDECIDABLE, "the finding names no field"
-        old_schema = _body_schema(old, finding["op_key"], "request")
-        new_schema = _body_schema(new, finding["op_key"], "request")
-        if new_schema is None:
-            return UNDECIDABLE, "no request body found on the new side"
-
-        # A requirement inside an object the old body did not have is
-        # unreachable for an existing caller: they never send the parent, so
-        # the server never asks them for the child. Stripe's `limits` and
-        # Twilio's `conversationsV1Bridge` are both brand-new optional objects
-        # with a required property inside, and both scored as "every existing
-        # caller is now rejected". Asked here, from the raw OLD body, about the
-        # PARENT -- a different question from the engine's, which compares
-        # flattened keys.
-        tokens = subject_tokens(finding.get("subject") or "")
-        if len(tokens) > 1 and old_schema is not None:
-            stem = tokens[:-1]
-            if any(step_kind == "prop" for step_kind, _ in stem):
-                had_parent, _ = walk_subject(old, old_schema, stem)
-                has_parent, _ = walk_subject(new, new_schema, stem)
-                if has_parent and not had_parent:
-                    trail = "".join(v if k != "prop" else "." + v for k, v in stem)
-                    return REFUTED, (f"`{trail.lstrip('.')}` is absent from the old "
-                                     f"request body — nobody was sending the parent, "
-                                     f"so `{leaf}` cannot reject an existing caller")
-
-        def required_of(schema, doc, path_parts):
-            if not path_parts:
-                node = schema
-            else:
-                found, node = walk_properties(schema, path_parts[:-1], doc)
-                if not found:
-                    return None
-            if isinstance(node, dict) and "$ref" in node:
-                node = schemas_of(doc).get(str(node["$ref"]).rsplit("/", 1)[-1]) or {}
-            return set((node or {}).get("required") or [])
-
-        parts = [p for p in root.replace("[]", ".[].").split(".") if p]
-        new_req = required_of(new_schema, new, parts)
-        old_req = required_of(old_schema, old, parts) if old_schema is not None else set()
-        if new_req is None:
-            return UNDECIDABLE, "could not resolve the parent object"
-        if leaf in new_req and leaf not in (old_req or set()):
-            return CONFIRMED, f"`{leaf}` newly required in the request body"
-        return REFUTED, (f"`{leaf}` required old={leaf in (old_req or set())} "
-                         f"new={leaf in new_req}")
+        # Asked as a VALIDATOR would: does some body that validated under OLD
+        # get rejected under NEW? See `check_now_required`.
+        return check_now_required(
+            finding, old, new,
+            _body_schema(old, finding["op_key"], "request"),
+            _body_schema(new, finding["op_key"], "request"))
 
     if kind == "response_field_removed":
         # Ask what a CALLER loses, reading the subject's brackets rather than
@@ -1643,25 +1772,11 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
             return CONFIRMED, "present at old, absent at new"
         return REFUTED, f"old={found_old} new={found_new}"
 
-    if kind in ("request_field_added_required", "request_field_now_required"):
-        resolved_new = resolve_root(new, root)
-        if resolved_new is None or not resolved_new[1]:
-            return UNDECIDABLE, f"root `{root}` is not a named schema with a field"
-        schema_new, parts = resolved_new
-        parent_new = walk_properties(schema_new, parts[:-1], new)[1] if len(parts) > 1 \
-            else schema_new
-        leaf = parts[-1]
-        req_new = set((parent_new or {}).get("required") or [])
-        resolved_old = resolve_root(old, root)
-        if resolved_old is None:
-            return UNDECIDABLE, "schema absent from the old spec"
-        schema_old, parts_old = resolved_old
-        parent_old = walk_properties(schema_old, parts_old[:-1], old)[1] \
-            if len(parts_old) > 1 else schema_old
-        req_old = set((parent_old or {}).get("required") or [])
-        if leaf in req_new and leaf not in req_old:
-            return CONFIRMED, f"`{leaf}` newly in required"
-        return REFUTED, f"`{leaf}` required old={leaf in req_old} new={leaf in req_new}"
+    # NOTE: a second `request_field_added_required`/`request_field_now_required`
+    # branch used to sit here, asking the schema-rooted version of the same
+    # question. It was unreachable -- the branch above returns on every path --
+    # so it decided nothing and hid the fact that this class had exactly one
+    # implementation. Removed rather than left as scenery.
 
     return UNDECIDABLE, f"no independent check implemented for `{kind}`"
 
