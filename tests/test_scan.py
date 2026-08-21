@@ -618,3 +618,44 @@ class TestThePinReportsWhichRelease(unittest.TestCase):
         root = self._root({"package.json": _json.dumps(
             {"dependencies": {"stripe-terminal-react": "1.0.0"}})})
         self.assertEqual("", pinned_sdk_version(root, get("stripe")))
+
+    def test_every_workspace_pin_is_reported(self):
+        """A monorepo can pin different releases in different workspaces, and
+        those are different API versions on different files. langfuse pins
+        `stripe@^18.5.0` in `web/` and `stripe@^17.4.0` in `worker/`; reporting
+        whichever was found first is a lie of omission exactly where the number
+        matters."""
+        import json as _json
+        import tempfile
+        from pathlib import Path as _P
+        from apidrift.scan import pinned_sdk_version
+        from apidrift.vendors import get
+        root = _P(tempfile.mkdtemp(prefix="apidrift-mono-"))
+        for space, spec in (("web", "^18.5.0"), ("worker", "^17.4.0")):
+            (root / space / "src").mkdir(parents=True)
+            (root / space / "package.json").write_text(
+                _json.dumps({"dependencies": {"stripe": spec}}))
+            (root / space / "src" / "pay.ts").write_text("")
+        (root / "package.json").write_text('{"dependencies": {"turbo": "2"}}')
+        declared = pinned_sdk_version(
+            root, get("stripe"), ["web/src/pay.ts", "worker/src/pay.ts"])
+        self.assertIn("stripe@^18.5.0", declared)
+        self.assertIn("stripe@^17.4.0", declared)
+
+    def test_the_nearest_manifest_wins_within_one_workspace(self):
+        """Walking UP from the file, not down from the root: the workspace's
+        own manifest is the one that governs it."""
+        import json as _json
+        import tempfile
+        from pathlib import Path as _P
+        from apidrift.scan import pinned_sdk_version
+        from apidrift.vendors import get
+        root = _P(tempfile.mkdtemp(prefix="apidrift-near-"))
+        (root / "worker" / "src").mkdir(parents=True)
+        (root / "package.json").write_text(
+            _json.dumps({"dependencies": {"stripe": "^9.0.0"}}))
+        (root / "worker" / "package.json").write_text(
+            _json.dumps({"dependencies": {"stripe": "^17.4.0"}}))
+        (root / "worker" / "src" / "pay.ts").write_text("")
+        declared = pinned_sdk_version(root, get("stripe"), ["worker/src/pay.ts"])
+        self.assertTrue(declared.startswith("stripe@^17.4.0"), declared)

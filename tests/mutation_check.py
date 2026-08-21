@@ -2004,7 +2004,7 @@ MUTATIONS = [
     (
         "the pin stops naming the release, so the report is not actionable",
         "apidrift/scan.py",
-        "                declared = pinned_sdk_version(root, vendor)",
+        "                declared = pinned_sdk_version(root, vendor, pinned)",
         "                declared = \"\"",
         ["test_the_pin_names_the_declared_release"],
     ),
@@ -2022,6 +2022,22 @@ MUTATIONS = [
         "    key = tuple(finding.affected_ops or ())\n    cached = _PATHS_CACHE.get(key)",
         "    key = id(finding)\n    cached = _PATHS_CACHE.get(key)",
         ["test_the_memo_is_keyed_on_the_operation_list_not_an_address"],
+    ),
+
+    (
+        "the pin reads only the repo root, so a monorepo workspace is invisible",
+        "apidrift/scan.py",
+        "    groups.append([root])",
+        "    groups = [[root]]",
+        ["test_the_nearest_manifest_wins_within_one_workspace",
+         "test_every_workspace_pin_is_reported"],
+    ),
+    (
+        "the pin reports only the first workspace it found",
+        "apidrift/scan.py",
+        "        if declared and declared not in found:\n            found.append(declared)",
+        "        if declared and not found:\n            found.append(declared)",
+        ["test_every_workspace_pin_is_reported"],
     ),
 
 ]

@@ -119,7 +119,8 @@ def reaches_through_sdk(source: str, vendor: Vendor) -> bool:
     return False
 
 
-def pinned_sdk_version(root: Path, vendor: Vendor) -> str:
+def pinned_sdk_version(root: Path, vendor: Vendor,
+                       near: Sequence[str] = ()) -> str:
     """The SDK release this repo declares for `vendor`, if it declares one.
 
     "You are pinned" is not actionable; "you are pinned to `stripe@^17.4.0`" is,
@@ -135,32 +136,67 @@ def pinned_sdk_version(root: Path, vendor: Vendor) -> str:
     dated-version vendor, which is what changed BETWEEN two API versions.
     """
     packages = set(_SDK_PACKAGES.get(vendor.key, ())) | {vendor.key}
-    for name in ("package.json", "requirements.txt", "pyproject.toml",
-                 "Pipfile", "setup.py"):
-        path = root / name
-        if not path.is_file():
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        if name == "package.json":
-            try:
-                doc = json.loads(text)
-            except ValueError:
+    # Every directory from each pinned FILE up to the repo root, nearest first,
+    # then the root itself. Real repositories are monorepos: langfuse declares
+    # `stripe` in `worker/package.json` and its root manifest does not mention
+    # it at all, so a root-only read reported "pinned" with no version -- which
+    # is the half of the sentence that is not actionable.
+    # One workspace's answer is not the repository's. langfuse pins
+    # `stripe@^18.5.0` in `web/package.json` and `stripe@^17.4.0` in
+    # `worker/package.json`, and those are two different API versions on two
+    # different sets of files. Reporting whichever was found first would be a
+    # lie of omission in exactly the place the number matters, so every
+    # DISTINCT declaration is collected and reported.
+    found: List[str] = []
+    groups: List[List[Path]] = []
+    for rel in list(near)[:12]:
+        chain: List[Path] = []
+        here = (root / rel).parent
+        while True:
+            chain.append(here)
+            if here == root or root not in here.parents:
+                break
+            here = here.parent
+        groups.append(chain)
+    groups.append([root])
+
+    for roots in groups:
+        declared = _declared_in(roots, packages)
+        if declared and declared not in found:
+            found.append(declared)
+    return ", ".join(found[:3]) + (" …" if len(found) > 3 else "")
+
+
+def _declared_in(roots: Sequence[Path], packages: Set[str]) -> str:
+    """The first declaration of any of `packages` along this directory chain."""
+    for base in roots:
+        for name in ("package.json", "requirements.txt", "pyproject.toml",
+                     "Pipfile", "setup.py"):
+            path = base / name
+            if not path.is_file():
                 continue
-            for section in ("dependencies", "devDependencies",
-                            "peerDependencies", "optionalDependencies"):
-                for pkg, spec in (doc.get(section) or {}).items():
-                    if pkg in packages:
-                        return f"{pkg}@{spec}"
-            continue
-        for line in text.splitlines():
-            stripped = line.strip().strip('"\'')
-            for pkg in packages:
-                if re.match(rf"^{re.escape(pkg)}\s*(==|>=|~=|\^|=|,|\[)", stripped) \
-                        or re.match(rf"^{re.escape(pkg)}$", stripped):
-                    return stripped.rstrip(",").strip()
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if name == "package.json":
+                try:
+                    doc = json.loads(text)
+                except ValueError:
+                    continue
+                for section in ("dependencies", "devDependencies",
+                                "peerDependencies", "optionalDependencies"):
+                    for pkg, spec in (doc.get(section) or {}).items():
+                        if pkg in packages:
+                            return f"{pkg}@{spec}"
+                continue
+            for line in text.splitlines():
+                stripped = line.strip().strip('"\'')
+                for pkg in packages:
+                    if re.match(rf"^{re.escape(pkg)}\s*(==|>=|~=|\^|=|,|\[)",
+                                stripped) \
+                            or re.match(rf"^{re.escape(pkg)}$", stripped):
+                        return stripped.rstrip(",").strip()
     return ""
 
 
@@ -521,7 +557,7 @@ def scan_repo(
                       if reaches_through_sdk(source, vendor)]
             if pinned:
                 result.pinned[key] = sorted(pinned)
-                declared = pinned_sdk_version(root, vendor)
+                declared = pinned_sdk_version(root, vendor, pinned)
                 if declared:
                     result.pinned_versions[key] = declared
                 provable = [(rel, src) for rel, src in files
