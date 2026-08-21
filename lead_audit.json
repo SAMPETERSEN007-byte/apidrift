@@ -36,7 +36,7 @@
     "lead_precision": "0/10",
     "sendable": false,
     "blocker": "Operation reachability is accepted as proof for a whole-schema removal. A caller who reaches the operation but never reads any field of the removed schema is not affected, and seven of ten audited leads were exactly that. The fix is to resolve the removed schema to its leaf field names in the OLD spec and require a read of one of them, rejecting calls whose response is discarded.",
-    "findings_precision": "5-vendor gate population: 49/49 breaking, zero undecidable. ALL 21 registered vendors, measured for the first time 2026-08-20: 1487/1537 = 96.7% on independently decidable findings, 337 undecidable, over 1874 breaking findings. Started the day claiming 96.3% over 2766 findings, which was really 67.8%. The earlier 64/64 was a statement about five vendors, not about the engine.",
+    "findings_precision": "5-vendor gate population: 46/46 breaking, 68/68 potentially, zero undecidable. ALL 31 vendors with findings, 2026-08-21: 1332/1447 = 92.1% on independently decidable findings, 172 undecidable, over 1619 breaking findings. The full progression of every all-vendor number this project has ever claimed: 96.3% -> 67.8% -> 96.7% -> 77.8% -> 92.1%. Every drop is the checker learning to decide findings nobody had checked; none of the higher numbers was ever a measurement of the engine.",
     "also_open": [
       "operation_reached() stops at the first affected operation with a hit, in list order, so an alphabetically earlier DELETE whose response is discarded wins over a GET whose response is deserialized. Rank by whether the response is consumed.",
       "A lead's breaks_on names the finding's representative operation while its proof names the operation the file actually calls, with nothing stating the two are related. This misled three auditors who had the repo, the spec and the source in front of them."
@@ -119,18 +119,26 @@
       }
     },
     "open_false_positive_classes": {
-      "_note": "50 findings the independent checker still refutes, by kind. Each is a real defect and none is fixed. Three adversarial audits diagnosed the first three correctly and every one of their proposed fixes was measured as UNSAFE -- one would have dropped all-vendor precision to 77.3% and refuted `stripe token.card.iin`. 2026-08-21: the two request_field_* classes are CLOSED (see findings_defect_found_and_fixed_7) and the standing total is 33 over a 1767-finding population. The counts below are the 2026-08-20 numbers and have NOT been re-derived for the other kinds -- do not read them as a fresh measurement.",
-      "response_field_removed": 13,
-      "schema_removed": 10,
-      "schema_field_type_changed": 8,
-      "request_field_added_required": "CLOSED 2026-08-21 (was 8 refuted of 33 decidable, with 103 more undecidable; the whole 158-finding class re-adjudicated to 47 TRUE / 109 FALSE / 2 undecidable, and the engine now emits only the 47)",
-      "endpoint_removed": 5,
-      "request_field_now_required": "CLOSED 2026-08-21 (was 4; all four were the CHECKER's false refutations -- it never merged allOf -- and the class now measures 18/18 with 4 undecidable)",
-      "schema_field_removed": 2,
-      "known_mechanisms": [
-        "flattener key identity: `oneOf[null, X]` collapsing to `$ref X`, a root `$ref X` becoming `allOf[X, ...]`, and union arms renamed by content -- a key vanishes while the payload is unchanged.",
-        "CLOSED 2026-08-21. Engine and checker both asked whether the string appears in a `required:[...]` array at the one node their path reaches, rather than whether a body that validated under OLD is rejected under NEW. Re-adjudicated over the WHOLE class (158 findings, no sampling): 47 TRUE / 109 FALSE / 2 undecidable, which corroborates the earlier independent adjudication's 43/124. The checker was wrong in BOTH directions: 103 of 158 were UNDECIDABLE for a purely notational reason (`collapse()` rewrites the path to `<Schema>.a.b` and the checker walked the schema NAME as a property) and 12 of its refutations were FALSE because it read one node's `required` array and never merged `allOf`.",
-        "endpoint_removed: the engine keys on METHOD+path and the checker on path alone. Their refuted sets are disjoint, so the 5 each is not the same 5."
+      "_note": "115 findings the independent checker still refutes, 2026-08-21. 94 of them are ONE mechanism, named below and deliberately not fixed. That leaves 21 across six kinds.",
+      "response_field_removed": 94,
+      "schema_removed": 7,
+      "schema_field_removed": 4,
+      "response_field_type_changed": 4,
+      "schema_field_type_changed": 3,
+      "request_enum_value_removed": 2,
+      "endpoint_moved": 1,
+      "the_one_mechanism": "A response position that GAINS union arms. Twilio repointed a 200 body from `us_app_to_person` to a `oneOf` of it and a v2 superset; Cloudflare widened an Access policy `result` to `anyOf[app_policy, infra_policy]`; PayPal replaced `oneOf[error_400 ... error_500]` with one `error` object carrying every field. Every old key moves, so every field reads as removed, while a field present in EVERY new arm is still guaranteed. NO ENGINE FIX IS PROPOSED: the only rule that decides it is 'does every alternative still promise this field', which is verbatim the question the checker asks, and building it twice is how this project shipped the same defect six times. The checker catching them is worth more than the engine and the checker agreeing."
+    },
+    "recall_controls": {
+      "_note": "The gate had five layers and none asked whether the tool can still FIRE. Layers 1-5 all get quieter as the engine gets more conservative, so a suppressor that silenced everything would pass all five -- precision on zero findings is undefined, not zero. Layer 6 injects a break whose answer is known.",
+      "vendor_control": "235 controls fired across all 32 vendors, 0 MISSED, 0 found-but-refuted. Eight injections each.",
+      "scan_control": "a fixture repo with the same dependence in Python AND TypeScript, built from findings re-derived on every run rather than read from a file. Both languages must fire.",
+      "corpus_scan": "9,240 files of real third-party code (Documenso, Formbricks, Langfuse, vercel/ai-chatbot), impacts held to a hand-verified baseline of 0. It reported 27 impacts before the co-location fix and 0 after, so it moves when scan precision moves.",
+      "caught": [
+        "the checker refuting a real `GET /emails` removal because it keyed on PATH alone while an endpoint is METHOD+path",
+        "every vendor evidence marker being PYTHON-shaped, so `import { Resend } from 'resend'` matched nothing and TypeScript files were rejected at the prefilter and never examined",
+        "`_leaf_of` and `_named_identifier` disagreeing about what a finding names, so the scan prefilter demanded a SCHEMA name appear in source",
+        "a conflict resolution that kept a CONTROLS registry entry while dropping the function it names"
       ]
     }
   },
