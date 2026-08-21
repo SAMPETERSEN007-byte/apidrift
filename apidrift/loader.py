@@ -650,6 +650,14 @@ def load_spec(raw: bytes, filename: str) -> Spec:
 
     views = build_schema_views(doc)
     every, request_roots, response_roots = operation_schema_roots(doc)
+    if not every and views:
+        # CONTROL, not a fallback. Reference-based root discovery returned
+        # NOTHING while the document declares schemas -- an empty measurement,
+        # which is a claim about the instrument until something says otherwise.
+        # The document is dereferenced; ask where the bodies actually appear.
+        # If that finds nothing either, the maps stay empty and the schema
+        # suppressors go on abstaining, which is the honest answer.
+        every, request_roots, response_roots = dereferenced_schema_roots(doc)
     return Spec(
         version=version,
         title=title,
@@ -691,6 +699,7 @@ class SchemaView:
     kind: str                      # object | array | enum | primitive | union
     enum: Optional[Tuple[str, ...]] = None
     item: Optional[str] = None     # for an array: what its elements are
+    item_enum: Optional[Tuple[str, ...]] = None   # ...and their enum, if inline
     # `discriminator.mapping` KEYS -- the values a caller actually puts in the
     # discriminator property. Unlike the schema names they point at, these are
     # on the wire, so losing one narrows what a caller may send.
@@ -1010,6 +1019,100 @@ def operation_schema_roots(
             req = set(_direct_refs(op.get("requestBody")))
             req |= set(_direct_refs(op.get("parameters")))
             resp = set(_direct_refs(op.get("responses")))
+            if req:
+                request[key] = sorted(req)
+            if resp:
+                response[key] = sorted(resp)
+            if req or resp:
+                every[key] = sorted(req | resp)
+    return every, request, response
+
+
+def _inline_bodies(views_raw: Dict[str, Any]) -> Dict[str, List[str]]:
+    """canonical JSON of a named schema's body -> the names that carry it.
+
+    Two schemas may be byte-identical (Sentry defines `Repository` and
+    `RepositoryNode` from the same serializer), so the value is a list.
+    """
+    index: Dict[str, List[str]] = {}
+    for name, body in views_raw.items():
+        if not isinstance(body, dict) or not body:
+            continue
+        index.setdefault(json.dumps(body, sort_keys=True), []).append(name)
+    return index
+
+
+def _inline_matches(node: Any, index: Dict[str, List[str]],
+                    depth: int = 0) -> List[str]:
+    """Every named schema whose body appears VERBATIM inside `node`.
+
+    The inline analogue of `_direct_refs`, walked to the same depth. A
+    DEREFERENCED document carries no `$ref` at all, so `_direct_refs` finds
+    nothing and every schema looks unreachable -- which is a fact about the
+    publisher's tooling, not about the API. What a caller sees is the
+    operation's body, so ask where that body actually appears.
+    """
+    out: List[str] = []
+    if depth > 8 or not isinstance(node, (dict, list)):
+        return out
+    if isinstance(node, list):
+        for item in node:
+            out.extend(_inline_matches(item, index, depth + 1))
+        return out
+    hit = index.get(json.dumps(node, sort_keys=True))
+    if hit:
+        out.extend(hit)
+        # Keep walking: a schema may be nested inside a larger one that is
+        # itself named (Sentry's `Branches` contains `BranchNode`), and both
+        # are separately observable at this operation.
+    for value in node.values():
+        out.extend(_inline_matches(value, index, depth + 1))
+    return out
+
+
+def dereferenced_schema_roots(
+    doc: Dict[str, Any],
+) -> Tuple[Dict[str, List[str]], Dict[str, List[str]], Dict[str, List[str]]]:
+    """`operation_schema_roots` for a document that publishes NO `$ref`.
+
+    Sentry publishes `openapi-derefed.json`: 3.2 MB with zero occurrences of
+    `"$ref"`, every schema body inlined straight into the operation that uses
+    it while `components/schemas` is kept as a parallel table. Reference-based
+    reachability reads that as "no operation reaches any schema", which is the
+    same vacuous measurement the `unreachable` suppressor's control exists to
+    refuse (findings_defect_found_and_fixed_6).
+
+    The removed schema's shape is still verbatim SOMEWHERE, and that somewhere
+    is exactly where a caller could observe it. Matching bodies instead of
+    names gives the same three maps and the four suppressors then apply
+    unchanged.
+
+    Deliberately NOT applied to a document that does link its schemas: there a
+    body may coincide with a schema nobody named, and reference identity is
+    both cheaper and exact.
+    """
+    every: Dict[str, List[str]] = {}
+    request: Dict[str, List[str]] = {}
+    response: Dict[str, List[str]] = {}
+    raw = ((doc.get("components") or {}).get("schemas")
+           or doc.get("definitions") or {})
+    paths = doc.get("paths")
+    if not isinstance(raw, dict) or not isinstance(paths, dict):
+        return every, request, response
+    index = _inline_bodies(raw)
+    if not index:
+        return every, request, response
+    for path, item in paths.items():
+        if not isinstance(item, dict):
+            continue
+        for method in HTTP_METHODS:
+            op = item.get(method)
+            if not isinstance(op, dict):
+                continue
+            key = f"{method.upper()} {path}"
+            req = set(_inline_matches(op.get("requestBody"), index))
+            req |= set(_inline_matches(op.get("parameters"), index))
+            resp = set(_inline_matches(op.get("responses"), index))
             if req:
                 request[key] = sorted(req)
             if resp:

@@ -308,8 +308,216 @@ def inject_schema_field_type_changed(doc) -> Optional[Tuple[dict, str, Callable]
     return None
 
 
+_CONTROL_SHAPE = {"type": "string", "description": "apidrift control"}
+
+
+def inject_schema_removed(doc) -> Optional[Tuple[dict, str, Callable]]:
+    """Delete a schema an operation actually carries, and change what it
+    carried.
+
+    The recall control for the four `schema_removed` suppressors. Each of them
+    deletes findings, so each can delete a real break, and until this session
+    nothing injected a removal into a real vendor spec to check that a genuine
+    one still comes out.
+
+    The target is chosen from the RAW document, never from the engine's
+    reachability maps: a control that picks its target with the mechanism
+    under test degrades to `n/a` exactly when that mechanism breaks, and
+    "could not run" is not "passed". Two keys, because a DEREFERENCED document
+    (Sentry) answers only the second -- a `$ref` inside an operation, or the
+    schema's body appearing verbatim inside one.
+
+    What the control demands is that the removal stays VISIBLE at the
+    operation that carried it, not that it carries a particular label. Sentry's
+    `AutofixPostResponse` is the 202 body of an operation whose REQUEST body
+    declares the same two field names, so the engine suppresses the
+    schema-level claim and reports `response_field_removed` for `run_id` and
+    `sentry_run_id` on that exact operation instead -- a more precise
+    description of the same break, not a lost one. Demanding the kind would
+    have scored that a miss and invited a "fix" that made the report worse.
+    Reported nowhere IS a miss, and that is what this asserts.
+    """
+    schemas = _schemas_of(doc)
+    if not schemas:
+        return None
+
+    carriers: Dict[str, set] = {}
+    for key, subtree in _op_subtrees(doc):
+        found: set = set()
+        _refs_in(subtree, found)
+        for hit in found:
+            carriers.setdefault(hit, set()).add(key)
+    by_ref = bool(carriers)
+    if not by_ref:
+        index: Dict[str, str] = {}
+        for name, body in schemas.items():
+            if isinstance(body, dict) and body:
+                index.setdefault(
+                    json.dumps(body, sort_keys=True, default=str), name)
+        if not index:
+            return None
+        for key, subtree in _op_subtrees(doc):
+            found = set()
+            _bodies_in(subtree, index, found)
+            for hit in found:
+                carriers.setdefault(hit, set()).add(key)
+
+    for name in sorted(carriers):
+        body = schemas.get(name)
+        if not isinstance(body, dict) or not isinstance(
+                body.get("properties"), dict) or not body["properties"]:
+            continue
+        fields = {str(f) for f in body["properties"]}
+        ops = set(carriers[name])
+        out = copy.deepcopy(doc)
+        if by_ref:
+            target = f"#/components/schemas/{name}"
+            match = (lambda n, t=target: isinstance(n, dict)
+                     and n.get("$ref") == t)
+        else:
+            wanted = json.dumps(body, sort_keys=True, default=str)
+            match = (lambda n, w=wanted: isinstance(n, dict)
+                     and json.dumps(n, sort_keys=True, default=str) == w)
+        holder_key = "components" if isinstance(
+            (doc.get("components") or {}).get("schemas"), dict) else "definitions"
+        out["paths"] = _replace_everywhere(out["paths"], match, _CONTROL_SHAPE)
+        # Anything else that pointed at it must stop pointing, or the document
+        # keeps a dangling reference and the diff measures the dangle rather
+        # than the removal.
+        out[holder_key] = _replace_everywhere(out[holder_key], match,
+                                              _CONTROL_SHAPE)
+        holder = (out[holder_key].get("schemas")
+                  if holder_key == "components" else out[holder_key])
+        if not isinstance(holder, dict) or name not in holder:
+            continue
+        holder.pop(name, None)
+        return out, name, lambda f, n=name, fs=fields, os=ops: (
+            (f.kind == "schema_removed" and f.subject == n)
+            or (f.kind in ("response_field_removed", "schema_field_removed",
+                           "request_field_removed", "schema_field_type_changed",
+                           "response_field_type_changed")
+                and f.op_key in os
+                and f.subject.split("<")[0].split(".")[-1] in fs))
+    return None
+
+
+def _schemas_of(doc) -> Dict[str, Any]:
+    node = ((doc.get("components") or {}).get("schemas")
+            or doc.get("definitions") or {})
+    return node if isinstance(node, dict) else {}
+
+
+def _op_subtrees(doc):
+    for path, method, op in _operations(doc):
+        key = f"{method.upper()} {path}"
+        yield key, op.get("requestBody")
+        yield key, op.get("responses")
+        yield key, op.get("parameters")
+
+
+def _refs_in(node, out: set, depth: int = 0) -> None:
+    if depth > 8 or not isinstance(node, (dict, list)):
+        return
+    if isinstance(node, list):
+        for item in node:
+            _refs_in(item, out, depth + 1)
+        return
+    ref = node.get("$ref")
+    if isinstance(ref, str) and "/schemas/" in ref:
+        out.add(ref.rsplit("/", 1)[-1])
+    for value in node.values():
+        _refs_in(value, out, depth + 1)
+
+
+def _bodies_in(node, index: Dict[str, str], out: set, depth: int = 0) -> None:
+    if depth > 8 or not isinstance(node, (dict, list)):
+        return
+    if isinstance(node, list):
+        for item in node:
+            _bodies_in(item, index, out, depth + 1)
+        return
+    hit = index.get(json.dumps(node, sort_keys=True, default=str))
+    if hit:
+        out.add(hit)
+    for value in node.values():
+        _bodies_in(value, index, out, depth + 1)
+
+
+def _replace_everywhere(node, match: Callable[[Any], bool], with_: Any):
+    if isinstance(node, dict):
+        if match(node):
+            return copy.deepcopy(with_)
+        return {k: _replace_everywhere(v, match, with_) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_replace_everywhere(v, match, with_) for v in node]
+    return node
+
+
 CONTROLS: Tuple[Tuple[str, Callable], ...] = (
     ("endpoint_removed", inject_endpoint_removed),
+    ("schema_removed", inject_schema_removed),
+    ("response_field_removed", inject_response_field_removed),
+    ("request_field_added_required", inject_request_field_added_required),
+    ("param_type_changed", inject_param_type_changed),
+    ("request_enum_value_removed", inject_request_enum_value_removed),
+)
+
+
+def _schemas_of(doc) -> Dict[str, Any]:
+    node = ((doc.get("components") or {}).get("schemas")
+            or doc.get("definitions") or {})
+    return node if isinstance(node, dict) else {}
+
+
+def _op_subtrees(doc):
+    for path, method, op in _operations(doc):
+        key = f"{method.upper()} {path}"
+        yield key, op.get("requestBody")
+        yield key, op.get("responses")
+        yield key, op.get("parameters")
+
+
+def _refs_in(node, out: set, depth: int = 0) -> None:
+    if depth > 8 or not isinstance(node, (dict, list)):
+        return
+    if isinstance(node, list):
+        for item in node:
+            _refs_in(item, out, depth + 1)
+        return
+    ref = node.get("$ref")
+    if isinstance(ref, str) and "/schemas/" in ref:
+        out.add(ref.rsplit("/", 1)[-1])
+    for value in node.values():
+        _refs_in(value, out, depth + 1)
+
+
+def _bodies_in(node, index: Dict[str, str], out: set, depth: int = 0) -> None:
+    if depth > 8 or not isinstance(node, (dict, list)):
+        return
+    if isinstance(node, list):
+        for item in node:
+            _bodies_in(item, index, out, depth + 1)
+        return
+    hit = index.get(json.dumps(node, sort_keys=True, default=str))
+    if hit:
+        out.add(hit)
+    for value in node.values():
+        _bodies_in(value, index, out, depth + 1)
+
+
+def _replace_everywhere(node, match: Callable[[Any], bool], with_: Any):
+    if isinstance(node, dict):
+        if match(node):
+            return copy.deepcopy(with_)
+        return {k: _replace_everywhere(v, match, with_) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_replace_everywhere(v, match, with_) for v in node]
+    return node
+
+
+CONTROLS: Tuple[Tuple[str, Callable], ...] = (
+    ("endpoint_removed", inject_endpoint_removed),
+    ("schema_removed", inject_schema_removed),
     ("response_field_removed", inject_response_field_removed),
     ("request_field_added_required", inject_request_field_added_required),
     ("nested_request_field_added_required",

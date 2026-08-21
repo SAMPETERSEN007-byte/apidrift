@@ -1179,6 +1179,102 @@ class TestSchemaRemovalIsObservable(unittest.TestCase):
         self.assertIn("Card", self._removed(result))
         self.assertIn("unreachable_unmeasurable", result.suppressed)
 
+    # -- dereferenced documents: reachability by BODY, not by name ---------
+    #
+    # Abstaining on a dereferenced document is honest but it is not an answer,
+    # and it was 25 of the 337 UNDECIDABLE findings across 21 vendors. What a
+    # caller sees is the operation's inline body, so ask where that body
+    # appears. Sentry's whole `components/schemas` table is a parallel copy of
+    # bodies that are also written out inside the operations.
+
+    def _derefed(self, schemas, paths):
+        """A document with schemas, operations, and not one `$ref`."""
+        return {"openapi": "3.0.3", "info": {"title": "t", "version": "1"},
+                "servers": [{"url": "https://api.test.com/v1"}],
+                "components": {"schemas": copy.deepcopy(schemas)},
+                "paths": copy.deepcopy(paths)}
+
+    GHOST = {"type": "object", "required": ["id", "label"],
+             "properties": {"id": {"type": "string"},
+                            "label": {"type": "string"}}}
+
+    @staticmethod
+    def _op(body):
+        return {"get": {"operationId": "read", "responses": {"200": {
+            "content": {"application/json": {"schema": copy.deepcopy(body)}}}}}}
+
+    def test_a_dereferenced_removal_whose_BODY_changed_is_still_reported(self):
+        """The break this rule had to be built around.
+
+        `DetailedOrganizationSerializerWithProjectsAndTeams` is verbatim the
+        200 body of a PUT that still exists and lost seven required response
+        properties. Any rule that suppresses on a dereferenced document
+        without looking at the body would delete it.
+        """
+        thinner = {"type": "object", "required": ["id"],
+                   "properties": {"id": {"type": "string"}}}
+        old = self._derefed({"Ghost": self.GHOST}, {"/g": self._op(self.GHOST)})
+        new = self._derefed({}, {"/g": self._op(thinner)})
+        result = run(old, new)
+        self.assertIn("Ghost", self._removed(result))
+        self.assertNotIn("unreachable_unmeasurable", result.suppressed)
+
+    def test_a_dereferenced_removal_still_inlined_unchanged_is_not_a_break(self):
+        """Sentry's `Organization`: ten inline sites, all still identical. The
+        components entry went; the wire did not move."""
+        old = self._derefed({"Ghost": self.GHOST}, {"/g": self._op(self.GHOST)})
+        new = self._derefed({}, {"/g": self._op(self.GHOST)})
+        result = run(old, new)
+        self.assertNotIn("Ghost", self._removed(result))
+
+    def test_a_dereferenced_removal_only_on_a_removed_operation_is_not_a_break(self):
+        """Twenty-two of Sentry's twenty-five. The operation itself is gone,
+        `endpoint_removed` reports that, and the schema is not a second
+        break -- the same reasoning the `carrying` filter already applies."""
+        keep = {"type": "object", "properties": {"z": {"type": "string"}}}
+        old = self._derefed({"Ghost": self.GHOST, "Keep": keep},
+                            {"/g": self._op(self.GHOST), "/k": self._op(keep)})
+        new = self._derefed({"Keep": keep}, {"/k": self._op(keep)})
+        result = run(old, new)
+        self.assertNotIn("Ghost", self._removed(result))
+        self.assertIn("endpoint_removed", {f.kind for f in result.findings})
+
+    def test_a_dereferenced_body_that_appears_nowhere_is_unreachable(self):
+        """The precision half of body matching.
+
+        Matching by VALUE must not invent reachability. `Ghost`'s body is
+        written nowhere under `paths` while `Keep`'s is, so the control has
+        fired and the honest verdict is the ordinary `unreachable` one -- the
+        same verdict the independent checker reaches from the raw document.
+        """
+        keep = {"type": "object", "properties": {"z": {"type": "string"}}}
+        old = self._derefed({"Ghost": self.GHOST, "Keep": keep},
+                            {"/k": self._op(keep)})
+        new = self._derefed({"Keep": keep}, {"/k": self._op(keep)})
+        result = run(old, new)
+        self.assertNotIn("Ghost", self._removed(result))
+        self.assertEqual(1, result.suppressed.get("unreachable"),
+                         "unreachable, not reachable-through-a-body-it-lacks")
+
+    def test_body_matching_is_NOT_applied_to_a_document_that_links(self):
+        """The guard. Where references exist they are exact and cheaper, and a
+        body that merely coincides with a schema nobody named must not invent
+        reachability. `Ghost` is an orphan here even though its body is
+        written out inside a live operation."""
+        linked = copy.deepcopy(BASE)
+        linked["components"]["schemas"]["Ghost"] = {
+            "type": "object", "properties": {"solo": {"type": "string"}}}
+        linked["paths"]["/ghosts"] = {"get": {
+            "operationId": "ghosts", "responses": {"200": {"content": {
+                "application/json": {"schema": {
+                    "type": "object",
+                    "properties": {"solo": {"type": "string"}}}}}}}}}
+        new = copy.deepcopy(linked)
+        del new["components"]["schemas"]["Ghost"]
+        result = run(linked, new)
+        self.assertNotIn("Ghost", self._removed(result))
+        self.assertEqual(1, result.suppressed.get("unreachable"))
+
     # -- relocated ---------------------------------------------------------
 
     def test_a_schema_inlined_at_its_only_use_site_is_not_a_break(self):
@@ -1208,6 +1304,122 @@ class TestSchemaRemovalIsObservable(unittest.TestCase):
         self.new["components"]["schemas"]["Card"]["properties"]["brand"] = {
             "type": "string", "enum": ["visa"]}
         self.assertIn("Brand", self._removed(run(self.old, self.new)))
+
+    def test_an_unrelated_field_changing_in_the_parent_is_not_this_break(self):
+        """The precision half of the parent loop. Only the properties that
+        actually reached the removed schema may be compared: a sibling field
+        changing in the same release is its own finding, and folding it in
+        here would report every restructure once per neighbouring schema."""
+        for doc in (self.old, self.new):
+            doc["components"]["schemas"]["Card"]["properties"]["brand"] = {
+                "$ref": "#/components/schemas/Brand"}
+            doc["components"]["schemas"]["Brand"] = {
+                "type": "string", "enum": ["visa", "amex"]}
+        del self.new["components"]["schemas"]["Brand"]
+        self.new["components"]["schemas"]["Card"]["properties"]["brand"] = {
+            "type": "string", "enum": ["visa", "amex"]}
+        # ...and a SIBLING changed, which has nothing to do with `Brand`.
+        self.new["components"]["schemas"]["Card"]["properties"]["iin"] = {
+            "type": "integer"}
+        result = run(self.old, self.new)
+        self.assertNotIn("Brand", self._removed(result))
+
+    def test_a_schema_inlined_at_an_ARRAYS_ITEMS_is_not_a_break(self):
+        """Klaviyo's `Constant_contactEnum` is never a property's TYPE. It is
+        the `items` of `ConstantContactIntegrationFilter.value`, so a loop that
+        only read `field.type` compared nothing and the flattener reported the
+        inlined element as a bare "string" with its enum gone."""
+        for doc in (self.old, self.new):
+            doc["components"]["schemas"]["Card"]["properties"]["brands"] = {
+                "type": "array", "items": {"$ref": "#/components/schemas/Brand"}}
+            doc["components"]["schemas"]["Brand"] = {
+                "type": "string", "enum": ["visa", "amex"]}
+        del self.new["components"]["schemas"]["Brand"]
+        self.new["components"]["schemas"]["Card"]["properties"]["brands"] = {
+            "type": "array", "items": {"type": "string",
+                                       "enum": ["visa", "amex"]}}
+        result = run(self.old, self.new)
+        self.assertNotIn("Brand", self._removed(result))
+        self.assertEqual(1, result.suppressed.get("relocated"))
+
+    def test_inlining_a_DIFFERENT_item_shape_is_still_a_break(self):
+        """The mirror. An element enum that lost a value is not the same
+        element, and the inlining must not launder it."""
+        for doc in (self.old, self.new):
+            doc["components"]["schemas"]["Card"]["properties"]["brands"] = {
+                "type": "array", "items": {"$ref": "#/components/schemas/Brand"}}
+            doc["components"]["schemas"]["Brand"] = {
+                "type": "string", "enum": ["visa", "amex"]}
+        del self.new["components"]["schemas"]["Brand"]
+        self.new["components"]["schemas"]["Card"]["properties"]["brands"] = {
+            "type": "array", "items": {"type": "string", "enum": ["visa"]}}
+        self.assertIn("Brand", self._removed(run(self.old, self.new)))
+
+    def test_a_named_array_inlined_is_not_a_break_when_its_ELEMENT_changed(self):
+        """PayPal inlined `billing_cycle_list` at the identical property and,
+        in the same release, edited `billing_cycle` -- which the array points
+        AT. Resolving the element made the pure inlining compare unequal, so a
+        second change to a second schema was reported a second time against a
+        schema that is byte-identical where it is used. That element change is
+        its own finding against its own schema."""
+        for doc in (self.old, self.new):
+            doc["components"]["schemas"]["CardList"] = {
+                "type": "array", "items": {"$ref": "#/components/schemas/Card"}}
+            doc["components"]["schemas"]["Bank"]["properties"]["cards"] = {
+                "$ref": "#/components/schemas/CardList"}
+        del self.new["components"]["schemas"]["CardList"]
+        self.new["components"]["schemas"]["Bank"]["properties"]["cards"] = {
+            "type": "array", "items": {"$ref": "#/components/schemas/Card"}}
+        # ...and the ELEMENT changed, separately.
+        self.new["components"]["schemas"]["Card"]["properties"]["issuer"] = {
+            "type": "string"}
+        result = run(self.old, self.new)
+        self.assertNotIn("CardList", self._removed(result))
+
+    def test_inlining_a_named_array_as_a_DIFFERENT_array_is_still_a_break(self):
+        """The mirror of the notation escape: same notation is the whole
+        licence, and an array that changed what it holds does not have it."""
+        for doc in (self.old, self.new):
+            doc["components"]["schemas"]["CardList"] = {
+                "type": "array", "items": {"$ref": "#/components/schemas/Card"}}
+            doc["components"]["schemas"]["Bank"]["properties"]["cards"] = {
+                "$ref": "#/components/schemas/CardList"}
+        del self.new["components"]["schemas"]["CardList"]
+        self.new["components"]["schemas"]["Bank"]["properties"]["cards"] = {
+            "type": "array", "items": {"$ref": "#/components/schemas/Bank"}}
+        self.assertIn("CardList", self._removed(run(self.old, self.new)))
+
+    def _brands(self, items):
+        doc = copy.deepcopy(BASE)
+        doc["components"]["schemas"]["Card"]["properties"]["brands"] = {
+            "type": "array", "items": items}
+        loaded = spec(doc)
+        return loaded, loaded.schemas["Card"].fields["brands"]
+
+    def test_the_shape_projection_carries_an_INLINE_items_enum(self):
+        """The other half of carrying the element's enum, tested where the
+        comparison actually happens.
+
+        `_item_type` reported `items: {type: string, enum: [...]}` as plain
+        "string", so an array's element enum was invisible in BOTH directions:
+        Twilio narrowing one read as no change at all, and a named enum schema
+        inlined at that position read as a change when nothing had moved.
+        """
+        from apidrift.diff import _field_shape
+        wide, a = self._brands({"type": "string", "enum": ["visa", "amex"]})
+        narrow, b = self._brands({"type": "string", "enum": ["visa"]})
+        self.assertNotEqual(_field_shape(a, wide), _field_shape(b, narrow),
+                            "narrowing the element enum is a different shape")
+        named_doc = copy.deepcopy(BASE)
+        named_doc["components"]["schemas"]["BrandEnum"] = {
+            "type": "string", "enum": ["visa", "amex"]}
+        named_doc["components"]["schemas"]["Card"]["properties"]["brands"] = {
+            "type": "array", "items": {"$ref": "#/components/schemas/BrandEnum"}}
+        named = spec(named_doc)
+        self.assertEqual(
+            _field_shape(a, wide),
+            _field_shape(named.schemas["Card"].fields["brands"], named),
+            "a named element enum and its inlined body are the same thing")
 
     # -- renamed at an operation root --------------------------------------
 
@@ -1240,6 +1452,46 @@ class TestSchemaRemovalIsObservable(unittest.TestCase):
             "application/json"]["schema"]["properties"]["source"]["anyOf"][0] = {
                 "$ref": "#/components/schemas/CardV2"}
         self.assertIn("Card", self._removed(run(self.old, self.new)))
+
+    # -- direction: a whole schema travels ONE way -------------------------
+
+    def _request_only(self):
+        """`/charges` POST sends a `ChargeRequest` whose property names also
+        appear in the 200 response it reads back. Auth0's
+        `AddOrganizationConnectionRequestContent` is exactly this."""
+        for doc in (self.old, self.new):
+            doc["components"]["schemas"]["ChargeRequest"] = {
+                "type": "object", "required": ["id"],
+                "properties": {"id": {"type": "string"},
+                               "iin": {"type": "string"}}}
+            doc["paths"]["/charges"]["post"]["requestBody"]["content"][
+                "application/json"]["schema"] = {
+                    "$ref": "#/components/schemas/ChargeRequest"}
+
+    def test_replacing_a_request_body_outright_is_still_a_break(self):
+        """The recall control injected exactly this into Auth0's real spec and
+        came back MISSED: `id` and `iin` are also response property names on
+        the same operation, so a merged name map said "still all there" while
+        the request body had become a bare string. Nothing was reported at
+        all."""
+        self._request_only()
+        del self.new["components"]["schemas"]["ChargeRequest"]
+        self.new["paths"]["/charges"]["post"]["requestBody"]["content"][
+            "application/json"]["schema"] = {"type": "string"}
+        self.assertIn("ChargeRequest", self._removed(run(self.old, self.new)))
+
+    def test_a_request_schema_relocated_WITHIN_the_request_is_not_a_break(self):
+        """The other half. Direction narrows the question; it must not disable
+        the suppressor -- the names are still sent the same way."""
+        self._request_only()
+        del self.new["components"]["schemas"]["ChargeRequest"]
+        self.new["paths"]["/charges"]["post"]["requestBody"]["content"][
+            "application/json"]["schema"] = {
+                "type": "object", "required": ["id"],
+                "properties": {"id": {"type": "string"},
+                               "iin": {"type": "string"}}}
+        result = run(self.old, self.new)
+        self.assertNotIn("ChargeRequest", self._removed(result))
 
     # -- subsumed ----------------------------------------------------------
 

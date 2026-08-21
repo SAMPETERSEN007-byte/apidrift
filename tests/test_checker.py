@@ -62,22 +62,90 @@ class TestSchemaRemoved(unittest.TestCase):
         self.assertEqual(REFUTED, verdict, why)
         self.assertIn("inlined or renamed", why)
 
-    def test_a_dereferenced_document_is_UNDECIDABLE_not_refuted(self):
+    def test_a_dereferenced_document_with_no_signal_at_all_is_UNDECIDABLE(self):
         """The control that stops the orphan test being a null test.
 
         Sentry's `openapi-derefed.json` contains zero `$ref` in 3.2 MB, so "no
         reference points at it" is true of every schema there and decides
-        nothing. Refuting on it would have discarded 24 real breaks.
+        nothing. Body identity is the second key into the same question -- but
+        when NEITHER key has signal, the honest answer is still that this
+        instrument cannot measure this document.
         """
         old = doc({"Ghost": {"type": "object",
                              "properties": {"x": {"type": "string"}}}},
                   {"/things": {"get": {"responses": resp(
-                      {"type": "object", "properties": {"x": {"type": "string"}}})}}})
+                      {"type": "string"})}}})
         new = doc({}, old["paths"])
         verdict, why = check(finding("schema_removed", subject="Ghost"),
                              old, new, [], [])
         self.assertEqual(UNDECIDABLE, verdict, why)
-        self.assertIn("dereferenced", why)
+        self.assertIn("neither references nor inlines", why)
+
+    def test_a_dereferenced_body_still_inlined_is_refuted(self):
+        """The components table went; the wire did not move.
+
+        Sentry's `Organization` is inlined at ten sites and every one still
+        carries the identical body in the new document.
+        """
+        body = {"type": "object", "properties": {"x": {"type": "string"}}}
+        old = doc({"Ghost": body},
+                  {"/things": {"get": {"responses": resp(body)}}})
+        new = doc({}, old["paths"])
+        verdict, why = check(finding("schema_removed", subject="Ghost"),
+                             old, new, [], [])
+        self.assertEqual(REFUTED, verdict, why)
+        self.assertIn("still inlined", why)
+
+    def test_a_dereferenced_body_that_CHANGED_is_confirmed(self):
+        """The break this whole rule had to be built around.
+
+        `DetailedOrganizationSerializerWithProjectsAndTeams` is verbatim the
+        200 body of a PUT that still exists and lost seven required response
+        properties. Any rule that refutes on a dereferenced document without
+        looking at the body would delete it.
+        """
+        body = {"type": "object", "required": ["x", "y"],
+                "properties": {"x": {"type": "string"},
+                               "y": {"type": "string"}}}
+        thinner = {"type": "object", "required": ["x"],
+                   "properties": {"x": {"type": "string"}}}
+        old = doc({"Ghost": body},
+                  {"/things": {"get": {"responses": resp(body)}}})
+        new = doc({}, {"/things": {"get": {"responses": resp(thinner)}}})
+        verdict, why = check(finding("schema_removed", subject="Ghost"),
+                             old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+
+    def test_a_dereferenced_body_only_on_a_removed_operation_is_refuted(self):
+        """Twenty-two of Sentry's twenty-five. The operation itself is gone and
+        `endpoint_removed` reports that; the schema is not a second break."""
+        body = {"type": "object", "properties": {"x": {"type": "string"}}}
+        other = {"type": "object", "properties": {"z": {"type": "string"}}}
+        old = doc({"Ghost": body, "Kept": other},
+                  {"/gone": {"get": {"responses": resp(body)}},
+                   "/stays": {"get": {"responses": resp(other)}}})
+        new = doc({"Kept": other},
+                  {"/stays": {"get": {"responses": resp(other)}}})
+        verdict, why = check(finding("schema_removed", subject="Ghost"),
+                             old, new, [], [])
+        self.assertEqual(REFUTED, verdict, why)
+        self.assertIn("not independently observable", why)
+
+    def test_a_dereferenced_schema_carried_by_no_operation_is_refuted(self):
+        """A vestigial components entry whose body appears nowhere under
+        `paths`, while other schemas' bodies do -- so the control fired."""
+        old = doc({"Ghost": {"type": "object",
+                             "properties": {"nowhere": {"type": "string"}}},
+                   "Kept": {"type": "object",
+                            "properties": {"z": {"type": "string"}}}},
+                  {"/stays": {"get": {"responses": resp(
+                      {"type": "object",
+                       "properties": {"z": {"type": "string"}}})}}})
+        new = doc({"Kept": old["components"]["schemas"]["Kept"]}, old["paths"])
+        verdict, why = check(finding("schema_removed", subject="Ghost"),
+                             old, new, [], [])
+        self.assertEqual(REFUTED, verdict, why)
+        self.assertIn("appears nowhere under", why)
 
     def test_an_orphan_IS_refuted_when_the_document_does_link(self):
         """The other half. The control must not disable the rule outright."""

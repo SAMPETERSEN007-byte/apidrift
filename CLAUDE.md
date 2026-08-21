@@ -7,12 +7,12 @@ proves — per file, per line — which of them land on real code.
 Two vantage points, and the difference is the whole product:
 
 - `apidrift` (the report) — what changed across the tracked vendors. A claim
-  about a **spec diff**. 46/46 on the five default vendors; **90.6% across all
-  31** (1286/1420, 211 undecidable over 1631 breaking findings), re-measured
+  about a **spec diff**. 46/46 on the five default vendors; **92.1% across all
+  31** (1332/1447, 172 undecidable over 1619 breaking findings), re-measured
   2026-08-21. The two numbers are not in conflict — the first was never a
   statement about the engine. Every all-vendor number this project has claimed
   went DOWN when the checker stopped sharing the engine's blind spots:
-  96.3% → 67.8% → 96.7% → 77.8% → 90.6%. Each drop is the checker learning to
+  96.3% → 67.8% → 96.7% → 77.8% → 92.1%. Each drop is the checker learning to
   decide findings nobody had checked; see defects 5 and 6 below.
 - `apidrift scan PATH` (the CI gate) — which of those changes break code in a
   repository you have a checkout of. A claim about a **repo**. Dependence is
@@ -29,8 +29,8 @@ product now lives.
 **State:** branch `scan-your-own-repo`, no remote, one dependency (PyYAML).
 **32 vendors registered, 13 snapshot sources.** `tools/vendor_check.py`: 31
 diff, 1 (column) has history shorter than the window, 0 fail.
-`tools/vendor_control.py`: **all 32 have a firing control**, which is what makes
-a zero count a measurement. `main` is behind — do not merge to it casually, the
+`tools/vendor_control.py`: **235 controls fire across all 32 vendors, 0 missed**
+— eight injections each, which is what makes a zero count a measurement. `main` is behind — do not merge to it casually, the
 branch is the work.
 
 ---
@@ -42,12 +42,12 @@ layers, each asking a question none of the others asks:
 
 | # | Layer | Question | Baseline (2026-08-21) |
 |---|-------|----------|----------------------|
-| 1 | unit tests | does the code do what it says? | 406 tests |
-| 2 | mutation testing | do the tests fail when the code is wrong? | 215/215 killed |
+| 1 | unit tests | does the code do what it says? | 436 tests |
+| 2 | mutation testing | do the tests fail when the code is wrong? | 238/238 killed |
 | 3 | end-to-end | does the pipeline still produce output? | `out/report.md` |
 | 4 | precision audit | are the FINDINGS real, per the RAW specs? | 46/46 breaking, 68/68 potentially |
 | 5 | lead standing | are the LEADS real, per the last audit? | 0/10 — NOT sendable |
-| 6 | recall controls | can the instrument still FIRE at all? | 27 fired, 0 missed |
+| 6 | recall controls | can the instrument still FIRE at all? | 36 fired, 0 missed |
 
 🚨 **3 runs before 4 because 4 audits the file 3 writes.** Ordered the other way
 the audit read the PREVIOUS run's findings, so after an engine change the first
@@ -97,7 +97,7 @@ confirm or refute against the raw spec is not a weaker finding — it is not a
 finding. `measure_precision.py` reports UNDECIDABLE as its own bucket and
 excludes it from the ratio rather than counting it as a pass. 46/46 means
 forty-six decided and forty-six confirmed, not "46 of the ones we liked".
-Across all 31 vendors 211 findings are still UNDECIDABLE and 134 are REFUTED —
+Across all 31 vendors 172 findings are still UNDECIDABLE and 115 are REFUTED —
 together the honest measure of how much of the engine is unaudited or wrong.
 Vendors with no findings in the window have no precision measurement and print
 as UNMEASURED, which is not a pass — but every one of them now has a firing
@@ -169,6 +169,34 @@ abstain when there are none**, in their own separate states. Same shape as
 search — and it is why a new suppressor gets an adversarial audit, not just a
 test.
 
+**3c. Abstaining is honest, and it is still not an answer.** That control left
+all 25 of Sentry's `schema_removed` findings UNDECIDABLE — printed, counted,
+and decided by nobody. A dereferenced document has a second key into the very
+same caller's question: **body identity instead of reference identity.** Every
+one of Sentry's 157 schemas appears VERBATIM somewhere under `paths`, because
+the `components` table is a parallel copy of bodies the operations also write
+out. Asked that way the class decides completely — 25 → 2 findings, 0
+undecidable:
+
+- 22 are carried only by operations that were REMOVED in the same change, and
+  `endpoint_removed` reports each of those on its own.
+- `Organization` is inlined at ten sites and all ten still carry the identical
+  body: the vestigial table entry went, the wire did not move.
+- `DetailedOrganizationSerializerWithProjectsAndTeams` and `AutofixRequest`
+  survive, and the independent checker CONFIRMS both.
+
+Engine side: `loader.dereferenced_schema_roots()` builds the same
+`reachable`/`rooted_at`/request/response maps by matching schema BODIES inside
+operation subtrees, and is applied **only** when reference-based discovery
+returned nothing — where references exist they are exact and cheaper, and a
+body that merely coincides with a schema nobody named must not invent
+reachability. Checker side: `check_schema_removed_dereferenced()` walks the
+raw document for verbatim occurrences with its own walker and its own control
+(how many named schemas appear inline at all). Independence measured, not
+asserted: **with `_removal_is_observable` forced to `(True, "")` the engine
+emits all 25 and the checker refutes exactly 23 unaided, confirming exactly
+the 2 the engine keeps.**
+
 The morning of 2026-08-20 claimed 84/84 = 100%. It was really **64/84 = 76%**.
 Mutation-verified end to end: with all four suppressions disabled the engine
 emits 86 and the independent checker refutes 22 unaided.
@@ -234,7 +262,7 @@ question so no two can collapse into one opinion:
 
 | Reason | Question | Measured |
 |---|---|---|
-| `unreachable` | does any operation reach it? | Sentry 25/25 — but only where the document links schemas at all |
+| `unreachable` | does any operation reach it? | measured where the document links schemas OR inlines them — see below |
 | `relocated` | does every place that pointed at it still present the same shape? | Klaviyo 208 inlined enums |
 | `renamed` | does every operation that named it now name a schema of identical shape? | Cloudflare 191 bulk-renamed envelopes |
 | `subsumed` | is every route in through another schema removed in the same change? | PayPal `error_409`, one restructure reported 92 times |
@@ -249,6 +277,55 @@ of `error_default` — along with 20 Cloudflare request-surface schemas.
 "not a break" test goes red; make it fire unconditionally and the "still a
 break" test goes red. A suppressor with only the first half is a deletion
 nobody is checking.
+
+🚨 **`tools/vendor_control.py` now injects a `schema_removed` into all 22
+vendors' real specs** — until 2026-08-20 these four suppressors had NO recall
+control at all, only precision measurements, which is exactly the shape that
+lets a suppressor eat a real break unnoticed. **121 controls fire, 0 MISSED.**
+It picks its target from the RAW document, never from the engine's
+reachability maps: a control that chooses its stimulus with the mechanism
+under test degrades to `n/a` precisely when that mechanism breaks, and "could
+not run" is not "passed". It demands the removal stay VISIBLE at the operation
+that carried it, not that it carry a particular LABEL — Sentry's
+`AutofixPostResponse` surfaces as `response_field_removed` on the same
+operation, which is a more precise description of the same break.
+
+**Two recall holes it found on its first run, both pre-existing, both now
+closed and both measured to change nothing across the 21 real windows:**
+
+- *auth0, MISSED outright.* `_operation_field_names` merged request and
+  response names, so replacing `AddOrganizationConnectionRequestContent` with
+  a bare string read as "all four names are still there" — they were, in the
+  201 RESPONSE. A whole schema travels ONE way; both the name test and the
+  rename test now ask about that way (`_operation_field_names_where`).
+- *the same shape in `_renamed_at_roots`.* A request body "renamed" to a
+  shape-identical RESPONSE schema on the same operation is not a rename.
+
+### Three more `schema_removed` refutations closed, and one attempt reverted
+
+The 10 refuted became **7** (klaviyo 3 → 1, paypal 1 → 0), by two questions
+`_shape_at_parents` could not previously ask:
+
+- **the schema sits at an array's `items`.** Klaviyo's `Constant_contactEnum`
+  is never a property's TYPE, so a loop reading only `field.type` compared
+  nothing. It also needed `Field.item_enum`: `items: {type: string, enum: [x]}`
+  flattened to plain `"string"`, which made a named element enum and its
+  inlined body compare unequal — and made a NARROWING of one invisible. That
+  second half found a real Twilio break the engine had been missing
+  (`use_case_categories`), CONFIRMED by the checker.
+- **a pure inlining whose ELEMENT separately changed.** PayPal inlined
+  `billing_cycle_list` at the identical property while editing
+  `billing_cycle`, which the array points AT. Resolving one level further
+  mixed the two; `_view_notation`/`_field_notation` ask the narrower question,
+  and the element's change is still its own finding against its own schema.
+
+🚨 **The `truncated` abstention was narrowed and MEASURED UNSAFE — reverted.**
+Deciding the class whenever every contributed name was found (on the true
+observation that truncation can only HIDE a name) removed 60 findings,
+**49 of which the independent checker had CONFIRMED** — PayPal 73 → 35,
+Cloudflare 31 → 13. All-vendor precision rose to 97.7% *by deleting real
+breaks*, the worst outcome available here. The comment in `diff.py` says so at
+the line. Do not re-apply it without a measurement showing those 49 are false.
 
 ### And four more on the `scan` side
 All refuted by hand against source + raw spec, all gated: a read proving a
@@ -315,8 +392,8 @@ Do not add a PR path, an auto-commit, or an email send. Do not flip
 
 ```bash
 ./gate.sh                                          # the only proof. expect exit 3
-./.venv/bin/python -m unittest discover -s tests   # layer 1 —  0.1s (406 tests)
-./.venv/bin/python tests/mutation_check.py         # layer 2 — ~60s (215 mutations)
+./.venv/bin/python -m unittest discover -s tests   # layer 1 —  0.1s (436 tests)
+./.venv/bin/python tests/mutation_check.py         # layer 2 — ~90s (238 mutations)
 ./.venv/bin/python tools/vendor_control.py         # layer 6 — inject a KNOWN break, all 32
 ./.venv/bin/python tools/scan_control.py --asof 2026-08-21
 ./.venv/bin/python tools/corpus_scan.py --corpus /tmp/corpus --asof 2026-08-21

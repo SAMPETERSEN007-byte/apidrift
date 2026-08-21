@@ -939,6 +939,129 @@ def _same_contract(old: Dict[str, Any], new: Dict[str, Any],
     return False
 
 
+# --------------------------------------------------------------------------
+# The same question on a DEREFERENCED document.
+#
+# Sentry publishes `openapi-derefed.json`: zero `"$ref"` in 3.2 MB, every
+# schema body inlined into the operation that uses it while `components/
+# schemas` is kept as a parallel table. `ref_sites` finds nothing there, and
+# the honest answer used to be UNDECIDABLE for all 25 removals.
+#
+# But a caller never saw the table either -- they saw the BODY, and the body is
+# still findable. So ask the caller's question by VALUE instead of by
+# reference: where did this exact body appear under `paths`, and is it still
+# there? Reference identity and body identity are different keys into the same
+# question, and body identity is the only one a dereferenced document answers.
+# --------------------------------------------------------------------------
+
+_INLINE_CACHE: Dict[int, Dict[str, List[Tuple[Any, ...]]]] = {}
+
+
+def _canon(node: Any) -> str:
+    return json.dumps(node, sort_keys=True)
+
+
+def inline_body_sites(doc: Dict[str, Any]) -> Dict[str, List[Tuple[Any, ...]]]:
+    """canonical body -> every location under `paths` holding it verbatim.
+
+    Cached per document object: the walk is over the whole `paths` tree and a
+    run may ask about dozens of removed schemas from the same spec.
+    """
+    cached = _INLINE_CACHE.get(id(doc))
+    if cached is not None:
+        return cached
+    out: Dict[str, List[Tuple[Any, ...]]] = {}
+
+    def walk(node: Any, path: Tuple[Any, ...]) -> None:
+        if isinstance(node, dict):
+            if node:
+                out.setdefault(_canon(node), []).append(path)
+            for key, value in node.items():
+                walk(value, path + (key,))
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, path + (index,))
+
+    walk(doc.get("paths") or {}, ("paths",))
+    _INLINE_CACHE[id(doc)] = out
+    return out
+
+
+def _inlined_schema_count(doc: Dict[str, Any]) -> int:
+    """How many of this document's named schemas appear verbatim under `paths`?
+
+    The CONTROL for the rule below, and it is not optional. If a document
+    neither links its schemas nor inlines them, "its body appears nowhere" is
+    true of every schema and decides nothing -- the same vacuity that made the
+    first `unreachable` rule a broken instrument.
+    """
+    sites = inline_body_sites(doc)
+    return sum(1 for body in schemas_of(doc).values()
+               if isinstance(body, dict) and body and _canon(body) in sites)
+
+
+def _operation_of(site: Tuple[Any, ...]) -> Optional[Tuple[str, str]]:
+    """The (path, method) whose subtree this site sits in, if any."""
+    if len(site) >= 3 and site[0] == "paths":
+        method = str(site[2])
+        if method.lower() in ("get", "put", "post", "delete", "options",
+                              "head", "patch", "trace"):
+            return str(site[1]), method
+    return None
+
+
+def check_schema_removed_dereferenced(
+        name: str, old_body: Any, old: Dict[str, Any],
+        new: Dict[str, Any]) -> Tuple[str, str]:
+    """Can a caller of a dereferenced spec observe this schema's removal?"""
+    inlined = _inlined_schema_count(old)
+    if not inlined:
+        return UNDECIDABLE, ("the old document neither references nor inlines "
+                             "any of its named schemas — neither key into the "
+                             "caller's question has signal here")
+    sites = inline_body_sites(old).get(_canon(old_body), [])
+    if not sites:
+        return REFUTED, (f"the body of `{name}` appears nowhere under `paths` "
+                         f"in the old document, though {inlined} other named "
+                         f"schema(s) do — no request or response ever carried "
+                         f"it, so no caller can observe its removal")
+    new_sites = inline_body_sites(new)
+    intact, gone_ops, broken = 0, [], []
+    for site in sites:
+        here = value_at(new, site)
+        if here is not _MISSING and _canon(here) == _canon(old_body):
+            intact += 1
+            continue
+        owner = _operation_of(site)
+        if owner:
+            path, method = owner
+            in_new = ((new.get("paths") or {}).get(path) or {})
+            if not isinstance(in_new, dict) or method not in in_new:
+                # The whole operation is gone. Its disappearance is reported
+                # on its own as `endpoint_removed`; the schema's removal is
+                # not independently observable, exactly as an inner schema
+                # inside a removed outer one is not.
+                gone_ops.append(f"{method.upper()} {path}")
+                continue
+        broken.append("/".join(str(x) for x in site))
+    if intact == len(sites):
+        return REFUTED, (f"still inlined: all {intact} use site(s) under "
+                         f"`paths` carry an identical body, so the wire "
+                         f"contract is unchanged and only the vestigial "
+                         f"components entry went")
+    if not broken and gone_ops:
+        return REFUTED, (f"not independently observable — every use site is on "
+                         f"`{sorted(set(gone_ops))[0]}`, an operation removed "
+                         f"in the same change and reported on its own")
+    if not broken:
+        return UNDECIDABLE, f"no use site of `{name}` could be adjudicated"
+    return CONFIRMED, (f"{len(broken)} of {len(sites)} inline use site(s) no "
+                       f"longer carry the body, e.g. {broken[0]}"
+                       + (f" (also {len(new_sites.get(_canon(old_body), []))} "
+                          f"verbatim copies remain elsewhere)"
+                          if new_sites.get(_canon(old_body)) else ""))
+
+
 def _removed_ancestors(old: Dict[str, Any], new: Dict[str, Any],
                        site: Tuple[Any, ...]) -> Optional[str]:
     """The nearest named schema ENCLOSING this site that is also gone.
@@ -975,10 +1098,10 @@ def check_schema_removed(finding: Dict[str, Any], old: Dict[str, Any],
         # not a result.
         linked = len(ref_sites(old, None))
         if linked == 0:
-            return UNDECIDABLE, ("the old document contains no $ref into "
-                                 "components/schemas at all — it is "
-                                 "dereferenced, so reference-based reasoning "
-                                 "has no signal here")
+            # Dereferenced. Reference identity has no signal, but body
+            # identity does: ask the same caller's question by VALUE.
+            return check_schema_removed_dereferenced(
+                name, old_schemas[name], old, new)
         return REFUTED, (f"nothing in the old document referenced it, though "
                          f"{linked} other schema reference(s) exist — no "
                          f"request or response could carry it, so no caller "

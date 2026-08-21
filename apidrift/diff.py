@@ -1208,10 +1208,32 @@ def _operation_field_names(spec: Spec) -> Dict[str, Set[str]]:
     `reasoning=` was reported as broken. Names, not paths, because that is
     what a caller writes and what `dependence.prove()` matches on.
     """
+    return _operation_field_names_where(spec, "all")
+
+
+def _operation_field_names_where(spec: Spec, where: str) -> Dict[str, Set[str]]:
+    """The same map, restricted to one DIRECTION of the operation.
+
+    Merging both directions is right for the relocation question a field asks
+    -- a name that moved between two schemas composing the same operation is
+    still written the same way by the caller. It is wrong for a whole SCHEMA
+    that travels in only one direction: Auth0's
+    `AddOrganizationConnectionRequestContent` is the request body of
+    `POST /organizations/{id}/enabled_connections` and every one of its four
+    property names also appears in that operation's 201 RESPONSE, so replacing
+    the request body outright still looked like "the names are all still
+    there". A control that injected exactly that removal into Auth0's real
+    spec came back MISSED: the engine reported nothing at all.
+    """
     out: Dict[str, Set[str]] = {}
     for key, op in spec.operations.items():
+        groups: List[Dict[str, Field]] = []
+        if where in ("all", "request"):
+            groups.append(op.request_fields)
+        if where in ("all", "response"):
+            groups.extend(op.responses.values())
         names: Set[str] = set()
-        for fields in [op.request_fields] + list(op.responses.values()):
+        for fields in groups:
             for path in fields:
                 names.add(_TYPE_ANNOTATION.sub("", path).rsplit(".", 1)[-1])
         out[key] = names
@@ -1302,14 +1324,31 @@ def _shape_at_parents(name: str, view, parents: Set[str],
         if before is None or after is None:
             return False
         for field_name, field in before.fields.items():
-            if field.type != f"->{name}":
+            # Directly, or as the ELEMENT of an array. Klaviyo's
+            # `Constant_contactEnum` is never a property's type -- it is the
+            # `items` of `ConstantContactIntegrationFilter.value`, and a loop
+            # that only reads `field.type` never compared it at all.
+            if field.type != f"->{name}" and field.item != f"->{name}":
                 continue
             compared += 1
             replacement = after.fields.get(field_name)
             if replacement is None:
                 return False
-            if _field_shape(field, old) != _field_shape(replacement, new):
-                return False
+            if _field_shape(field, old) == _field_shape(replacement, new):
+                continue
+            # The transitive shape can differ for a reason that has nothing to
+            # do with this schema: PayPal inlined `billing_cycle_list` at the
+            # identical property while separately editing `billing_cycle`,
+            # which the array points AT. That second change is its own finding
+            # against its own schema. Ask the narrower question too -- is the
+            # replacement the same NOTATION, resolved no further?
+            # A `required` list is not carried on an inline field, so a
+            # schema that declares one cannot be compared this way; fall
+            # through to the transitive answer rather than guess.
+            if (not view.required
+                    and _field_notation(replacement) == _view_notation(view)):
+                continue
+            return False
     if compared:
         return True
     # Nothing was compared: the parent reaches the schema from a place this
@@ -1343,6 +1382,23 @@ def _shape_at_parents(name: str, view, parents: Set[str],
     return all(_view_shape(old.schemas[p], old) == _view_shape(new.schemas[p], new)
                for p in parents
                if p in old.schemas and p in new.schemas)
+
+
+def _view_notation(view) -> Tuple:
+    """A named schema written out, resolved NO further than its own body.
+
+    The counterpart to `_view_shape`, which resolves one more level. Inlining
+    a schema at the place that named it is a pure notation change: the bytes a
+    caller receives are the same. Whether what it POINTS AT also changed is a
+    separate question with a separate finding, and mixing the two made a pure
+    inlining read as a break.
+    """
+    return (view.kind, view.enum, view.item, tuple(sorted(view.fields)))
+
+
+def _field_notation(field: Field) -> Tuple:
+    """The same projection for an inline field definition."""
+    return (field.type, field.enum, field.item, tuple(field.shape or ()))
 
 
 def _item_shape(item: Optional[str], spec: Spec,
@@ -1432,7 +1488,8 @@ def _still_presents(before, after, old: Spec, new: Spec,
 def _renamed_at_roots(name: str, view, direct: Sequence[str],
                       old: Spec, new: Spec,
                       new_roots: Dict[str, Set[str]],
-                      response_only: bool = False) -> bool:
+                      response_only: bool = False,
+                      side: str = "all") -> bool:
     """Did every operation that named this schema simply start naming another
     schema of the identical shape?
 
@@ -1451,6 +1508,14 @@ def _renamed_at_roots(name: str, view, direct: Sequence[str],
         return False
     for op_key in direct:
         candidates = new_roots.get(op_key) or set()
+        # On the SAME side. A request body replaced by a schema that happens to
+        # match the operation's RESPONSE body is not a rename -- the caller now
+        # sends something else. `ChargeRequest` and `Card` can be shape-
+        # identical and still be two different halves of one call.
+        if side == "request":
+            candidates = {c for c in candidates if new.used_in_requests(c)}
+        elif side == "response":
+            candidates = {c for c in candidates if new.used_in_responses(c)}
         if not any(_still_presents(view, new.schemas[c], old, new, response_only)
                    for c in candidates if c in new.schemas):
             return False
@@ -1472,6 +1537,7 @@ def _removal_is_observable(
     old_names: Dict[str, Set[str]], new_names: Dict[str, Set[str]],
     truncated: Set[str], reachability_has_signal: bool = True,
     new_roots: Optional[Dict[str, Set[str]]] = None,
+    by_direction: Optional[Dict[Tuple[str, str], Dict[str, Set[str]]]] = None,
 ) -> Tuple[bool, str]:
     """Can any caller tell that this schema is gone?
 
@@ -1550,8 +1616,14 @@ def _removal_is_observable(
         # replacement carrying MORE than it did.
         response_only = (old.used_in_responses(name)
                          and not old.used_in_requests(name))
+        # Which half of the call this schema is. A whole schema travels one
+        # way; both the rename test and the name test below must ask about
+        # that way and not the other.
+        side = ("response" if response_only
+                else "request" if old.used_in_requests(name)
+                and not old.used_in_responses(name) else "all")
         if _renamed_at_roots(name, view, carrying, old, new, new_roots or {},
-                             response_only):
+                             response_only, side):
             return False, "renamed"
         # This branch, and only this branch, reads the flattened field names.
         # Past `MAX_DEPTH` a name is invisible on that side, so "it is still
@@ -1559,15 +1631,30 @@ def _removal_is_observable(
         # abstention. A suppressor that goes quiet exactly where it is least
         # sure is how the relocation blind spot stayed open. The shape test
         # above needs none of this -- it compares schemas, not flattenings.
+        #
+        # 🚨 Narrowing this abstention was TRIED and MEASURED UNSAFE. Deciding
+        # the class whenever every contributed name was found -- on the ground
+        # that truncation can only HIDE a name -- suppressed 60 findings, of
+        # which the independent checker had CONFIRMED 49: PayPal 73->35,
+        # Cloudflare 31->13. All-vendor precision rose to 97.7% by deleting
+        # real breaks, which is the worst outcome available here. The engine's
+        # name test and the checker's site test disagree on those 49 and the
+        # checker is the one reading the raw document. Do not re-apply it
+        # without a measurement that shows those 49 are false.
         if any(op in truncated for op in carrying):
             return True, "truncated"
+        # And read them on the SIDE this schema travels on. A request body's
+        # names reappearing in the same operation's response is not the same
+        # name still being accepted -- see `_operation_field_names_where`.
+        visible_old = (by_direction or {}).get(("old", side)) or old_names
+        visible_new = (by_direction or {}).get(("new", side)) or new_names
         if contributed and all(
-                not (contributed - (new_names.get(op) or set()))
+                not (contributed - (visible_new.get(op) or set()))
                 for op in carrying
-                if contributed & (old_names.get(op) or set())):
+                if contributed & (visible_old.get(op) or set())):
             return False, "relocated"
         if not contributed and all(
-                not ((old_names.get(op) or set()) - (new_names.get(op) or set()))
+                not ((visible_old.get(op) or set()) - (visible_new.get(op) or set()))
                 for op in carrying):
             return False, "relocated"
 
@@ -1585,6 +1672,15 @@ def _diff_schema_views(old: Spec, new: Spec,
     incoming = _incoming_refs(old)
     old_truncated = _truncated_ops(old)
     new_roots = _invert_rooted_at(new)
+    # The same name maps, split by direction. A whole schema travels one way;
+    # merging both directions let a request body be replaced outright while
+    # its names lived on in the response (auth0, MISSED by the recall control).
+    by_direction = {
+        ("old", "request"): _operation_field_names_where(old, "request"),
+        ("new", "request"): _operation_field_names_where(new, "request"),
+        ("old", "response"): _operation_field_names_where(old, "response"),
+        ("new", "response"): _operation_field_names_where(new, "response"),
+    }
     # The control for the unreachable test: does this document link schemas at
     # all? If nothing anywhere is reachable, "unreachable" is a property of
     # the document's style, not of the schema.
@@ -1596,7 +1692,7 @@ def _diff_schema_views(old: Spec, new: Spec,
         observable, reason = _removal_is_observable(
             name, view, ops, removed_names, incoming, old, new,
             old_op_names, new_op_names, old_truncated, reachability_has_signal,
-            new_roots,
+            new_roots, by_direction,
         )
         if not observable:
             counts[reason] = counts.get(reason, 0) + 1
