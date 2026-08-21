@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
@@ -348,6 +348,51 @@ def _named_arms(members: List[Any], resolver: "Resolver", seen: Set[str]) -> Lis
     return out
 
 
+def _nullability_wrapper_arm(
+    node: Dict[str, Any], members: List[Any], resolver: "Resolver", seen: Set[str]
+) -> Optional[Any]:
+    """The payload arm of a union that expresses nothing but nullability.
+
+    `oneOf: [{"type": "null"}, {"$ref": X}]` and `anyOf: [{"$ref": X}]` beside
+    `nullable: true` are how OpenAPI 3.0 spells "nullable X". Neither is a
+    union: exactly one payload shape ever reaches the wire, and the only other
+    alternative is the absence of one.
+
+    That matters because an arm segment puts a SCHEMA NAME into the field's key.
+    Discord dropped `[null, X]` wrappers across its spec and OpenAI renamed
+    `Conversation-2` to `ResponseConversation` behind one of them; the payload
+    at those positions never moved, and between them eight response fields were
+    reported removed. The name is not on the wire, so the wrapper must not be in
+    the key.
+
+    Two guards, both bought with a measurement:
+
+    * A union with two or more real arms is left alone. Losing one of those is a
+      payload alternative genuinely disappearing -- discord's 200 for
+      `GET /guilds/{id}/auto-moderation/rules` really did stop returning
+      `SpamLinkRuleResponse` -- and this must never be able to silence it.
+    * Nullability must be DECLARED, by a `null` member or by `nullable`. A
+      one-member `oneOf` that merely has not grown its second arm yet is a real
+      union: Cloudflare's `infra_ServiceConfig` was `oneOf: [HttpServiceConfig]`
+      with a discriminator and gained a TCP arm. Treating that as transparent
+      moved every key beneath it in one version and not the other, and invented
+      six removed response fields whose value never left the payload.
+    """
+    real: List[Any] = []
+    saw_null = False
+    for member in members:
+        resolved, _ = resolver.resolve(member, seen)
+        if isinstance(resolved, dict) and _type_of(resolved) == "null":
+            saw_null = True
+            continue
+        real.append(member)
+        if len(real) > 1:
+            return None
+    if len(real) != 1 or not (saw_null or _is_nullable(node)):
+        return None
+    return real[0]
+
+
 def flatten_schema(
     schema: Any,
     resolver: Resolver,
@@ -391,6 +436,19 @@ def flatten_schema(
     stype = _type_of(resolved)
     nullable = _is_nullable(resolved)
     enum = _enum_of(resolved)
+
+    # A nullable wrapper is not a union. Flatten straight through it at the same
+    # prefix and the same depth, so the key a caller would write is the key the
+    # diff compares. See `_nullability_wrapper_arm` for why the arm name is noise
+    # here and load-bearing when there are two or more real arms.
+    if stype in ("oneOf", "anyOf"):
+        members = list(resolved.get(stype) or [])
+        solo = _nullability_wrapper_arm(resolved, members, resolver, seen)
+        if solo is not None:
+            out.update(flatten_schema(solo, resolver, prefix, depth, required, seen))
+            if prefix and prefix in out:
+                out[prefix] = replace(out[prefix], nullable=True)
+            return out
 
     if prefix:
         out[prefix] = Field(type=stype, required=required, nullable=nullable, enum=enum)
@@ -689,7 +747,32 @@ def _ref_name(node: Any) -> Optional[str]:
         carrying = [arm for arm in arms if not _annotation_only_arm(arm)]
         if len(carrying) == 1:
             return _ref_name(carrying[0])
+    # And through a nullability wrapper, for the same reason: `oneOf: [null, X]`
+    # and `anyOf: [X]` beside `nullable` are OpenAPI 3.0's spellings for
+    # "nullable X". The schema view is what the SCHEMA-level diff compares, and
+    # without this a vendor collapsing the wrapper -- Discord, across its whole
+    # spec -- reads as `oneOf -> ->Theme`, a type change on a field whose
+    # payload never moved. Kept in step with `_nullability_wrapper_arm`, which
+    # says the same thing for the operation-level flattener.
+    if "properties" not in node:
+        for keyword in ("oneOf", "anyOf"):
+            members = node.get(keyword)
+            if not isinstance(members, list) or not members:
+                continue
+            real = [m for m in members if not _is_null_node(m)]
+            if len(real) == 1 and (len(real) < len(members) or _is_nullable(node)):
+                return _ref_name(real[0])
     return None
+
+
+def _is_null_node(node: Any) -> bool:
+    """A union member that carries no payload, only the possibility of none."""
+    if not isinstance(node, dict):
+        return False
+    raw = node.get("type")
+    if isinstance(raw, list):
+        return all(t == "null" for t in raw) and bool(raw)
+    return raw == "null"
 
 
 def _discriminator_targets(node: Any) -> List[str]:

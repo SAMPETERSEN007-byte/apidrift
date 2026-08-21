@@ -48,6 +48,7 @@ KIND_LABEL = {
     "schema_enum_value_removed": "enum value removed",
     "schema_enum_value_added": "enum value added",
     "schema_field_now_nullable": "field became nullable",
+    "response_field_now_nullable": "response field became nullable",
     "operation_server_changed": "endpoint moved to a different host",
     "endpoint_removed": "endpoint removed",
     "endpoint_moved": "endpoint moved",
@@ -236,6 +237,37 @@ def _blind(path: str) -> str:
     )
 
 
+_LAST_SEGMENT = re.compile(r"(\.[^.\[<]+|\[\]|<[^>]*>)$")
+
+
+def _parent_key(path: str) -> str:
+    """The flattened key one hop above `path`, or "" at the body root."""
+    mark = _LAST_SEGMENT.search(path)
+    if not mark or mark.start() == 0:
+        return ""
+    return path[:mark.start()]
+
+
+def _inside_new_subtree(path: str, old_fields: Dict[str, Field],
+                        old_blind: Set[str]) -> bool:
+    """True when the field's PARENT is itself absent from the old side.
+
+    A required property inside an object that did not exist before cannot break
+    a caller: nobody was sending the parent, and the requirement is unreachable
+    until they do. OpenAI added an optional `moderation` object whose `model` is
+    required; reporting `moderation.model` as a newly required request field
+    says every existing caller is now rejected, which is the opposite of true.
+
+    This is a claim about the PARENT, deliberately: `name not in old_fields` is
+    already true for every field in this loop, so testing the field itself
+    again would decide nothing.
+    """
+    parent = _parent_key(path)
+    if not parent or not _strip_root_marker(parent):
+        return False  # the body root always existed
+    return parent not in old_fields and _blind(parent) not in old_blind
+
+
 def _synthetic_parent(path: str) -> str:
     """The path up to the outermost anonymous arm — i.e. what actually changed."""
     for mark in reversed(list(_ARM.finditer(path))):
@@ -411,6 +443,20 @@ def _diff_fields(
                         subject=name, old="optional", new="required",
                     ))
                 continue
+            if not _strip_root_marker(name) and new_fields:
+                # `name` IS the root marker — the schema the body was a bare
+                # `$ref` to. That name is not a field and never reaches the
+                # wire, and the flattener only emits this key in the `$ref`
+                # case, so `$ref X` becoming `allOf: [X, ...]` deletes it while
+                # every byte of the payload survives. GitHub did exactly that to
+                # the 200 of `PATCH /repos/{owner}/{repo}/issues/{n}`, and
+                # Cloudflare to three Workers and Queues envelopes.
+                #
+                # `new_fields` being non-empty is the precondition, not a
+                # detail: when the body is gone altogether there is no key left
+                # to carry the loss, and then the marker's removal is the
+                # finding. A suppressor with no precondition is a deletion.
+                continue
             kind = "request_field_removed" if where == "request" else "response_field_removed"
             # Losing a response field breaks every consumer reading it.
             # Losing a request field is usually ignored server-side.
@@ -464,6 +510,8 @@ def _diff_fields(
             continue  # the old side was not walked this far
         if _blind(name) in old_blind:
             continue  # same field reshaped or re-rooted — already accounted for
+        if _inside_new_subtree(name, old_fields, old_blind):
+            continue  # required inside a parent nobody was sending yet
         if where == "request" and f_new.required:
             out.append(_mk(
                 op, "request_field_added_required", BREAKING,

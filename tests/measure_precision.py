@@ -19,7 +19,7 @@ import random
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
 
@@ -269,33 +269,297 @@ def body_roots_at(doc: Dict[str, Any], node: Any, depth: int = 0,
     return names
 
 
-def strip_schema_head(parts: List[str], old: Dict[str, Any],
-                      new: Dict[str, Any], old_body: Any) -> Optional[List[str]]:
-    """Drop a leading SCHEMA NAME from a field path, when that is what it is.
+def subject_tokens(subject: str) -> List[Tuple[str, str]]:
+    """Split a subject into ('mark'|'prop'|'item', value) steps."""
+    out: List[Tuple[str, str]] = []
+    i = 0
+    while i < len(subject):
+        char = subject[i]
+        if char == "<":
+            close = subject.find(">", i)
+            if close < 0:
+                return []
+            out.append(("mark", subject[i + 1:close]))
+            i = close + 1
+        elif subject.startswith("[]", i):
+            out.append(("item", "[]"))
+            i += 2
+        elif char == ".":
+            i += 1
+        else:
+            j = i
+            while j < len(subject) and subject[j] not in ".<[":
+                j += 1
+            if j == i:
+                return []
+            out.append(("prop", subject[i:j]))
+            i = j
+    return out
 
-    `collapse()` keys a finding on its innermost named schema, so `root_cause`
-    reads `MessageResponse.nonce` while the operation's body is
-    `$ref: MessageResponse` and its properties are `nonce`, `content`, ... .
-    Walking `MessageResponse` as if it were a property finds nothing on either
-    side, and the whole class reported UNDECIDABLE for that reason alone --
-    an ADDRESSING failure, not a fact about the change.
 
-    Guarded twice over. The head must name a schema in one of the documents,
-    and the OLD body must actually resolve to that schema at its root. Without
-    the second test a path rooted at `Foo` would be re-read against whatever
-    schema this operation happens to return, and a `Bar.id` that never moved
-    would refute a real change to `Foo.id`. Returns None when either test
-    fails, which leaves the finding UNDECIDABLE -- honest, and the direction
-    that cannot manufacture a verdict.
+def pointer(doc: Dict[str, Any], ref: str) -> Any:
+    """Resolve a local JSON pointer by walking it, not by guessing its section."""
+    if not ref.startswith("#/"):
+        return None
+    node: Any = doc
+    for token in ref[2:].split("/"):
+        token = token.replace("~1", "/").replace("~0", "~")
+        if not isinstance(node, dict) or token not in node:
+            return None
+        node = node[token]
+    return node
+
+
+def deref(doc: Dict[str, Any], node: Any, depth: int = 0) -> Any:
+    """Follow a local `$ref` chain. Written here; the engine's is not imported."""
+    seen: Set[str] = set()
+    while isinstance(node, dict) and isinstance(node.get("$ref"), str) and depth < 24:
+        ref = node["$ref"]
+        if ref in seen:
+            return {}
+        seen.add(ref)
+        node = schemas_of(doc).get(ref.rsplit("/", 1)[-1])
+        depth += 1
+    return node if isinstance(node, dict) else {}
+
+
+def payload_alternatives(doc: Dict[str, Any], node: Any, depth: int = 0) -> List[Any]:
+    """Every shape a payload at this position may take.
+
+    `oneOf`/`anyOf` are alternatives; `allOf` is one shape and stays whole. A
+    `null` arm is dropped: it is the absence of a payload, not a payload with
+    fields to read, and a response that can no longer be null is narrower
+    rather than broken.
     """
-    if len(parts) < 2:
+    node = deref(doc, node)
+    if depth > 6 or not node:
+        return [node] if node else []
+    out: List[Any] = []
+    for key in ("oneOf", "anyOf"):
+        arms = node.get(key)
+        if isinstance(arms, list) and arms:
+            if is_documented_enum(doc, node, arms):
+                return [node]
+            for arm in arms:
+                resolved = deref(doc, arm)
+                if type_name(resolved) == "null":
+                    continue
+                out.extend(payload_alternatives(doc, arm, depth + 1))
+            return out
+    return [node]
+
+
+def is_documented_enum(doc: Dict[str, Any], node: Dict[str, Any],
+                       arms: List[Any]) -> bool:
+    """A `oneOf` of `const` values is one scalar with docs, not alternatives.
+
+    Discord writes `ForumLayout` as `{"type": "integer", "oneOf": [{"title":
+    "DEFAULT", "const": 0}, ...]}` so each value gets a name and a sentence.
+    Splitting that into three alternatives loses the declared `integer` and
+    leaves three shapes of type `any`, which then match nothing -- and the
+    checker CONFIRMS a field that never moved. A union whose members only pin
+    values is a value set, so the node stays whole.
+    """
+    if not node.get("type"):
+        return False
+    for arm in arms:
+        resolved = deref(doc, arm)
+        if not resolved:
+            return False
+        if "const" not in resolved and not resolved.get("enum"):
+            return False
+        if resolved.get("properties") or resolved.get("items"):
+            return False
+    return True
+
+
+def type_name(node: Any) -> str:
+    if not isinstance(node, dict):
+        return "any"
+    raw = node.get("type")
+    if isinstance(raw, list):
+        rest = [t for t in raw if t != "null"]
+        return str(rest[0]) if rest else "null"
+    if raw:
+        return str(raw)
+    if "properties" in node:
+        return "object"
+    if "items" in node:
+        return "array"
+    if "allOf" in node:
+        return "object"
+    for key in ("oneOf", "anyOf"):
+        if key in node:
+            return key
+    return "any"
+
+
+def flat_properties(doc: Dict[str, Any], node: Any,
+                    depth: int = 0) -> Tuple[Dict[str, Any], Set[str]]:
+    """Properties visible on ONE alternative, merging `allOf` (not unions)."""
+    node = deref(doc, node)
+    props: Dict[str, Any] = {}
+    required: Set[str] = set()
+    if depth > 6 or not node:
+        return props, required
+    for arm in node.get("allOf") or []:
+        sub, sub_req = flat_properties(doc, arm, depth + 1)
+        props.update(sub)
+        required |= sub_req
+    props.update(node.get("properties") or {})
+    required |= {str(r) for r in (node.get("required") or [])}
+    return props, required
+
+
+def allowed_values(doc: Dict[str, Any], node: Any) -> Optional[Set[str]]:
+    """The value set a property is pinned to, if any (`const` or `enum`)."""
+    node = deref(doc, node)
+    if not node:
         return None
-    head = parts[0]
-    if head not in (schemas_of(old) | schemas_of(new)):
-        return None
-    if head not in body_roots_at(old, old_body):
-        return None
-    return parts[1:]
+    if "const" in node:
+        return {str(node["const"])}
+    enum = node.get("enum")
+    if isinstance(enum, list) and enum:
+        return {str(v) for v in enum}
+    return None
+
+
+def shape_of(doc: Dict[str, Any], node: Any) -> Tuple[str, frozenset, Dict[str, Set[str]]]:
+    """What a caller can rely on from one alternative: type, names, pinned values."""
+    props, _ = flat_properties(doc, node)
+    pinned = {}
+    for name, sub in props.items():
+        values = allowed_values(doc, sub)
+        if values:
+            pinned[name] = values
+    return type_name(deref(doc, node)), frozenset(props), pinned
+
+
+def still_presented(doc_new: Dict[str, Any], candidates: List[Any],
+                    old_shape: Tuple[str, frozenset, Dict[str, Set[str]]]) -> bool:
+    """Can some new alternative still deliver everything the old one did?
+
+    Names alone are not enough. Discord replaced `SpamLinkRuleResponse` with
+    `UserProfileRuleResponse` in the 200 of
+    `GET /guilds/{id}/auto-moderation/rules`; the two carry the SAME eleven
+    property names and differ only in the value `trigger_type` is pinned to
+    (2 vs 4). A caller keyed on `trigger_type == 2` has lost its arm, so the
+    pinned values are part of what an alternative promises.
+    """
+    old_type, old_props, old_pinned = old_shape
+    for candidate in candidates:
+        cand_type, cand_props, cand_pinned = shape_of(doc_new, candidate)
+        if old_type != cand_type:
+            continue
+        if not old_props <= cand_props:
+            continue
+        if any(name in cand_pinned and not values <= cand_pinned[name]
+               for name, values in old_pinned.items()):
+            continue
+        return True
+    return False
+
+
+def unconstrained(doc: Dict[str, Any], node: Any) -> bool:
+    """An object that declares no properties at all constrains nothing.
+
+    Sentry replaced an issue's `metadata` -- a two-arm union with declared
+    fields -- by `{"type": "object", "additionalProperties": {}}`. Nothing in
+    that document says whether `filename` still arrives, so the honest answer is
+    that this checker cannot tell. Deciding it either way would be a verdict
+    read off a premise that holds vacuously, which is how the first
+    `unreachable` rule nearly deleted a real Sentry break.
+
+    `additionalProperties: false` is the opposite case and must not be swept in
+    with it. Cloudflare's `DELETE /accounts/{id}/ai-search/tokens/{id}` returns
+    `{"type": "object", "additionalProperties": false}` where nine fields used
+    to be: that document says, explicitly, that nothing else arrives. Treating
+    the two spellings alike would abstain on nine real breaks.
+    """
+    resolved = deref(doc, node)
+    if not resolved or type_name(resolved) != "object":
+        return False
+    if resolved.get("additionalProperties") is False:
+        return False
+    props, _ = flat_properties(doc, resolved)
+    return not props
+
+
+def guaranteed_property(doc: Dict[str, Any], node: Any, name: str) -> Tuple[bool, Any]:
+    """Is `name` promised here whatever the server answers with?
+
+    Under a `oneOf` a property present in ONE arm is not promised: the server
+    may answer with another arm. `walk_properties` returns the first arm that
+    has it, which is right for `allOf` and wrong for a union -- and it is the
+    difference between "the field is still somewhere in the document" (the
+    engine's question) and "a caller can still read it" (the caller's).
+    """
+    alts = payload_alternatives(doc, node)
+    if not alts:
+        return False, None
+    found = None
+    for alt in alts:
+        props, _ = flat_properties(doc, alt)
+        if name not in props:
+            return False, None
+        found = props[name] if found is None else found
+    return True, found
+
+
+def walk_subject(doc: Dict[str, Any], body: Any,
+                 tokens: List[Tuple[str, str]]) -> Tuple[bool, Any]:
+    """Follow subject tokens through a raw body. Schema marks are not steps."""
+    node = body
+    for index, (kind, value) in enumerate(tokens):
+        if kind == "mark":
+            picked = pick_arm(doc, node, value)
+            if picked is None:
+                if index == 0 and value in body_roots_at(doc, node):
+                    continue  # the root stamp names what the body IS, not a step
+                if index == 0:
+                    # ...but only when the body really IS that schema. A
+                    # subject rooted at `<Foo>` walked against an operation
+                    # that returns `Bar` re-reads `Foo.id` as `Bar.id`, and an
+                    # unrelated field that never moved then decides a real
+                    # change. Abstaining is the direction that cannot
+                    # manufacture a verdict.
+                    return False, None
+                return False, None
+            node = picked
+        elif kind == "item":
+            items = None
+            for alt in payload_alternatives(doc, node):
+                if isinstance(alt, dict) and alt.get("items") is not None:
+                    items = alt["items"]
+                    break
+            if items is None:
+                return False, None
+            node = items
+        else:
+            ok, sub = guaranteed_property(doc, node, value)
+            if not ok:
+                return False, None
+            node = sub
+    return True, node
+
+
+def pick_arm(doc: Dict[str, Any], node: Any, name: str) -> Optional[Any]:
+    """The union arm the engine called `name`, matched by `$ref` name or title."""
+    raw = deref(doc, node)
+    for key in ("oneOf", "anyOf"):
+        arms = raw.get(key)
+        if not isinstance(arms, list):
+            continue
+        for arm in arms:
+            if isinstance(arm, dict):
+                ref = arm.get("$ref")
+                if isinstance(ref, str) and ref.rsplit("/", 1)[-1] == name:
+                    return arm
+        for arm in arms:
+            target = deref(doc, arm)
+            if str(target.get("title") or "") == name:
+                return arm
+    return None
 
 
 def resolve_root(doc: Dict[str, Any], root_cause: str) -> Optional[Tuple[Any, List[str]]]:
@@ -341,27 +605,6 @@ def find_operation(doc: Dict[str, Any], op_key: str) -> Optional[Dict[str, Any]]
     return node if isinstance(node, dict) else None
 
 
-_ARM_MARKER = re.compile(r"<[^<>]*>")
-
-
-def plain_path(subject: str) -> str:
-    """The dotted field path a CONSUMER walks, with the engine's arm markers off.
-
-    A finding's `subject` annotates each hop with the schema it passed through:
-    `<ListCompanyResponse>._links`, `customer<customer>.default_source<card>.iin`.
-    `root_cause` is the marker-free form, but it is only set on findings that
-    went through `collapse()` -- so anything reaching this checker uncollapsed
-    arrived as a string with angle brackets in it, and every branch that looks
-    up `parts[0]` in `components/schemas` found `<ListCompanyResponse>`, which
-    is not a schema name and never will be.
-
-    That is why `vendor_control.py` printed `found+undecidable` for
-    `response_field_removed` on adyen and sendgrid: an injected break, known
-    real, that nothing could confirm because the checker could not read the
-    address it was given. The markers are notation, not evidence -- a caller
-    reads `_links` off the body either way.
-    """
-    return _ARM_MARKER.sub("", subject).replace("..", ".").strip(".")
 
 
 def find_path_item(doc: Dict[str, Any], path: str) -> Optional[Dict[str, Any]]:
@@ -588,7 +831,13 @@ def check_schema_removed(finding: Dict[str, Any], old: Dict[str, Any],
 def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
           old_tree: List[str], new_tree: List[str]) -> Tuple[str, str]:
     kind = finding["kind"]
-    root = finding.get("root_cause") or plain_path(finding.get("subject") or "")
+    # The SUBJECT is read through `subject_tokens` where a path is needed;
+    # `root` is only the collapsed dotted form, and a subject that never went
+    # through `collapse()` has none. A regex that stripped the engine's arm
+    # markers to fake one stood here and was removed: with it neutered the
+    # checker returned byte-identical verdicts on all 1,810 findings across 31
+    # vendors, so it was answering nothing that the bracket reader does not.
+    root = finding.get("root_cause") or ""
 
     if kind == "spec_removed":
         target = finding["subject"]
@@ -706,8 +955,13 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
                     if str(candidate).startswith("2"):
                         node = body
                         break
+        # A response object may itself be a `$ref`, and it points into
+        # `components/responses`, not `components/schemas`. Taking only the
+        # basename and looking it up among the schemas resolved nothing, so
+        # every operation Cloudflare writes that way -- `rulesets_RulesetOrDryRun`
+        # and its siblings -- had no body on either side and went UNDECIDABLE.
         if "$ref" in (node or {}):
-            node = schemas_of(doc).get(str(node["$ref"]).rsplit("/", 1)[-1]) or {}
+            node = pointer(doc, str(node["$ref"])) or {}
         content = (node or {}).get("content") or {}
         for mime in ("application/json", "application/x-www-form-urlencoded"):
             if mime in content:
@@ -818,11 +1072,19 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
         parts = [p for p in root.replace("[]", ".[].").split(".") if p]
         found_old, node_old = walk_properties(old_body, parts, old)
         found_new, node_new = walk_properties(new_body, parts, new)
-        if not (found_old or found_new):
-            tail = strip_schema_head(parts, old, new, old_body)
-            if tail:
-                found_old, node_old = walk_properties(old_body, tail, old)
-                found_new, node_new = walk_properties(new_body, tail, new)
+        if not (found_old and found_new):
+            # `root_cause` flattens schema names and wire segments into one
+            # dotted string, so its head is often a SCHEMA that no property
+            # walk can find. The SUBJECT keeps the brackets the engine wrote;
+            # read those instead of guessing where a name ends. A dotted-string
+            # heuristic stood here too and was removed rather than kept beside
+            # this: two mechanisms answering one question mask each other's
+            # mutations, and a suppressor nothing can falsify is not a
+            # suppressor.
+            tokens = subject_tokens(finding.get("subject") or "")
+            if tokens:
+                found_old, node_old = walk_subject(old, old_body, tokens)
+                found_new, node_new = walk_subject(new, new_body, tokens)
         if not (found_old and found_new):
             return UNDECIDABLE, f"field not resolvable (old={found_old}, new={found_new})"
         before, after = effective_shape(node_old, old), effective_shape(node_new, new)
@@ -1203,11 +1465,45 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
 
     if kind in ("request_field_added_required", "request_field_now_required"):
         # Operation-level: the body is inline, so walk it directly.
+        #
+        # `root` is only set on findings that went through `collapse()`, and an
+        # injected control never does -- so taking the leaf from it alone gave
+        # the empty string, and this branch refuted a break it had been told
+        # was real, with "`` required old=False new=False". Caught by
+        # `vendor_control.py`, which is the entire reason to inject a break
+        # whose answer is known.
         leaf = root.split(".")[-1].replace("[]", "")
+        if not leaf:
+            steps = [value for step_kind, value in
+                     subject_tokens(finding.get("subject") or "")
+                     if step_kind == "prop"]
+            leaf = steps[-1] if steps else ""
+        if not leaf:
+            return UNDECIDABLE, "the finding names no field"
         old_schema = _body_schema(old, finding["op_key"], "request")
         new_schema = _body_schema(new, finding["op_key"], "request")
         if new_schema is None:
             return UNDECIDABLE, "no request body found on the new side"
+
+        # A requirement inside an object the old body did not have is
+        # unreachable for an existing caller: they never send the parent, so
+        # the server never asks them for the child. Stripe's `limits` and
+        # Twilio's `conversationsV1Bridge` are both brand-new optional objects
+        # with a required property inside, and both scored as "every existing
+        # caller is now rejected". Asked here, from the raw OLD body, about the
+        # PARENT -- a different question from the engine's, which compares
+        # flattened keys.
+        tokens = subject_tokens(finding.get("subject") or "")
+        if len(tokens) > 1 and old_schema is not None:
+            stem = tokens[:-1]
+            if any(step_kind == "prop" for step_kind, _ in stem):
+                had_parent, _ = walk_subject(old, old_schema, stem)
+                has_parent, _ = walk_subject(new, new_schema, stem)
+                if has_parent and not had_parent:
+                    trail = "".join(v if k != "prop" else "." + v for k, v in stem)
+                    return REFUTED, (f"`{trail.lstrip('.')}` is absent from the old "
+                                     f"request body — nobody was sending the parent, "
+                                     f"so `{leaf}` cannot reject an existing caller")
 
         def required_of(schema, doc, path_parts):
             if not path_parts:
@@ -1229,6 +1525,81 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
             return CONFIRMED, f"`{leaf}` newly required in the request body"
         return REFUTED, (f"`{leaf}` required old={leaf in (old_req or set())} "
                          f"new={leaf in new_req}")
+
+    if kind == "response_field_removed":
+        # Ask what a CALLER loses, reading the subject's brackets rather than
+        # re-splitting the dotted key. Everything this needs is in the raw
+        # document; the fall-throughs below stay for subjects this cannot parse.
+        tokens = subject_tokens(finding.get("subject") or "")
+        status = finding.get("status", "")
+        old_body = _body_schema(old, finding["op_key"], "response", status)
+        new_body = _body_schema(new, finding["op_key"], "response", status)
+        if tokens and old_body is not None and new_body is not None:
+            last_kind, last_value = tokens[-1]
+            stem = tokens[:-1]
+            reached_old, parent_old = walk_subject(old, old_body, stem)
+            reached_new, parent_new = walk_subject(new, new_body, stem)
+            if reached_old and reached_new:
+                new_alts = payload_alternatives(new, parent_new)
+                if any(unconstrained(new, alt) for alt in new_alts):
+                    return UNDECIDABLE, ("the new schema at that position "
+                                         "declares no properties, so nothing in "
+                                         "the document says whether the field "
+                                         "still arrives")
+                if last_kind == "prop":
+                    was, _ = guaranteed_property(old, parent_old, last_value)
+                    now, _ = guaranteed_property(new, parent_new, last_value)
+                    if was and not now:
+                        return CONFIRMED, (f"`{last_value}` was promised by every "
+                                           f"alternative at old, and is not at new")
+                    if was and now:
+                        return REFUTED, (f"`{last_value}` is still promised by every "
+                                         f"alternative the new response can return")
+                elif last_kind == "item":
+                    def elements(doc, parent):
+                        out = []
+                        for alt in payload_alternatives(doc, parent):
+                            if isinstance(alt, dict) and alt.get("items") is not None:
+                                out.extend(payload_alternatives(doc, alt["items"]))
+                        return out
+                    was_items = elements(old, parent_old)
+                    now_items = elements(new, parent_new)
+                    if was_items and not now_items:
+                        return CONFIRMED, "the array no longer declares an element type"
+                    if was_items:
+                        lost = [i for i in was_items
+                                if not still_presented(new, now_items, shape_of(old, i))]
+                        if lost:
+                            return CONFIRMED, (f"the array's elements no longer "
+                                               f"present {shape_of(old, lost[0])[0]}"
+                                               f"{sorted(shape_of(old, lost[0])[1])[:6]}")
+                        return REFUTED, "the array still carries the same element type"
+                else:
+                    # A schema marker. It names either one arm of a union at
+                    # this position, or -- when nothing at this position is a
+                    # union with that name -- the body itself, which is not a
+                    # field at all. A marker at index 0 can be either, so ask
+                    # the document rather than the index.
+                    arm = pick_arm(old, parent_old, last_value)
+                    old_alts = ([arm] if arm is not None
+                                else payload_alternatives(old, parent_old))
+                    if not old_alts:
+                        return REFUTED, (f"the `{last_value}` alternative carried no "
+                                         f"payload — the response merely stopped "
+                                         f"being nullable there")
+                    lost = [a for a in old_alts
+                            if not still_presented(new, payload_alternatives(
+                                new, parent_new), shape_of(old, a))]
+                    if lost:
+                        return CONFIRMED, (f"no alternative the new response can "
+                                           f"return still delivers "
+                                           f"{sorted(shape_of(old, lost[0])[1])[:6]}")
+                    return REFUTED, (f"the shape `{last_value}` denoted is still "
+                                     f"presented at that position — a union that "
+                                     f"collapsed, a body that gained an `allOf` "
+                                     f"wrapper, or a schema renamed, and none of "
+                                     f"the three is on the wire")
+        # Fall through: unparsed subject, or a body this could not resolve.
 
     if kind in ("response_field_removed", "request_field_removed"):
         where = "response" if kind.startswith("response") else "request"

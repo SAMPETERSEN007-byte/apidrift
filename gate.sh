@@ -39,18 +39,18 @@ $PY -m unittest discover -s tests 2>&1 | tail -3 || fail=1
 step "2/6 mutation testing"
 $PY tests/mutation_check.py 2>&1 | tail -2 || fail=1
 
-step "3/6 precision audit (every finding, checked against raw specs)"
-echo "-- breaking --"
-$PY tests/measure_precision.py --sample 1000 --severity breaking 2>&1 | sed -n '4,10p' || fail=1
-echo "-- potentially breaking --"
-$PY tests/measure_precision.py --sample 1000 --severity potentially_breaking 2>&1 | sed -n '4,10p' || fail=1
-
-step "4/6 end-to-end run"
+step "3/6 end-to-end run (FIRST: layer 4 writes what layer 3 audits)"
 if $PY -m apidrift.cli --days 90 --quiet; then
   echo "pipeline OK -> out/report.md"
 else
   echo "pipeline FAILED"; fail=1
 fi
+
+step "4/6 precision audit (every finding, checked against raw specs)"
+echo "-- breaking --"
+$PY tests/measure_precision.py --sample 1000 --severity breaking 2>&1 | sed -n '4,10p' || fail=1
+echo "-- potentially breaking --"
+$PY tests/measure_precision.py --sample 1000 --severity potentially_breaking 2>&1 | sed -n '4,10p' || fail=1
 
 step "5/6 lead standing (from the last adversarial audit)"
 if [ -f lead_audit.json ]; then

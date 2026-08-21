@@ -1934,3 +1934,256 @@ class TestLoaderRejectsNonMappings(unittest.TestCase):
     def test_a_real_spec_still_loads(self):
         """The control: the guard must reject non-mappings, not everything."""
         self.assertTrue(spec(copy.deepcopy(BASE)).operations)
+class TestNullabilityWrapperIsNotAUnion(unittest.TestCase):
+    """`oneOf: [null, X]` is how OpenAPI 3.0 spells "nullable X".
+
+    Collapsing the wrapper to a bare `$ref X` -- which Discord did across its
+    whole spec -- moves no byte of the payload, and renaming the schema behind
+    it (OpenAI, `Conversation-2` -> `ResponseConversation`) moves none either.
+    Both used to delete every key under the arm and read as removed fields.
+    """
+
+    def setUp(self):
+        self.old = copy.deepcopy(BASE)
+        self.new = copy.deepcopy(BASE)
+        for doc in (self.old, self.new):
+            doc["components"]["schemas"]["Theme"] = {
+                "type": "object", "properties": {"hue": {"type": "string"}}}
+            doc["components"]["schemas"]["Card"]["properties"]["theme"] = {
+                "oneOf": [{"type": "null"},
+                          {"$ref": "#/components/schemas/Theme"}]}
+
+    def test_dropping_the_null_arm_is_not_a_break(self):
+        self.new["components"]["schemas"]["Card"]["properties"]["theme"] = {
+            "$ref": "#/components/schemas/Theme"}
+        self.assertEqual(run(self.old, self.new).breaking, [])
+
+    def test_renaming_the_schema_behind_the_wrapper_is_not_a_break(self):
+        schemas = self.new["components"]["schemas"]
+        schemas["ThemeV2"] = schemas.pop("Theme")
+        schemas["Card"]["properties"]["theme"] = {
+            "oneOf": [{"type": "null"}, {"$ref": "#/components/schemas/ThemeV2"}]}
+        self.assertEqual(run(self.old, self.new).breaking, [])
+
+    def test_a_single_arm_anyOf_beside_nullable_is_the_same_wrapper(self):
+        """Stripe's spelling: `anyOf: [$ref X]` with `nullable: true`."""
+        for doc in (self.old, self.new):
+            doc["components"]["schemas"]["Card"]["properties"]["theme"] = {
+                "anyOf": [{"$ref": "#/components/schemas/Theme"}], "nullable": True}
+        schemas = self.new["components"]["schemas"]
+        schemas["ThemeV2"] = schemas.pop("Theme")
+        schemas["Card"]["properties"]["theme"] = {
+            "anyOf": [{"$ref": "#/components/schemas/ThemeV2"}], "nullable": True}
+        self.assertEqual(run(self.old, self.new).breaking, [])
+
+    def test_losing_a_field_THROUGH_the_wrapper_is_still_a_break(self):
+        """The other direction: transparency must not swallow a real loss."""
+        del self.new["components"]["schemas"]["Theme"]["properties"]["hue"]
+        self.assertTrue(run(self.old, self.new).breaking,
+                        "a field vanishing behind the wrapper is a break")
+
+    def test_a_union_with_two_REAL_arms_keeps_its_arms(self):
+        """Discord's auto-moderation control, in miniature.
+
+        `[null, Rule, SpamRule]` losing `SpamRule` is a response alternative
+        genuinely disappearing. Nothing about nullability may silence it.
+        """
+        for doc in (self.old, self.new):
+            doc["components"]["schemas"]["Rule"] = {
+                "type": "object", "properties": {"kind": {"type": "string"}}}
+            doc["components"]["schemas"]["SpamRule"] = {
+                "type": "object", "properties": {"spam": {"type": "string"}}}
+            doc["components"]["schemas"]["Card"]["properties"]["rule"] = {
+                "oneOf": [{"type": "null"},
+                          {"$ref": "#/components/schemas/Rule"},
+                          {"$ref": "#/components/schemas/SpamRule"}]}
+        self.new["components"]["schemas"]["Card"]["properties"]["rule"] = {
+            "oneOf": [{"type": "null"}, {"$ref": "#/components/schemas/Rule"}]}
+        found = {f.kind for f in run(self.old, self.new).breaking}
+        self.assertIn("response_field_removed", found)
+
+    def test_a_one_arm_union_that_declares_no_nullability_is_left_alone(self):
+        """Cloudflare's `infra_ServiceConfig`: `oneOf: [Http]` + discriminator.
+
+        It later grew a TCP arm. Treating a one-member union as transparent
+        moved every key beneath it on one side only and invented six removed
+        response fields whose value never left the payload.
+        """
+        for doc in (self.old, self.new):
+            doc["components"]["schemas"]["Card"]["properties"]["cfg"] = {
+                "oneOf": [{"$ref": "#/components/schemas/Bank"}],
+                "discriminator": {"propertyName": "id"}}
+        self.new["components"]["schemas"]["Card"]["properties"]["cfg"]["oneOf"].append(
+            {"$ref": "#/components/schemas/Theme"})
+        self.assertEqual(
+            [f.subject for f in run(self.old, self.new).breaking], [],
+            "adding an arm must not read as the first arm's fields being removed")
+
+
+class TestRootMarkerIsNotAField(unittest.TestCase):
+    """`$ref X` becoming `allOf: [X, ...]` deletes the root key, not the payload.
+
+    The flattener stamps `<X>` only when the body is a BARE `$ref`, so the two
+    spellings of the same body are not comparable at the root. GitHub wrapped
+    the 200 of `PATCH /repos/{o}/{r}/issues/{n}` in exactly that `allOf` and the
+    root key read as a removed response field.
+    """
+
+    def setUp(self):
+        self.old = copy.deepcopy(BASE)
+        self.new = copy.deepcopy(BASE)
+
+    def _body(self, doc):
+        return doc["paths"]["/charges"]["post"]["responses"]["200"]["content"][
+            "application/json"]
+
+    def test_wrapping_a_ref_body_in_an_allOf_is_not_a_break(self):
+        self._body(self.new)["schema"] = {"allOf": [
+            {"$ref": "#/components/schemas/Card"},
+            {"type": "object", "properties": {"hint": {"type": "string"}}}]}
+        self.assertEqual(run(self.old, self.new).breaking, [])
+
+    def test_a_body_that_loses_its_fields_is_still_a_break(self):
+        """The other direction: the marker rule must not eat a real loss."""
+        self._body(self.new)["schema"] = {"allOf": [
+            {"type": "object", "properties": {"hint": {"type": "string"}}}]}
+        found = {f.kind for f in run(self.old, self.new).breaking}
+        self.assertIn("response_field_removed", found)
+
+
+class TestRequiredInsideANewParent(unittest.TestCase):
+    """A required property of an object nobody was sending rejects nobody.
+
+    Stripe added an optional `limits` object whose `accounts` is required and
+    Twilio an optional `conversationsV1Bridge` whose `serviceId` is; both scored
+    as "every existing caller is now rejected", which is the opposite of true.
+    """
+
+    def setUp(self):
+        self.old = copy.deepcopy(BASE)
+        self.new = copy.deepcopy(BASE)
+
+    def _body(self, doc):
+        return doc["paths"]["/charges"]["post"]["requestBody"]["content"][
+            "application/json"]["schema"]
+
+    def test_a_required_field_inside_a_new_optional_object_is_not_breaking(self):
+        self._body(self.new)["properties"]["limits"] = {
+            "type": "object", "properties": {"accounts": {"type": "integer"}},
+            "required": ["accounts"]}
+        self.assertEqual([f.subject for f in run(self.old, self.new).breaking], [])
+
+    def test_a_required_field_added_to_an_EXISTING_object_is_still_breaking(self):
+        """The other direction: only a NEW parent excuses the requirement."""
+        for doc in (self.old, self.new):
+            self._body(doc)["properties"]["limits"] = {
+                "type": "object", "properties": {"note": {"type": "string"}}}
+        self._body(self.new)["properties"]["limits"]["properties"]["accounts"] = {
+            "type": "integer"}
+        self._body(self.new)["properties"]["limits"]["required"] = ["accounts"]
+        found = {f.kind for f in run(self.old, self.new).breaking}
+        self.assertIn("request_field_added_required", found)
+
+    def test_a_new_TOP_LEVEL_required_field_is_still_breaking(self):
+        self._body(self.new)["properties"]["idempotency_key"] = {"type": "string"}
+        self._body(self.new)["required"].append("idempotency_key")
+        found = {f.kind for f in run(self.old, self.new).breaking}
+        self.assertIn("request_field_added_required", found)
+
+
+class TestAnonymousArmReshapeInARealUnion(unittest.TestCase):
+    """The reshape path, exercised where it still runs.
+
+    `TestAnonymousArmReshape` builds its fixture out of a `[enum, null]`
+    wrapper, which is now flattened transparently -- so those three tests
+    stopped reaching the `blind in new_blind` branch and its mutation survived
+    while they stayed green. A union with two REAL arms is where an anonymous
+    arm's content-derived rename still has to be read as a reshape.
+    """
+
+    def setUp(self):
+        self.old = copy.deepcopy(BASE)
+        self.new = copy.deepcopy(BASE)
+        for doc in (self.old, self.new):
+            doc["components"]["schemas"]["Card"]["properties"]["tier"] = {
+                "anyOf": [{"$ref": "#/components/schemas/Bank"},
+                          {"type": "string", "enum": ["auto", "flex"]}]}
+
+    def _tier(self, doc):
+        return doc["components"]["schemas"]["Card"]["properties"]["tier"]["anyOf"][1]
+
+    def test_enum_widening_in_a_real_union_is_not_a_field_removal(self):
+        from apidrift.diff import _kind_class
+        self._tier(self.new)["enum"] = ["auto", "flex", "fast"]
+        result = run(self.old, self.new)
+        classes = {_kind_class(f.kind) for f in result.findings}
+        self.assertIn("enum_value_added", classes)
+        self.assertNotIn("field_removed", classes)
+        self.assertEqual(result.breaking, [], "widening an enum is not breaking")
+
+    def test_enum_narrowing_in_a_real_union_is_reported(self):
+        from apidrift.diff import _kind_class
+        self._tier(self.new)["enum"] = ["auto"]
+        classes = {_kind_class(f.kind) for f in run(self.old, self.new).findings}
+        self.assertIn("enum_value_removed", classes)
+        self.assertNotIn("field_removed", classes)
+
+    def test_arm_type_change_in_a_real_union_is_breaking_not_removal(self):
+        self._tier(self.new).clear()
+        self._tier(self.new).update({"type": "integer"})
+        result = run(self.old, self.new)
+        found = {f.kind for f in result.findings}
+        self.assertIn("response_field_type_changed", found)
+        self.assertNotIn("response_field_removed", found)
+
+
+class TestRenameInsideAMultiArmUnion(unittest.TestCase):
+    """The parent's-ref-set rule, exercised where it still decides.
+
+    The pair above builds its union as `anyOf: [$ref X, null]`, which the schema
+    view now reads straight through as `->X` -- so the field comparison settles
+    those cases and the ref-set branch stopped being reached, leaving its
+    mutation alive while both tests stayed green. A union with two REAL arms
+    still records the property as `anyOf` and nothing typed `->X`, which is the
+    situation the branch was written for.
+    """
+
+    def _docs(self):
+        old = copy.deepcopy(BASE)
+        new = copy.deepcopy(BASE)
+        for doc in (old, new):
+            doc["components"]["schemas"]["Link"] = {
+                "type": "object", "properties": {"id": {"type": "string"}},
+                "required": ["id"]}
+            doc["components"]["schemas"]["Wrapper"] = {
+                "type": "object",
+                "properties": {"link": {"anyOf": [
+                    {"$ref": "#/components/schemas/Link"},
+                    {"$ref": "#/components/schemas/Bank"}]}}}
+            doc["paths"]["/charges"]["get"]["responses"]["200"]["content"][
+                "application/json"]["schema"]["properties"]["wrapper"] = {
+                    "$ref": "#/components/schemas/Wrapper"}
+        return old, new
+
+    def test_a_rename_inside_a_multi_arm_union_is_not_a_removal(self):
+        old, new = self._docs()
+        new["components"]["schemas"]["LinkV2"] = new["components"]["schemas"].pop("Link")
+        new["components"]["schemas"]["Wrapper"]["properties"]["link"]["anyOf"][0] = {
+            "$ref": "#/components/schemas/LinkV2"}
+        new["components"]["schemas"]["Wrapper"]["properties"]["note"] = {"type": "string"}
+        removed = {f.subject for f in run(old, new).findings
+                   if f.kind == "schema_removed"}
+        self.assertNotIn("Link", removed)
+
+    def test_a_multi_arm_union_arm_that_changed_shape_is_still_a_break(self):
+        """The control: a different SHAPE at the same position is not a rename."""
+        old, new = self._docs()
+        new["components"]["schemas"]["LinkV2"] = {
+            "type": "object", "properties": {"uuid": {"type": "string"}},
+            "required": ["uuid"]}
+        del new["components"]["schemas"]["Link"]
+        new["components"]["schemas"]["Wrapper"]["properties"]["link"]["anyOf"][0] = {
+            "$ref": "#/components/schemas/LinkV2"}
+        removed = {f.subject for f in run(old, new).findings
+                   if f.kind == "schema_removed"}
+        self.assertIn("Link", removed)

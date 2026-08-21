@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from apidrift.diff import BREAKING, Finding                  # noqa: E402
+from apidrift.cli import analyse                             # noqa: E402
 from apidrift.scan import scan_repo                          # noqa: E402
 from apidrift.vendors import get                             # noqa: E402
 
@@ -52,6 +53,18 @@ CLIENTS: Dict[str, Dict[str, str]] = {
 }
 
 
+def _wire_leaf(subject: str) -> str:
+    """The last step of a subject that is actually on the wire.
+
+    A subject interleaves two alphabets: `.name` and `[]` are what a caller
+    writes, `<Name>` is a schema name and is not. Stripping the brackets and
+    taking the final dotted segment yields the field, not the schema.
+    """
+    import re as _re
+    plain = _re.sub(r"<[^<>]*>", "", subject)
+    return plain.replace("[]", "").split(".")[-1].strip()
+
+
 def _pick(findings: List[Dict[str, Any]], vendor_key: str) -> Optional[Dict[str, Any]]:
     """A response-side field removal with a name distinctive enough to prove.
 
@@ -61,8 +74,14 @@ def _pick(findings: List[Dict[str, Any]], vendor_key: str) -> Optional[Dict[str,
     for finding in findings:
         if finding["kind"] != "response_field_removed":
             continue
-        leaf = (finding.get("root_cause") or finding["subject"]).split(".")[-1]
-        leaf = leaf.split("<")[0].strip("[]")
+        # The leaf must be what a CALLER writes, and `root_cause` is not that:
+        # it is the finding's innermost SCHEMA name. Taking it built a fixture
+        # reading `record.subscriptions_trials_resource_trial_settings`, which
+        # no caller would ever write, and the control passed only while the
+        # prover was equally confused about the difference. The subject keeps
+        # the engine's brackets, and the last unbracketed step in it is the
+        # wire name -- here `trial_settings`.
+        leaf = _wire_leaf(finding.get("subject") or "")
         if len(leaf) < 6 or not leaf.replace("_", "").isalnum():
             continue
         path = finding.get("path") or ""
@@ -110,11 +129,25 @@ def _write_fixture(root: Path, vendor_key: str, case: Dict[str, Any]) -> Dict[st
 
 def run(findings_path: Path, cache: Path, asof: str, days: int,
         vendors: List[str]) -> int:
-    data = json.loads(findings_path.read_text())
-    by_vendor = {entry["vendor"]: [f for f in entry["findings"]
-                                   if f["severity"] == BREAKING]
-                 for entry in data}
+    # Findings are re-derived from the specs on every run, never read from a
+    # file. Reading `out_all/findings.json` meant this control could build a
+    # fixture around a finding the engine had since stopped emitting, and then
+    # report SILENT -- blaming the scanner for the absence of something nobody
+    # was looking for. A control pointed at a stale artifact is worse than no
+    # control: it goes red for a reason that has nothing to do with what it
+    # measures.
     since = (dt.date.fromisoformat(asof) - dt.timedelta(days=days)).isoformat()
+    by_vendor: Dict[str, List[Dict[str, Any]]] = {}
+    for key in vendors:
+        if key not in CLIENTS:
+            continue
+        try:
+            result = analyse(get(key), cache, since, fetch=False)
+        except Exception as exc:                            # noqa: BLE001
+            print(f"{key:10} could not diff: {type(exc).__name__}: {exc}"[:110])
+            continue
+        by_vendor[key] = [f.as_dict() for f in result.findings
+                          if f.severity == BREAKING]
 
     print("Each row: a REAL breaking change, written into a fixture repo as a\n"
           "genuine dependence, in two languages. Both must be found.\n")

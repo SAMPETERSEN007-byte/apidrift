@@ -633,6 +633,31 @@ def _which_is(calls: Sequence["Proof"]) -> List[str]:
     return [link for link in calls[0].chain if link.startswith("which is `")]
 
 
+_ARM_MARKERS = re.compile(r"<[^<>]*>")
+
+
+def wire_subject(finding: Finding) -> str:
+    """The finding's subject as a CALLER writes it, schema annotations removed.
+
+    A subject interleaves two alphabets: `.name` and `[]` are on the wire,
+    `<Name>` is a schema name and is not. `collapse()` keys `root_cause` on the
+    innermost named SCHEMA, so preferring it yields
+    `subscriptions_trials_resource_trial_settings` where the caller wrote
+    `trial_settings` -- and every consumer that then hunts the source for that
+    string finds nothing, because no caller writes a schema name.
+
+    One function because there were two, disagreeing: `_leaf_of` decided what
+    `prove()` looks for and `_named_identifier` decided what the scan prefilter
+    demands, and the prefilter's own contract is that it never rejects a file
+    `prove()` would accept.
+    """
+    subject = finding.subject or finding.root_cause
+    wire = _ARM_MARKERS.sub("", subject).replace("..", ".").strip(".")
+    if wire and not wire.startswith("/"):
+        return wire
+    return finding.root_cause or finding.subject
+
+
 def _leaf_of(finding: Finding) -> str:
     """The field or schema the change names, or empty if it names none.
 
@@ -640,9 +665,19 @@ def _leaf_of(finding: Finding) -> str:
     a name a caller writes as an identifier. Treating `/guilds/{id}/bulk-ban`
     as a field name sent every endpoint change down the field-read route,
     where it could never be proven.
+
+    `root_cause` is preferred only when it is a FIELD. `collapse()` keys a
+    finding on its innermost named SCHEMA, so for
+    `<subscription>.trial_settings<subscriptions_trials_resource_trial_settings>`
+    it holds the schema name -- and hunting a caller's code for
+    `subscriptions_trials_resource_trial_settings` finds nothing, because no
+    caller writes a schema name. The SUBJECT carries the wire path with the
+    engine's brackets around the schema annotations; strip those and the last
+    step is what the caller actually reads. Found by a scan control that went
+    silent on a Stripe break it had been firing on, once the control itself
+    stopped making the same mistake.
     """
-    subject = finding.root_cause or finding.subject
-    leaf = subject.split(".")[-1].replace("[]", "").strip("<>")
+    leaf = wire_subject(finding).split(".")[-1].replace("[]", "").strip("<>")
     if not leaf or leaf.startswith("<") or leaf.startswith("/"):
         return ""
     if not leaf[0].isalpha():

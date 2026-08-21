@@ -431,6 +431,43 @@ class TestNullability(unittest.TestCase):
         self.assertEqual(REFUTED, verdict, why)
 
 
+class TestUncollapsedFindingsAreStillAddressable(unittest.TestCase):
+    """`root_cause` is only set by `collapse()`.
+
+    Anything that did not go through it -- an injected control, a finding on a
+    single operation -- arrives with an empty `root_cause` and its address in
+    `subject`. Taking the leaf from `root_cause` alone yielded the empty string
+    and refuted a break the control had just injected, reporting
+    "`` required old=False new=False". Caught by `vendor_control.py`, which is
+    the entire reason to inject a break whose answer is known.
+    """
+
+    def test_a_top_level_required_field_with_no_root_cause_is_confirmed(self):
+        body = {"type": "object", "properties": {"To": {"type": "string"}}}
+        added = {"type": "object",
+                 "properties": {"To": {"type": "string"},
+                                "control_field": {"type": "string"}},
+                 "required": ["control_field"]}
+        old = doc({}, {"/things": {"post": {"requestBody": {"content": {
+            "application/json": {"schema": body}}}, "responses": resp({})}}})
+        new = doc({}, {"/things": {"post": {"requestBody": {"content": {
+            "application/json": {"schema": added}}}, "responses": resp({})}}})
+        verdict, why = check(
+            finding("request_field_added_required", subject="control_field",
+                    root_cause="", op_key="POST /things"), old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+
+    def test_a_finding_naming_no_field_at_all_is_undecidable(self):
+        """The control. Empty means unknown, and unknown is not 'refuted'."""
+        old = doc({}, {"/things": {"post": {"requestBody": {"content": {
+            "application/json": {"schema": {"type": "object"}}}},
+            "responses": resp({})}}})
+        verdict, _ = check(
+            finding("request_field_added_required", subject="", root_cause="",
+                    op_key="POST /things"), old, old, [], [])
+        self.assertEqual(UNDECIDABLE, verdict)
+
+
 class TestAnyValueIsNotIgnorance(unittest.TestCase):
     """`{}` accepts any JSON value. That is the DOCUMENT speaking.
 
@@ -695,6 +732,293 @@ class TestSchemaFieldTypeChanged(unittest.TestCase):
     def test_a_real_type_change_is_still_confirmed(self):
         f, old, new = self._f({"type": "string"}, {"type": "integer"})
         verdict, why = check(f, old, new, [], [])
+
+class TestResponseFieldRemovedAsksTheCallersQuestion(unittest.TestCase):
+    """Layer 3 must be able to refute this class WITHOUT the engine's help.
+
+    Every suppression added to the engine for it is paired with a case here, and
+    each one is decided from the raw document by a resolver this file owns. If
+    disabling the engine's half left these green, the two would be one opinion
+    with two names -- which is the defect this project has shipped five times.
+    """
+
+    def _op(self, schema, status="200"):
+        return {"/things": {"get": {"responses": resp(schema, status)}}}
+
+    def test_a_genuinely_removed_field_is_confirmed(self):
+        """The control. `stripe token.card.iin`, in miniature."""
+        old = doc({}, self._op({"type": "object", "properties": {
+            "card": {"type": "object", "properties": {"iin": {"type": "string"}}}}}))
+        new = doc({}, self._op({"type": "object", "properties": {
+            "card": {"type": "object", "properties": {"last4": {"type": "string"}}}}}))
+        verdict, why = check(
+            finding("response_field_removed", subject="card.iin",
+                    root_cause="card.iin", status="200"), old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+
+    def test_a_collapsed_nullability_wrapper_is_refuted(self):
+        """`oneOf: [null, X]` -> `$ref X`. Discord, across its whole spec."""
+        theme = {"type": "object", "properties": {"hue": {"type": "string"}}}
+        old = doc({"Theme": theme}, self._op({"type": "object", "properties": {
+            "theme": {"oneOf": [{"type": "null"},
+                                {"$ref": "#/components/schemas/Theme"}]}}}))
+        new = doc({"Theme": theme}, self._op({"type": "object", "properties": {
+            "theme": {"$ref": "#/components/schemas/Theme"}}}))
+        verdict, why = check(
+            finding("response_field_removed", subject="theme<Theme>",
+                    root_cause="Theme", status="200"), old, new, [], [])
+        self.assertEqual(REFUTED, verdict, why)
+
+    def test_a_renamed_schema_behind_the_wrapper_is_refuted(self):
+        """OpenAI: `Conversation-2` -> `ResponseConversation`, byte-identical."""
+        body = {"type": "object", "properties": {"id": {"type": "string"}},
+                "required": ["id"]}
+        old = doc({"Conversation-2": body}, self._op({
+            "type": "object", "properties": {"conversation": {
+                "anyOf": [{"$ref": "#/components/schemas/Conversation-2"},
+                          {"type": "null"}]}}}))
+        new = doc({"ResponseConversation": body}, self._op({
+            "type": "object", "properties": {"conversation": {
+                "anyOf": [{"$ref": "#/components/schemas/ResponseConversation"},
+                          {"type": "null"}]}}}))
+        verdict, why = check(
+            finding("response_field_removed",
+                    subject="conversation<Conversation-2>",
+                    root_cause="Conversation-2", status="200"), old, new, [], [])
+        self.assertEqual(REFUTED, verdict, why)
+
+    def test_response_arm_removal_is_confirmed(self):
+        """The control that stops the arm rule being a deletion.
+
+        Discord's 200 for `GET /guilds/{id}/auto-moderation/rules` swapped
+        `SpamLinkRuleResponse` for `UserProfileRuleResponse`. The two carry the
+        SAME property names and differ only in the value `trigger_type` is
+        pinned to, so a check on names alone refutes a real break.
+        """
+        def rule(value):
+            return {"type": "object", "properties": {
+                "id": {"type": "string"},
+                "trigger_type": {"type": "integer", "enum": [value]}}}
+        old = doc({"SpamLinkRuleResponse": rule(2), "KeywordRuleResponse": rule(1)},
+                  self._op({"type": "array", "items": {"oneOf": [
+                      {"$ref": "#/components/schemas/KeywordRuleResponse"},
+                      {"$ref": "#/components/schemas/SpamLinkRuleResponse"}]}}))
+        new = doc({"UserProfileRuleResponse": rule(4), "KeywordRuleResponse": rule(1)},
+                  self._op({"type": "array", "items": {"oneOf": [
+                      {"$ref": "#/components/schemas/KeywordRuleResponse"},
+                      {"$ref": "#/components/schemas/UserProfileRuleResponse"}]}}))
+        verdict, why = check(
+            finding("response_field_removed", subject="[]<SpamLinkRuleResponse>",
+                    root_cause="SpamLinkRuleResponse", status="200"),
+            old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+
+    def test_an_arm_replaced_by_a_SMALLER_shape_is_confirmed(self):
+        """The property-set half of the arm rule, on its own.
+
+        `test_response_arm_removal_is_confirmed` is decided by the pinned
+        `trigger_type` values, so it stays green even if the superset test is
+        deleted. Here the names alone settle it: the new arm cannot deliver
+        `name`.
+        """
+        old = doc({"Full": {"type": "object", "properties": {
+                       "id": {"type": "string"}, "name": {"type": "string"}}},
+                   "Other": {"type": "object", "properties": {
+                       "kind": {"type": "string"}}}},
+                  self._op({"oneOf": [{"$ref": "#/components/schemas/Full"},
+                                      {"$ref": "#/components/schemas/Other"}]}))
+        new = doc({"Slim": {"type": "object", "properties": {
+                       "id": {"type": "string"}}},
+                   "Other": {"type": "object", "properties": {
+                       "kind": {"type": "string"}}}},
+                  self._op({"oneOf": [{"$ref": "#/components/schemas/Slim"},
+                                      {"$ref": "#/components/schemas/Other"}]}))
+        verdict, why = check(
+            finding("response_field_removed", subject="<Full>",
+                    root_cause="Full", status="200"), old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+
+    def test_a_union_collapsed_onto_a_covering_object_is_refuted(self):
+        """Adyen merged `[Iban, USLocal]` into one object carrying both."""
+        old = doc({"Iban": {"type": "object", "properties": {
+                       "iban": {"type": "string"}}},
+                   "USLocal": {"type": "object", "properties": {
+                       "routingNumber": {"type": "string"}}}},
+                  self._op({"type": "object", "properties": {"bankAccount": {
+                      "oneOf": [{"$ref": "#/components/schemas/Iban"},
+                                {"$ref": "#/components/schemas/USLocal"}]}}}))
+        new = doc({"BankAccountDetails": {"type": "object", "properties": {
+                       "iban": {"type": "string"},
+                       "routingNumber": {"type": "string"}}}},
+                  self._op({"type": "object", "properties": {"bankAccount": {
+                      "$ref": "#/components/schemas/BankAccountDetails"}}}))
+        verdict, why = check(
+            finding("response_field_removed", subject="bankAccount<Iban>",
+                    root_cause="Iban", status="200"), old, new, [], [])
+        self.assertEqual(REFUTED, verdict, why)
+
+    def test_a_field_promised_by_only_ONE_new_arm_is_confirmed(self):
+        """A union is not an `allOf`.
+
+        Cloudflare widened an Access policy's `result` to
+        `anyOf[app_policy, infra_policy]`. Nine names live in both arms and
+        seven only in the first; a walk that returns the first arm that has the
+        field calls all sixteen safe.
+        """
+        old = doc({}, self._op({"type": "object", "properties": {
+            "result": {"type": "object", "properties": {
+                "id": {"type": "string"}, "precedence": {"type": "integer"}}}}}))
+        new = doc({}, self._op({"type": "object", "properties": {
+            "result": {"anyOf": [
+                {"type": "object", "properties": {
+                    "id": {"type": "string"}, "precedence": {"type": "integer"}}},
+                {"type": "object", "properties": {"id": {"type": "string"}}}]}}}))
+        confirmed, why = check(
+            finding("response_field_removed", subject="result.precedence",
+                    root_cause="result.precedence", status="200"), old, new, [], [])
+        self.assertEqual(CONFIRMED, confirmed, why)
+        refuted, why = check(
+            finding("response_field_removed", subject="result.id",
+                    root_cause="result.id", status="200"), old, new, [], [])
+        self.assertEqual(REFUTED, refuted, why)
+
+    def test_a_oneOf_of_const_values_is_one_scalar_not_alternatives(self):
+        """Discord documents `ForumLayout` as `type: integer` + `oneOf` consts.
+
+        Read as three alternatives, each arm declares no type at all, so the
+        old `integer` matches none of them and an untouched field is CONFIRMED
+        as removed. Over-confirming is the same defect as over-refuting: a
+        verdict the document does not support.
+        """
+        layout = {"type": "integer", "oneOf": [
+            {"title": "DEFAULT", "const": 0}, {"title": "LIST", "const": 1}]}
+        old = doc({"ForumLayout": layout}, self._op({
+            "type": "object", "properties": {"layout": {
+                "oneOf": [{"type": "null"},
+                          {"$ref": "#/components/schemas/ForumLayout"}]}}}))
+        new = doc({"ForumLayout": layout}, self._op({
+            "type": "object", "properties": {
+                "layout": {"$ref": "#/components/schemas/ForumLayout"}}}))
+        verdict, why = check(
+            finding("response_field_removed", subject="layout<ForumLayout>",
+                    root_cause="ForumLayout", status="200"), old, new, [], [])
+        self.assertEqual(REFUTED, verdict, why)
+
+    def test_a_dotted_schema_name_is_read_from_the_BRACKETS(self):
+        """Twilio names schemas `messaging.v1.service.us_app_to_person`.
+
+        Splitting `root_cause` on "." makes the head `messaging`, which is not a
+        schema and not a property, so the finding was UNDECIDABLE -- 33 of them
+        on one operation. The subject keeps the brackets the engine wrote.
+        """
+        person = {"type": "object", "properties": {"sid": {"type": "string"}}}
+        old = doc({"messaging.v1.person": person},
+                  self._op({"$ref": "#/components/schemas/messaging.v1.person"}))
+        new = doc({"messaging.v1.person": {"type": "object",
+                                           "properties": {"other": {"type": "string"}}}},
+                  self._op({"$ref": "#/components/schemas/messaging.v1.person"}))
+        verdict, why = check(
+            finding("response_field_removed",
+                    subject="<messaging.v1.person>.sid",
+                    root_cause="messaging.v1.person.sid", status="200"),
+            old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+        self.assertNotIn("not a named schema", why)
+
+    def test_a_free_form_object_is_UNDECIDABLE_not_confirmed(self):
+        """Sentry replaced a declared `metadata` union with `{"type":"object"}`.
+
+        Nothing in that document says whether `filename` still arrives. A
+        verdict either way would be read off a premise that holds vacuously.
+        """
+        old = doc({}, self._op({"type": "object", "properties": {
+            "metadata": {"type": "object", "properties": {
+                "filename": {"type": "string"}}}}}))
+        new = doc({}, self._op({"type": "object", "properties": {
+            "metadata": {"type": "object", "additionalProperties": {}}}}))
+        verdict, why = check(
+            finding("response_field_removed", subject="metadata.filename",
+                    root_cause="metadata.filename", status="200"), old, new, [], [])
+        self.assertEqual(UNDECIDABLE, verdict, why)
+
+    def test_a_CLOSED_empty_object_is_confirmed_not_abstained(self):
+        """The other spelling, and the control on the rule above.
+
+        Cloudflare's `DELETE .../ai-search/tokens/{id}` answers
+        `{"type": "object", "additionalProperties": false}` where nine fields
+        used to be. That document says explicitly that nothing else arrives.
+        """
+        old = doc({}, self._op({"type": "object", "properties": {
+            "result": {"type": "object", "properties": {"id": {"type": "string"}}}}}))
+        new = doc({}, self._op({"type": "object", "properties": {
+            "result": {"type": "object", "additionalProperties": False}}}))
+        verdict, why = check(
+            finding("response_field_removed", subject="result.id",
+                    root_cause="result.id", status="200"), old, new, [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+
+    def test_a_response_that_is_a_ref_into_components_responses_resolves(self):
+        """PayPal and Cloudflare both write `responses: {default: {$ref: ...}}`.
+
+        That pointer goes to `components/responses`, not `components/schemas`.
+        Taking the basename and looking it up among the schemas found nothing,
+        so the body was unresolvable on both sides and the check fell through to
+        "is `error_400` still a schema?" -- the spec author's question, and the
+        sixth time this checker has agreed with the engine by asking it.
+        """
+        old = doc({"error_400": {"type": "object", "properties": {
+            "debug_id": {"type": "string"}, "name": {"type": "string"}}}},
+            {"/things": {"get": {"responses": {
+                "default": {"$ref": "#/components/responses/default"}}}}})
+        old["components"]["responses"] = {"default": {"content": {
+            "application/json": {"schema": {"oneOf": [
+                {"$ref": "#/components/schemas/error_400"}]}}}}}
+        new = doc({"error": {"type": "object", "properties": {
+            "debug_id": {"type": "string"}, "name": {"type": "string"}}}},
+            {"/things": {"get": {"responses": {
+                "default": {"$ref": "#/components/responses/default_response"}}}}})
+        new["components"]["responses"] = {"default_response": {"content": {
+            "application/json": {"schema": {
+                "$ref": "#/components/schemas/error"}}}}}
+        verdict, why = check(
+            finding("response_field_removed", subject="<error_400>.debug_id",
+                    root_cause="error_400.debug_id", status="default"),
+            old, new, [], [])
+        self.assertEqual(REFUTED, verdict, why)
+
+
+class TestRequiredInsideANewParent(unittest.TestCase):
+    def _op(self, schema):
+        return {"/things": {"post": {
+            "requestBody": {"content": {"application/json": {"schema": schema}}},
+            "responses": resp({"type": "object"})}}}
+
+    def test_a_requirement_inside_a_brand_new_object_is_refuted(self):
+        old = doc({}, self._op({"type": "object",
+                                "properties": {"amount": {"type": "integer"}}}))
+        new = doc({}, self._op({"type": "object", "properties": {
+            "amount": {"type": "integer"},
+            "limits": {"type": "object",
+                       "properties": {"accounts": {"type": "integer"}},
+                       "required": ["accounts"]}}}))
+        verdict, why = check(
+            finding("request_field_added_required", subject="limits.accounts",
+                    root_cause="limits.accounts", op_key="POST /things"),
+            old, new, [], [])
+        self.assertEqual(REFUTED, verdict, why)
+
+    def test_a_requirement_added_to_an_EXISTING_object_is_confirmed(self):
+        old = doc({}, self._op({"type": "object", "properties": {
+            "limits": {"type": "object",
+                       "properties": {"accounts": {"type": "integer"}}}}}))
+        new = doc({}, self._op({"type": "object", "properties": {
+            "limits": {"type": "object",
+                       "properties": {"accounts": {"type": "integer"}},
+                       "required": ["accounts"]}}}))
+        verdict, why = check(
+            finding("request_field_added_required", subject="limits.accounts",
+                    root_cause="limits.accounts", op_key="POST /things"),
+            old, new, [], [])
         self.assertEqual(CONFIRMED, verdict, why)
 
 

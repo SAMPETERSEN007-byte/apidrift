@@ -27,7 +27,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .diff import ABSENCE_KINDS, ENDPOINT_KINDS, FIELD_KINDS, Finding
 from .classify import classify
-from .dependence import prove
+from .dependence import wire_subject, prove
 from .prospect import static_run
 from .signatures import build_signatures
 from .js_dependence import is_js
@@ -411,9 +411,16 @@ _IDENT_SPLIT = re.compile(r"[^A-Za-z0-9]+")
 
 
 def _named_identifier(finding: Finding) -> str:
-    """The specific field or schema the change is about, if it names one."""
-    subject = finding.root_cause or finding.subject
-    leaf = subject.split(".")[-1].replace("[]", "").strip("<>")
+    """The specific field or schema the change is about, if it names one.
+
+    Derived exactly as `prove()` derives what it looks for. The two used to
+    disagree -- this one preferred `root_cause`, which `collapse()` keys on the
+    innermost named SCHEMA -- so the prefilter demanded a schema name appear in
+    the source and rejected files `prove()` then confirmed. Its own contract is
+    that it never rejects a file `prove()` would have accepted, and it was
+    quietly breaking that.
+    """
+    leaf = wire_subject(finding).split(".")[-1].replace("[]", "").strip("<>")
     if not leaf or leaf.startswith("<") or len(leaf) < 3:
         return ""
     # Only a name a caller could plausibly write. A status code, a version
