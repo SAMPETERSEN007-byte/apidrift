@@ -380,6 +380,56 @@ source in front of them.
 
 ---
 
+## `tools/cross_check.py` — the seventh question, asked by code I did not write
+
+🚨 **Layers 1–6 are all apidrift checking apidrift.** The unit suite, the
+mutations, the end-to-end run, a precision checker in this repo, a lead record,
+and recall controls whose stimulus this repo's author chose. `vendor_control.py`
+injects breaks somebody thought of; nothing could surface a break **nobody**
+thought of.
+
+`oasdiff` (1.3k★, Go, ~160 checker rules) is an independent implementation of
+the same question. On the FIRST vendor and FIRST window tried it surfaced two
+genuine recall holes, both hand-verified against the raw documents:
+
+| Missed | Mechanism |
+|---|---|
+| `POST /v1/checkout/sessions` lost request property `line_items[].dynamic_tax_rates` | apidrift flattens it as `Field(type='__truncated__')` — it sits past `MAX_DEPTH=2` — and the truncation abstention silences it |
+| `POST /v1/terminal/readers/{reader}/cancel_action` repointed its 200 body from `$ref: terminal.reader` to an `anyOf`, dropping required `device_type` | apidrift sees `device_type` on **neither** side |
+
+🚨 **This corrects the record on the `truncated` abstention.** It is documented
+below as "MEASURED UNSAFE — reverted" because narrowing it deleted 49 confirmed
+findings. That measured its PRECISION cost. Its RECALL cost had never been
+measured by anything, and this is it. Both numbers are now on the table; neither
+alone decides the rule.
+
+A third disagreement is a SEVERITY split, not a hole: apidrift calls
+`documents.proof_of_registration` removal `potentially_breaking`, oasdiff calls
+it breaking. Removing a request property a caller sends does make Stripe reject
+the call. Unresolved, recorded.
+
+🚨 **oasdiff is an ORACLE, not an authority.** On that same pair it emitted
+**577,044** breaking changes to apidrift's 4 — 367,596
+`response-property-enum-value-added` and 209,438
+`response-optional-property-removed`, which is exactly the fan-out `collapse()`
+exists to prevent. Its value is entirely in the DISAGREEMENTS. Every one is a
+lead to check against the raw spec, never a verdict to adopt.
+
+**Not in `gate.sh`, on purpose.** It needs `brew install oasdiff` and takes ~85s
+per vendor; the gate's ~65 seconds is what makes it something anyone actually
+runs. Run it deliberately, after a change to a suppressor or the flattener.
+
+```bash
+brew install oasdiff
+./.venv/bin/python tools/cross_check.py --vendors stripe --days 90 --out /tmp/x.json
+```
+
+The tool exits 2 rather than degrading if `oasdiff` is absent: an oracle that
+silently does not run reports agreement, which is the failure it exists to
+prevent.
+
+---
+
 ## The fourth audit — 2026-08-21, and the first ever aimed at IMPACTS
 
 Three audits had attacked LEADS. `pr_blocker` had demanded a fourth that

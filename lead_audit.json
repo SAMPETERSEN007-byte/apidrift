@@ -217,7 +217,38 @@
         "pinned": "281 files across the corpus reach a dated-version vendor through its SDK and are reported UNMEASURED rather than judged. That is a large share of the code that used to produce impacts."
       }
     },
-    "performance": "posthog, the largest repo in the corpus, takes 16m39s at a 1095-day window. That is not a CI gate anybody keeps. Unfixed and unmeasured beyond this one number."
+    "performance": "posthog, the largest repo in the corpus, takes 16m39s at a 1095-day window. That is not a CI gate anybody keeps. Unfixed and unmeasured beyond this one number.",
+    "independent_cross_check": {
+      "added": "2026-08-21",
+      "tool": "tools/cross_check.py, against oasdiff 1.29.1",
+      "why": "Layers 1-6 are all apidrift checking apidrift, including the recall controls, whose stimulus this repo's author chooses. An independent implementation can surface a break nobody here thought of.",
+      "first_run": {
+        "vendor": "stripe",
+        "window": "2026-05-23 to 2026-08-21",
+        "apidrift_breaking": 4,
+        "oasdiff_breaking": 577044,
+        "oasdiff_after_noise": 10,
+        "recall_holes_found": 2,
+        "severity_disagreements": 1
+      },
+      "recall_holes": [
+        {
+          "op": "POST /v1/checkout/sessions",
+          "missed": "request property line_items[].dynamic_tax_rates removed",
+          "mechanism": "flattened as Field(type='__truncated__') past MAX_DEPTH=2; the truncation abstention then silences it",
+          "verified": "by hand against the raw old/new spec3.json"
+        },
+        {
+          "op": "POST /v1/terminal/readers/{reader}/cancel_action",
+          "missed": "200 body repointed from $ref terminal.reader to an anyOf, dropping required device_type",
+          "mechanism": "apidrift sees device_type on neither side",
+          "verified": "by hand against the raw old/new spec3.json"
+        }
+      ],
+      "corrects_the_record": "The `truncated` abstention is recorded as MEASURED UNSAFE because narrowing it deleted 49 confirmed findings. That measured its PRECISION cost. Its RECALL cost had never been measured by anything, and hole 1 is it. Both numbers are now on the table; neither alone decides the rule.",
+      "open_severity_split": "apidrift calls request-property removal potentially_breaking; oasdiff calls it breaking. Stripe rejects unknown params, so a caller that sends the removed property does break. Unresolved.",
+      "oracle_not_authority": "577,044 to apidrift's 4 on the same pair. 367,596 were response-property-enum-value-added and 209,438 were response-optional-property-removed -- the fan-out collapse() exists to prevent. Only the disagreements carry information."
+    }
   },
   "findings_defect_found_and_fixed_5": {
     "what": "A schema NAME never reaches the wire. `schema_removed` was 1007 of the 2766 breaking findings across all 21 vendors -- 36% of the population -- and the precision checker confirmed 1007 of 1007.",
