@@ -1426,3 +1426,137 @@ class TestRenameMatching(unittest.TestCase):
                          "a byte-identical URL with a renamed parameter is not a removal")
         self.assertNotIn("endpoint_moved", found,
                          "nor is it a move -- the URL a caller writes is unchanged")
+
+
+class TestAllOfCarriesUnions(unittest.TestCase):
+    """`allOf: [X]` where X is `anyOf: [A, B]` IS `anyOf: [A, B]`.
+
+    `_merge_all_of` copied properties, required and type from each member and
+    dropped a member's union on the floor, so that body merged to `{}` -- no
+    properties, no required, no type -- and the flattener reported ZERO fields
+    for it. Cloudflare writes its request bodies that way:
+    `POST /accounts/{id}/browser-rendering/content` flattened to 0 fields on
+    the old side, so every field on the new side read as newly added and newly
+    required. There was nothing to collapse, only something to carry through.
+    """
+
+    def _union_body(self, second_required):
+        return {"allOf": [{"anyOf": [
+            {"type": "object",
+             "properties": {"username": {"type": "string"},
+                            "password": {"type": "string"}},
+             "required": ["username", "password"]},
+            {"type": "object",
+             "properties": {"token": {"type": "string"}},
+             "required": second_required},
+        ]}]}
+
+    def test_a_union_inside_allOf_still_has_fields(self):
+        doc = copy.deepcopy(BASE)
+        doc["paths"]["/charges"]["post"]["requestBody"]["content"][
+            "application/json"]["schema"] = self._union_body(["token"])
+        fields = spec(doc).operations["POST /charges"].request_fields
+        self.assertTrue(fields, "a body written as allOf-of-anyOf is not empty")
+        leaves = {f.rsplit(".", 1)[-1] for f in fields}
+        self.assertIn("username", leaves)
+        self.assertIn("token", leaves)
+
+    def test_the_same_body_in_two_notations_reports_nothing(self):
+        """The consequence that mattered, in the shape it actually occurs.
+
+        Both sides identical would pass with the bug present -- zero fields
+        against zero fields is also no change. What produced the fabrications
+        is the SAME content written two ways: `allOf: [anyOf: [...]]` on one
+        side, the bare `anyOf: [...]` on the other. With the union dropped the
+        old side flattens to nothing and every field on the new side reads as
+        newly added and newly required.
+        """
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        wrapped = self._union_body(["token"])
+        old["paths"]["/charges"]["post"]["requestBody"]["content"][
+            "application/json"]["schema"] = wrapped
+        new["paths"]["/charges"]["post"]["requestBody"]["content"][
+            "application/json"]["schema"] = {"anyOf": wrapped["allOf"][0]["anyOf"]}
+        found = kinds(run(old, new))
+        self.assertNotIn("request_field_added_required", found)
+        self.assertNotIn("request_field_now_required", found)
+
+    def test_a_field_that_really_became_required_is_still_reported(self):
+        """The control. Every change above makes this class quieter."""
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        old["paths"]["/charges"]["post"]["requestBody"]["content"][
+            "application/json"]["schema"] = self._union_body([])
+        new["paths"]["/charges"]["post"]["requestBody"]["content"][
+            "application/json"]["schema"] = self._union_body(["token"])
+        self.assertIn("request_field_now_required", kinds(run(old, new)))
+
+    def test_several_different_unions_are_left_opaque(self):
+        """An intersection of unions is not representable in this shape, and
+        inventing one arm's worth of an answer would be worse than keeping the
+        schema opaque."""
+        doc = copy.deepcopy(BASE)
+        doc["paths"]["/charges"]["post"]["requestBody"]["content"][
+            "application/json"]["schema"] = {"allOf": [
+                {"anyOf": [{"type": "object",
+                            "properties": {"a": {"type": "string"}}}]},
+                {"oneOf": [{"type": "object",
+                            "properties": {"b": {"type": "string"}}}]},
+            ]}
+        fields = spec(doc).operations["POST /charges"].request_fields
+        self.assertEqual({}, dict(fields),
+                         "two competing unions must not be silently resolved to one")
+
+
+class TestPerOperationServers(unittest.TestCase):
+    """`servers` overrides per path-item and per operation, and only the
+    document level was ever read.
+
+    Stripe serves `POST /v1/files` and `GET /v1/quotes/{quote}/pdf` from
+    files.stripe.com; GitHub serves release-asset upload from
+    uploads.github.com. A vendor moving one of those breaks every caller with
+    that host written down, while the document-level list never moves -- so the
+    change was invisible. Verified against both raw specs before this existed.
+    """
+
+    def _with_server(self, host, where="op"):
+        doc = copy.deepcopy(BASE)
+        node = doc["paths"]["/charges"]
+        target = node["post"] if where == "op" else node
+        if host:
+            target["servers"] = [{"url": host}]
+        return doc
+
+    def test_an_operation_level_server_overrides_the_document(self):
+        loaded = spec(self._with_server("https://files.test.com/"))
+        self.assertEqual(("https://files.test.com/",),
+                         loaded.operations["POST /charges"].servers)
+        self.assertEqual(("https://api.test.com/v1",),
+                         loaded.operations["GET /charges"].servers,
+                         "a sibling operation keeps the document's servers")
+
+    def test_a_path_item_server_overrides_the_document(self):
+        loaded = spec(self._with_server("https://path.test.com/", where="item"))
+        self.assertEqual(("https://path.test.com/",),
+                         loaded.operations["POST /charges"].servers)
+
+    def test_moving_one_endpoint_to_another_host_is_breaking(self):
+        old = self._with_server("https://files.test.com/")
+        new = self._with_server("https://uploads.test.com/")
+        found = [f for f in run(old, new).findings
+                 if f.kind == "operation_server_changed"]
+        self.assertTrue(found, "a host move on one endpoint must be reported")
+        self.assertEqual("POST", found[0].method.upper())
+
+    def test_adding_a_host_alongside_the_old_one_is_not_breaking(self):
+        """Overlap means every caller that worked still works."""
+        old = self._with_server("https://files.test.com/")
+        new = copy.deepcopy(old)
+        new["paths"]["/charges"]["post"]["servers"] = [
+            {"url": "https://files.test.com/"}, {"url": "https://eu.test.com/"}]
+        self.assertNotIn("operation_server_changed", kinds(run(old, new)))
+
+    def test_an_unchanged_document_host_reports_nothing(self):
+        """The control: every operation inherits the document's servers, so a
+        naive comparison would fire on all of them."""
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        self.assertNotIn("operation_server_changed", kinds(run(old, new)))

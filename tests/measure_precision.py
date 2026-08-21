@@ -601,6 +601,31 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
             return CONFIRMED, f"lost {lost}"
         return REFUTED, f"no values lost (old={len(before)}, new={len(after)})"
 
+    if kind == "operation_server_changed":
+        # Resolved here from the raw document, with this checker's own reading
+        # of OpenAPI's override chain, so it can disagree with the loader's.
+        def effective(doc):
+            method, _, path = finding["op_key"].partition(" ")
+            item = (doc.get("paths") or {}).get(path)
+            if not isinstance(item, dict):
+                return None
+            op = item.get(method.lower())
+            for node in (op if isinstance(op, dict) else {}, item, doc):
+                block = node.get("servers") if isinstance(node, dict) else None
+                if isinstance(block, list) and block:
+                    return {str(e["url"]) for e in block
+                            if isinstance(e, dict) and e.get("url")}
+            return set()
+
+        was, now = effective(old), effective(new)
+        if was is None or now is None:
+            return UNDECIDABLE, "the operation is missing from one document"
+        if not was or not now:
+            return UNDECIDABLE, "no servers declared on one side"
+        if was & now:
+            return REFUTED, f"the host sets still overlap: {sorted(was & now)}"
+        return CONFIRMED, f"{sorted(was)} -> {sorted(now)}"
+
     if kind == "schema_removed":
         return check_schema_removed(finding, old, new)
 

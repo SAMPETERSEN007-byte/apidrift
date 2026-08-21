@@ -930,6 +930,44 @@ MUTATIONS = [
         "            by_id.setdefault((\"any\", op.operation_id), key)",
         ["test_a_real_move_is_reported_and_is_not_a_removal"],
     ),
+    (
+        "allOf drops a member's union again",
+        "apidrift/loader.py",
+        "        for keyword in (\"anyOf\", \"oneOf\"):\n            arms = resolved.get(keyword)\n            if isinstance(arms, list) and arms:\n                unions.append((keyword, arms))",
+        "        pass",
+        ["test_a_union_inside_allOf_still_has_fields",
+         "test_the_same_body_in_two_notations_reports_nothing"],
+    ),
+    (
+        "competing unions inside allOf are resolved to the first",
+        "apidrift/loader.py",
+        "    if (len(unions) == 1 and \"anyOf\" not in merged and \"oneOf\" not in merged):",
+        "    if (unions and \"anyOf\" not in merged and \"oneOf\" not in merged):",
+        ["test_several_different_unions_are_left_opaque"],
+    ),
+    (
+        "operation and path-item server overrides are ignored again",
+        "apidrift/loader.py",
+        "            op_servers = (_server_urls(op_node.get(\"servers\"))\n                          or item_servers or tuple(servers))",
+        "            op_servers = tuple(servers)",
+        ["test_an_operation_level_server_overrides_the_document",
+         "test_a_path_item_server_overrides_the_document",
+         "test_moving_one_endpoint_to_another_host_is_breaking"],
+    ),
+    (
+        "a path-item server no longer overrides the document",
+        "apidrift/loader.py",
+        "        item_servers = _server_urls(resolved_item.get(\"servers\"))",
+        "        item_servers = ()",
+        ["test_a_path_item_server_overrides_the_document"],
+    ),
+    (
+        "an added host counts as a move",
+        "apidrift/diff.py",
+        "    if was and now and not (was & now):",
+        "    if was and now and was != now:",
+        ["test_adding_a_host_alongside_the_old_one_is_not_breaking"],
+    ),
 ]
 
 

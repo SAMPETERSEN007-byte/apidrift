@@ -13,7 +13,8 @@ from .loader import TRUNCATED, Field, Operation, Param, Spec
 ENDPOINT_KINDS = frozenset({
     "endpoint_removed", "endpoint_moved", "spec_removed",
     "response_status_removed", "security_requirement_added",
-    "server_url_changed", "schema_removed", "endpoint_deprecated",
+    "server_url_changed", "operation_server_changed",
+    "schema_removed", "endpoint_deprecated",
 })
 
 # The break is the ABSENCE of the field, so the caller is found by the endpoint
@@ -47,6 +48,7 @@ KIND_LABEL = {
     "schema_enum_value_removed": "enum value removed",
     "schema_enum_value_added": "enum value added",
     "schema_field_now_nullable": "field became nullable",
+    "operation_server_changed": "endpoint moved to a different host",
     "endpoint_removed": "endpoint removed",
     "endpoint_moved": "endpoint moved",
     "endpoint_deprecated": "endpoint deprecated",
@@ -497,6 +499,22 @@ def _security_tightened(
 
 def _diff_operation(old: Operation, new: Operation) -> List[Finding]:
     out: List[Finding] = []
+    # Where the request is SENT, before anything about what is in it. Only the
+    # document-level `servers` was ever read, so an operation served from
+    # another host was invisible: Stripe puts `POST /v1/files` and
+    # `GET /v1/quotes/{quote}/pdf` on files.stripe.com and GitHub puts
+    # release-asset upload on uploads.github.com, and moving one of those
+    # breaks every caller with that host written down while the document-level
+    # list never moves. Reported only when the two sets are DISJOINT -- adding
+    # a host alongside the old one takes nothing away.
+    was, now = set(old.servers), set(new.servers)
+    if was and now and not (was & now):
+        out.append(_mk(
+            new, "operation_server_changed", BREAKING,
+            "this endpoint moved to a different host",
+            subject="<server>",
+            old=", ".join(sorted(was)), new=", ".join(sorted(now)),
+        ))
     out.extend(_diff_params(old, new))
     # Only the shallow, inline part of a body is compared here; anything named
     # is handled exactly by the schema diff.

@@ -96,6 +96,15 @@ class Operation:
     # the annotation described a shape the loader never produces, and anyone
     # reading the dataclass re-learned the misconception the fix removed.
     security: Tuple[frozenset, ...] = ()
+    # The hosts THIS operation is served from, after the OpenAPI override
+    # chain: operation-level `servers`, else path-item-level, else the
+    # document's. Only the document level was ever read, so an operation on a
+    # different host was invisible -- Stripe serves `POST /v1/files` and
+    # `GET /v1/quotes/{quote}/pdf` from files.stripe.com, GitHub serves
+    # release-asset upload from uploads.github.com, and a vendor moving one of
+    # those breaks every caller with that host written down while the
+    # document-level list never moves.
+    servers: Tuple[str, ...] = ()
 
     @property
     def key(self) -> str:
@@ -214,10 +223,26 @@ def _enum_of(schema: Dict[str, Any]) -> Optional[Tuple[str, ...]]:
 
 
 def _merge_all_of(schema: Dict[str, Any], resolver: Resolver, seen: Set[str]) -> Dict[str, Any]:
-    """Collapse allOf into a single object schema (properties + required union)."""
+    """Collapse allOf into a single object schema (properties + required union).
+
+    A member that contributes a UNION rather than properties used to be dropped
+    on the floor: `{"allOf": [{"anyOf": [A, B]}]}` merged to `{}` -- no
+    properties, no required, no type -- and the flattener then reported zero
+    fields for the whole body. Cloudflare writes its request bodies that way,
+    so `POST /accounts/{id}/browser-rendering/content` flattened to 0 fields on
+    the old side and every field on the new side read as newly added and
+    newly required. `allOf: [X]` where X is `anyOf: [A, B]` IS `anyOf: [A, B]`;
+    there was nothing to collapse, only something to carry through.
+
+    Only an unambiguous union is carried. Several members each contributing a
+    different union is an intersection of unions, which this shape cannot
+    represent, and inventing one arm's worth of an answer would be worse than
+    keeping the schema opaque -- so that case is left exactly as it was.
+    """
     merged: Dict[str, Any] = {k: v for k, v in schema.items() if k != "allOf"}
     props: Dict[str, Any] = dict(merged.get("properties") or {})
     required: List[str] = list(merged.get("required") or [])
+    unions: List[Tuple[str, List[Any]]] = []
     for member in schema.get("allOf") or []:
         resolved, seen2 = resolver.resolve(member, seen)
         if not isinstance(resolved, dict):
@@ -228,11 +253,18 @@ def _merge_all_of(schema: Dict[str, Any], resolver: Resolver, seen: Set[str]) ->
         required.extend(resolved.get("required") or [])
         if "type" not in merged and resolved.get("type"):
             merged["type"] = resolved["type"]
+        for keyword in ("anyOf", "oneOf"):
+            arms = resolved.get(keyword)
+            if isinstance(arms, list) and arms:
+                unions.append((keyword, arms))
     if props:
         merged["properties"] = props
         merged.setdefault("type", "object")
     if required:
         merged["required"] = sorted(set(required))
+    if (len(unions) == 1 and "anyOf" not in merged and "oneOf" not in merged):
+        keyword, arms = unions[0]
+        merged[keyword] = arms
     return merged
 
 
@@ -423,6 +455,14 @@ def _collect_params(
     return out
 
 
+def _server_urls(node: Any) -> Tuple[str, ...]:
+    """The `url` of every entry in a `servers` block, in order."""
+    if not isinstance(node, list):
+        return ()
+    return tuple(str(entry["url"]) for entry in node
+                 if isinstance(entry, dict) and entry.get("url"))
+
+
 def _security_names(node: Any) -> Tuple[frozenset, ...]:
     """Security as OpenAPI defines it: a list of ALTERNATIVES.
 
@@ -478,6 +518,7 @@ def load_spec(raw: bytes, filename: str) -> Spec:
         if not isinstance(resolved_item, dict):
             continue
         shared = _collect_params(resolved_item.get("parameters"), resolver)
+        item_servers = _server_urls(resolved_item.get("servers"))
         for method in HTTP_METHODS:
             op_node = resolved_item.get(method)
             if not isinstance(op_node, dict):
@@ -505,6 +546,9 @@ def load_spec(raw: bytes, filename: str) -> Spec:
 
             op_sec = op_node.get("security")
             security = _security_names(op_sec) if op_sec is not None else root_security
+            # OpenAPI's override chain, most specific first.
+            op_servers = (_server_urls(op_node.get("servers"))
+                          or item_servers or tuple(servers))
 
             op = Operation(
                 path=str(path),
@@ -517,6 +561,7 @@ def load_spec(raw: bytes, filename: str) -> Spec:
                 request_required=request_required,
                 responses=responses,
                 security=security,
+                servers=op_servers,
             )
             operations[op.key] = op
 
