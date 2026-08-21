@@ -384,7 +384,7 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
                          f"{[sorted(a) for a in before]} -> "
                          f"{[sorted(a) for a in after]}")
 
-    def _body_schema(doc, op_key, where):
+    def _body_schema(doc, op_key, where, status=""):
         op = find_operation(doc, op_key)
         if not isinstance(op, dict):
             return None
@@ -392,10 +392,16 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
             node = op.get("requestBody") or {}
         else:
             responses = op.get("responses") or {}
-            node = responses.get("200") or responses.get("201") or {}
+            # The status the FINDING names, when it names one. Resolving a 4XX
+            # body against the 200 body is not a measurement of anything, and
+            # it decided this class for months because the engine knew the
+            # status and recorded it only in the prose.
+            node = responses.get(status) if status else None
             if not node:
-                for status, body in responses.items():
-                    if str(status).startswith("2"):
+                node = responses.get("200") or responses.get("201") or {}
+            if not node:
+                for candidate, body in responses.items():
+                    if str(candidate).startswith("2"):
                         node = body
                         break
         if "$ref" in (node or {}):
@@ -503,8 +509,8 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
 
     if kind in ("request_field_type_changed", "response_field_type_changed"):
         where = "request" if kind.startswith("request") else "response"
-        old_body = _body_schema(old, finding["op_key"], where)
-        new_body = _body_schema(new, finding["op_key"], where)
+        old_body = _body_schema(old, finding["op_key"], where, finding.get("status", ""))
+        new_body = _body_schema(new, finding["op_key"], where, finding.get("status", ""))
         if old_body is None or new_body is None:
             return UNDECIDABLE, f"no {where} body on one side"
         parts = [p for p in root.replace("[]", ".[].").split(".") if p]
@@ -580,8 +586,9 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
             # Route-level findings sit inside an inline body rather than a
             # named schema, so resolve them through the operation instead.
             where = "request" if "request" in kind else "response"
-            old_body = _body_schema(old, finding["op_key"], where)
-            new_body = _body_schema(new, finding["op_key"], where)
+            status = finding.get("status", "")
+            old_body = _body_schema(old, finding["op_key"], where, status)
+            new_body = _body_schema(new, finding["op_key"], where, status)
             path_parts = [p for p in root.replace("[]", ".[].").split(".") if p]
             if old_body is not None and new_body is not None:
                 found_old, node_old = walk_properties(old_body, path_parts, old)
@@ -793,8 +800,8 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
 
     if kind in ("response_field_removed", "request_field_removed"):
         where = "response" if kind.startswith("response") else "request"
-        old_schema = _body_schema(old, finding["op_key"], where)
-        new_schema = _body_schema(new, finding["op_key"], where)
+        old_schema = _body_schema(old, finding["op_key"], where, finding.get("status", ""))
+        new_schema = _body_schema(new, finding["op_key"], where, finding.get("status", ""))
         if old_schema is not None and new_schema is not None:
             parts = [p for p in root.replace("[]", ".[].").split(".") if p]
             in_old, _ = walk_properties(old_schema, parts, old)

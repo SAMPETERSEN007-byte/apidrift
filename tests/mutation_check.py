@@ -721,14 +721,14 @@ MUTATIONS = [
     (
         "the root-rename suppressor is disabled",
         "apidrift/diff.py",
-        "        if _renamed_at_roots(name, view, carrying, old, new, new_roots or {}):",
+        "        if _renamed_at_roots(name, view, carrying, old, new, new_roots or {},\n                             response_only):",
         "        if False:",
         ["test_a_root_schema_renamed_to_an_identical_shape_is_not_a_break"],
     ),
     (
         "a root rename is accepted without comparing shapes",
         "apidrift/diff.py",
-        "        if not any(_view_shape(new.schemas[c], new) == want\n                   for c in candidates if c in new.schemas):\n            return False",
+        "        if not any(_still_presents(view, new.schemas[c], old, new, response_only)\n                   for c in candidates if c in new.schemas):\n            return False",
         "        if not candidates:\n            return False",
         ["test_a_rename_that_also_drops_a_field_is_still_a_break"],
     ),
@@ -967,6 +967,35 @@ MUTATIONS = [
         "    if was and now and not (was & now):",
         "    if was and now and was != now:",
         ["test_adding_a_host_alongside_the_old_one_is_not_breaking"],
+    ),
+    (
+        "response findings forget which response they came from",
+        "apidrift/diff.py",
+        "    for finding in out:\n        finding.status = status",
+        "    for finding in out:\n        finding.status = \"\"",
+        ["test_a_response_finding_records_which_response"],
+    ),
+    (
+        "a renamed response schema must match exactly again",
+        "apidrift/diff.py",
+        "    if before[0] == \"object\" and after and after[0] == \"object\":\n        return set(before[1]) <= set(after[1])",
+        "    if False:\n        return set(before[1]) <= set(after[1])",
+        ["test_a_renamed_response_schema_that_gained_a_field_is_not_a_break",
+         "test_the_superset_rule_is_a_SUPERSET_rule"],
+    ),
+    (
+        "a renamed response schema may lose fields too",
+        "apidrift/diff.py",
+        "        return set(before[1]) <= set(after[1])",
+        "        return True",
+        ["test_the_superset_rule_is_a_SUPERSET_rule"],
+    ),
+    (
+        "request schemas get the response widening rule too",
+        "apidrift/diff.py",
+        "    if not response_only:\n        return _view_shape(before, old) == _view_shape(after, new)",
+        "    if False:\n        return _view_shape(before, old) == _view_shape(after, new)",
+        ["test_the_widening_rule_applies_only_to_what_a_caller_READS"],
     ),
 ]
 

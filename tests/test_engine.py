@@ -1560,3 +1560,146 @@ class TestPerOperationServers(unittest.TestCase):
         naive comparison would fire on all of them."""
         old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
         self.assertNotIn("operation_server_changed", kinds(run(old, new)))
+
+
+class TestResponseFindingsCarryTheirStatus(unittest.TestCase):
+    """A 4XX body decided against the 200 body is not a measurement.
+
+    `_diff_fields` has always been given the response status and put it only in
+    the prose, so the independent checker had to guess and resolved every
+    response-side finding against the 200 body. Cloudflare removes `result`
+    from a 400 body while the 200 body keeps it, which read as "still present"
+    and refuted a real removal.
+    """
+
+    def test_a_response_finding_records_which_response(self):
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        for doc in (old, new):
+            doc["paths"]["/charges"]["get"]["responses"]["400"] = {
+                "content": {"application/json": {"schema": {
+                    "type": "object",
+                    "properties": {"errors": {"type": "string"},
+                                   "result": {"type": "string"}}}}}}
+        del new["paths"]["/charges"]["get"]["responses"]["400"]["content"][
+            "application/json"]["schema"]["properties"]["result"]
+        found = [f for f in run(old, new).findings
+                 if f.kind == "response_field_removed" and f.subject == "result"]
+        self.assertTrue(found, "the removal must be reported")
+        self.assertEqual("400", found[0].status,
+                         "and it must say which response it left")
+
+    def test_a_request_finding_carries_no_status(self):
+        """The control: a request body has no status, and inventing one would
+        send the checker looking in the wrong place."""
+        old, new = copy.deepcopy(BASE), copy.deepcopy(BASE)
+        new["paths"]["/charges"]["post"]["requestBody"]["content"][
+            "application/json"]["schema"]["required"].append("note")
+        found = [f for f in run(old, new).findings if "request" in f.kind]
+        self.assertTrue(found)
+        self.assertEqual("", found[0].status)
+
+
+class TestRenamedResponseSchemaMayCarryMore(unittest.TestCase):
+    """A schema a caller only ever READS cannot be broken by its replacement
+    carrying more than it did.
+
+    Exact equality is the right test for a schema a caller SENDS -- anything
+    the new one adds as required is a new obligation. It is the wrong test for
+    one a caller reads, and the rename check applied it to both. Cloudflare
+    renamed `access_schemas-single_response` to `access_single_response-2` and
+    added `enabled` to its `result`; 30 of its removals were that shape. This
+    is the provenance rule f034a2a already applies to severity, applied to the
+    rename test as well.
+    """
+
+    def _doc(self, direction="response", required=()):
+        doc = copy.deepcopy(BASE)
+        doc["components"]["schemas"]["Envelope"] = {
+            "type": "object",
+            "properties": {
+                "success": {"type": "boolean"},
+                # Nested on purpose: the superset rule only ever applies to a
+                # field that IS an object, so a flat fixture exercises none of
+                # it and passes whatever the rule says.
+                "result": {"type": "object", "properties": {
+                    "id": {"type": "string"}, "name": {"type": "string"}}},
+            },
+            "required": list(required),
+        }
+        node = doc["paths"]["/charges"]["post"]
+        ref = {"$ref": "#/components/schemas/Envelope"}
+        if direction == "response":
+            node["responses"]["200"] = {"content": {"application/json": {
+                "schema": ref}}}
+        else:
+            node["requestBody"] = {"required": True, "content": {
+                "application/json": {"schema": ref}}}
+        return doc
+
+    def _renamed(self, direction, extra_props=(), required=()):
+        doc = self._doc(direction, required)
+        schema = doc["components"]["schemas"].pop("Envelope")
+        for name in extra_props:
+            schema["properties"]["result"]["properties"][name] = {"type": "boolean"}
+        schema["required"] = list(required)
+        doc["components"]["schemas"]["EnvelopeV2"] = schema
+        ref = {"$ref": "#/components/schemas/EnvelopeV2"}
+        node = doc["paths"]["/charges"]["post"]
+        if direction == "response":
+            node["responses"]["200"]["content"]["application/json"]["schema"] = ref
+        else:
+            node["requestBody"]["content"]["application/json"]["schema"] = ref
+        return doc
+
+    def test_a_renamed_response_schema_that_gained_a_field_is_not_a_break(self):
+        """And it is the RENAME test that settles it, not a later branch.
+
+        Asserting only "no findings" would pass with the superset rule deleted,
+        because the leaf-name test one branch further down suppresses this too
+        -- for the wrong reason, and only because the added field is nested
+        deeper than that test can see. The suppression reason is the part that
+        has to be right.
+        """
+        old = self._doc()
+        new = self._renamed("response", extra_props=("enabled",))
+        result = run(old, new)
+        self.assertEqual(set(), kinds(result),
+                         "a reader cannot be broken by a field appearing")
+        self.assertEqual(1, result.suppressed.get("renamed"),
+                         f"the rename test must be what settles it, got "
+                         f"{result.suppressed}")
+
+    def test_the_widening_rule_applies_only_to_what_a_caller_READS(self):
+        """What a caller sends is a different question: the new one carrying
+        more is a new obligation, not a gift.
+
+        Asserted on `_still_presents` directly. End to end the distinction is
+        worth exactly three findings across all 21 vendors -- real, but every
+        synthetic fixture I could build is suppressed one branch earlier by the
+        leaf-name test, so a pipeline test would pass with the distinction
+        deleted and prove nothing.
+        """
+        from apidrift.diff import _still_presents
+        old = spec(self._doc())
+        new = spec(self._renamed("response", extra_props=("enabled",)))
+        before, after = old.schemas["Envelope"], new.schemas["EnvelopeV2"]
+        self.assertTrue(_still_presents(before, after, old, new, True),
+                        "a reader is not broken by a field appearing")
+        self.assertFalse(_still_presents(before, after, old, new, False),
+                         "a sender's contract has to match exactly")
+
+    def test_the_superset_rule_is_a_SUPERSET_rule(self):
+        """Asserted where it lives.
+
+        End to end a nested loss is already reported as `response_field_removed`
+        by the operation diff, so a pipeline test stays green whether this rule
+        says superset or "anything goes" -- it would prove nothing about the
+        comparison it is meant to pin.
+        """
+        from apidrift.diff import _shape_presents
+        smaller = ("object", ("id", "name"))
+        bigger = ("object", ("enabled", "id", "name"))
+        self.assertTrue(_shape_presents(smaller, bigger), "gaining a field is fine")
+        self.assertFalse(_shape_presents(bigger, smaller), "losing one is not")
+        self.assertFalse(_shape_presents(("scalar", "string"), ("scalar", "integer")),
+                         "a scalar has to match exactly")

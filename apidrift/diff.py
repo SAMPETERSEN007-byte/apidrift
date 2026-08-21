@@ -94,6 +94,12 @@ class Finding:
     method: str
     detail: str
     subject: str = ""          # param name / field path / status code
+    # For a response-side finding, WHICH response this is about. The engine has
+    # always known -- `_diff_fields` takes it -- and put it only in the prose,
+    # so the independent checker had to guess and resolved every finding
+    # against the 200 body. A 4XX body decided against the 200 body is not a
+    # measurement of anything.
+    status: str = ""
     old: str = ""
     new: str = ""
     operation_id: Optional[str] = None
@@ -133,6 +139,7 @@ class Finding:
             "method": self.method.upper(),
             "operation_id": self.operation_id,
             "subject": self.subject,
+            "status": self.status,
             "old": self.old,
             "new": self.new,
             "detail": self.detail,
@@ -463,6 +470,10 @@ def _diff_fields(
                 f"{label} gained required field `{name}`",
                 subject=name, old="<absent>", new=f_new.signature(),
             ))
+    # Response-side findings carry the status they came from, so the
+    # checker can resolve the right body instead of assuming 200.
+    for finding in out:
+        finding.status = status
     return out
 
 
@@ -1243,9 +1254,53 @@ def _view_shape(view, spec: Spec) -> Tuple:
                   for f, field in sorted(view.fields.items())))
 
 
+def _shape_presents(before: Optional[Tuple], after: Optional[Tuple]) -> bool:
+    """Does `after` still carry everything `before` did, one level down?
+
+    For an object that means its property names are a SUPERSET: a reader cannot
+    be broken by a field appearing, and a field DISAPPEARING still fails this
+    because the old names would no longer be contained. Anything that is not an
+    object has to match exactly -- a scalar becoming a different scalar is a
+    change in what you receive, not an addition to it.
+    """
+    if before is None or after is None:
+        return before == after
+    if before[0] == "object" and after and after[0] == "object":
+        return set(before[1]) <= set(after[1])
+    return before == after
+
+
+def _still_presents(before, after, old: Spec, new: Spec,
+                    response_only: bool) -> bool:
+    """Does `after` still present everything `before` did?
+
+    Exact equality is the right test for a schema a caller SENDS: anything the
+    new one adds as required is a new obligation. It is the wrong test for one
+    a caller READS. Cloudflare renamed `access_schemas-single_response` to
+    `access_single_response-2` and added `enabled` to its `result` -- a caller
+    reading that response cannot be broken by a field appearing, which is the
+    provenance rule f034a2a already applies to severity and never applied here.
+    """
+    if before.kind != after.kind or before.enum != after.enum:
+        return False
+    if not response_only:
+        return _view_shape(before, old) == _view_shape(after, new)
+    if not set(before.required) <= set(after.required):
+        return False
+    for field_name, field in before.fields.items():
+        replacement = after.fields.get(field_name)
+        if replacement is None:
+            return False
+        if not _shape_presents(_field_shape(field, old),
+                               _field_shape(replacement, new)):
+            return False
+    return True
+
+
 def _renamed_at_roots(name: str, view, direct: Sequence[str],
                       old: Spec, new: Spec,
-                      new_roots: Dict[str, Set[str]]) -> bool:
+                      new_roots: Dict[str, Set[str]],
+                      response_only: bool = False) -> bool:
     """Did every operation that named this schema simply start naming another
     schema of the identical shape?
 
@@ -1262,10 +1317,9 @@ def _renamed_at_roots(name: str, view, direct: Sequence[str],
     """
     if not direct:
         return False
-    want = _view_shape(view, old)
     for op_key in direct:
         candidates = new_roots.get(op_key) or set()
-        if not any(_view_shape(new.schemas[c], new) == want
+        if not any(_still_presents(view, new.schemas[c], old, new, response_only)
                    for c in candidates if c in new.schemas):
             return False
     return True
@@ -1360,7 +1414,12 @@ def _removal_is_observable(
         carrying = [op for op in direct if op in new_names]
         if not carrying:
             return False, "subsumed"
-        if _renamed_at_roots(name, view, carrying, old, new, new_roots or {}):
+        # A schema a caller only ever READS cannot be broken by the renamed
+        # replacement carrying MORE than it did.
+        response_only = (old.used_in_responses(name)
+                         and not old.used_in_requests(name))
+        if _renamed_at_roots(name, view, carrying, old, new, new_roots or {},
+                             response_only):
             return False, "renamed"
         # This branch, and only this branch, reads the flattened field names.
         # Past `MAX_DEPTH` a name is invisible on that side, so "it is still
