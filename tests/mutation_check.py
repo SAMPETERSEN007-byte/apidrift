@@ -1223,6 +1223,27 @@ MUTATIONS = [
         ["test_an_unterminated_string_is_reported_not_guessed",
          "test_an_unterminated_string_in_real_code_still_raises"],
     ),
+    (
+        "an untraced read is dependence again",
+        "apidrift/js_dependence.py",
+        "        if traced_only and chain is None:\n            continue",
+        "        if False:\n            continue",
+        ["test_a_read_of_a_generic_name_on_UNRELATED_data_is_not_dependence"],
+    ),
+    (
+        "route 2 stops requiring a call to a carrying operation",
+        "apidrift/js_dependence.py",
+        "    calls = _operation_calls(module, bindings, method, path, lines)\n    if not calls:\n        return [], (f\"reads `{leaf}` but never calls an operation that \"\n                    f\"carries it\")",
+        "    calls = []\n    if False:\n        pass",
+        ["test_a_read_of_a_generic_name_on_UNRELATED_data_is_not_dependence"],
+    ),
+    (
+        "a traced read stops being accepted",
+        "apidrift/js_dependence.py",
+        "    traced = _reads_of(module, leaf, bindings, lines, traced_only=True)\n    if traced:\n        return traced, \"\"",
+        "    traced = []\n    if traced:\n        return traced, \"\"",
+        ["test_a_traced_read_stands_ALONE_when_the_path_does_not_match"],
+    ),
 ]
 
 

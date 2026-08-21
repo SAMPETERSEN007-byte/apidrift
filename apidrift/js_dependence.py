@@ -170,20 +170,33 @@ def _operation_calls(module: Module, bindings: Set[str], method: str,
 
 
 def _reads_of(module: Module, leaf: str, bindings: Set[str],
-              lines: Sequence[str]) -> List[Proof]:
-    """Reads of `leaf` off a variable a vendor call was assigned to."""
-    sources = {call.assigned_to for call in module.calls
-               if call.assigned_to and call.chain and call.chain[0] in bindings}
+              lines: Sequence[str], traced_only: bool = False) -> List[Proof]:
+    """Reads of `leaf`, optionally only where the value came from this vendor.
+
+    `traced_only` is the difference between dependence and coincidence. Without
+    it this returned every `.name`, `.id` and `.user` in the file: Langfuse's
+    `_app.tsx` was reported as depending on Sentry's replay endpoint because it
+    reads `error.name` off a DOMException and `sessionUser.id` off NextAuth.
+    That is co-location, which took three adversarial audits to remove from the
+    Python prover and which I reintroduced here by reading only half its
+    contract.
+    """
+    origin: Dict[str, Tuple[str, ...]] = {
+        call.assigned_to: call.chain for call in module.calls
+        if call.assigned_to and call.chain and call.chain[0] in bindings}
     found: List[Proof] = []
     for read in module.reads:
         if leaf not in read.path:
             continue
-        traced = read.base in sources
-        found.append(Proof(
-            kind=FIELD_READ, line=read.line, text=_text_at(lines, read.line),
-            chain=[f"reads `{read.base}.{'.'.join(read.path)}`"] +
-                  ([f"and `{read.base}` came from a `{'.'.join(next(c.chain for c in module.calls if c.assigned_to == read.base))}` call"]
-                   if traced else [])))
+        chain = origin.get(read.base)
+        if traced_only and chain is None:
+            continue
+        proof_chain = [f"reads `{read.base}.{'.'.join(read.path)}`"]
+        if chain is not None:
+            proof_chain.append(
+                f"and `{read.base}` came from `{'.'.join(chain)}(...)`")
+        found.append(Proof(kind=FIELD_READ, line=read.line,
+                           text=_text_at(lines, read.line), chain=proof_chain))
     return found
 
 
@@ -256,18 +269,43 @@ def prove(source: str, finding: Finding, vendor: Vendor) -> Tuple[List[Proof], s
             return touched, ""
         return calls, ""
 
-    # Field-level changes. Direction decides which half of the file to look at.
+    # Field-level changes. Two routes, and the second needs BOTH halves --
+    # mirroring `dependence.prove()`, whose contract is a read of the field AND
+    # a call to an operation that carries it. Taking only the first half is
+    # co-location: it reported Langfuse as depending on Sentry's replay
+    # endpoint for reading `error.name` off a DOMException.
     if not leaf:
         return [], "the change names no field to check for"
     if finding.kind.startswith("request_") or finding.in_request:
         sends = _sends_of(module, leaf, bindings, lines)
-        if sends:
-            return sends, ""
-        return [], f"never sends `{leaf}` to this vendor"
+        if not sends:
+            return [], f"never sends `{leaf}` to this vendor"
+        if not _operation_calls(module, bindings, method, path, lines):
+            return [], (f"sends `{leaf}` but never calls an operation that "
+                        f"accepts it")
+        return sends, ""
+
+    # Route 1: the value is traced to a vendor call and the field is read off
+    # it. Dependence end to end, and it needs nothing else.
+    traced = _reads_of(module, leaf, bindings, lines, traced_only=True)
+    if traced:
+        return traced, ""
+
+    # Route 2: the field is read somewhere, AND this file calls an operation
+    # that carries it. Needed because most reads happen on a function
+    # parameter whose origin is in the caller and not visible here.
     reads = _reads_of(module, leaf, bindings, lines)
-    if reads:
-        return reads, ""
-    return [], f"never reads `{leaf}` off a value from this vendor"
+    if not reads:
+        return [], f"never reads `{leaf}` off a value from this vendor"
+    calls = _operation_calls(module, bindings, method, path, lines)
+    if not calls:
+        return [], (f"reads `{leaf}` but never calls an operation that "
+                    f"carries it")
+    anchor = calls[0].text[:60]
+    return ([Proof(kind=p.kind, line=p.line, text=p.text,
+                   chain=p.chain + [f"and this file calls `{anchor}`, an "
+                                    f"operation carrying the changed schema"])
+             for p in reads], "")
 
 
 def prove_relevance(source: str, addition: Finding,

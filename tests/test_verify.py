@@ -304,6 +304,58 @@ class TestUnprovableLanguages(unittest.TestCase):
         self.assertNotEqual(verdict, CONFIRMED, reason)
         self.assertIn("never sends", reason)
 
+    def test_a_read_of_a_generic_name_on_UNRELATED_data_is_not_dependence(self):
+        """The defect this test exists for, taken verbatim from real code.
+
+        Langfuse's `_app.tsx` was reported as depending on Sentry's replay
+        endpoint because it reads `error.name` off a DOMException. Twenty-seven
+        impacts across three real repositories were this: `.name`, `.id`,
+        `.user` read off NextAuth sessions, DOM exceptions and PostHog calls.
+
+        Co-location is not dependence. It took three adversarial audits to
+        remove that from the Python prover and I reintroduced it here by
+        implementing only half its contract -- a read, without the call to an
+        operation that carries the field.
+        """
+        source = ('import Stripe from "stripe";\n'
+                  'const stripe = new Stripe(k);\n'
+                  'try { risky(); } catch (error) {\n'
+                  '  if (error.iin === "NotFound") { return null; }\n'
+                  '}\n')
+        verdict, reason, _, _ = verify_source(source, "app.ts", finding(), STRIPE)
+        self.assertNotEqual(verdict, CONFIRMED, reason)
+        self.assertIn("never calls an operation that carries it", reason)
+
+    def test_a_read_TRACED_to_a_vendor_call_is_still_dependence(self):
+        """The control. The fix must remove coincidence, not evidence."""
+        source = ('import Stripe from "stripe";\n'
+                  'const stripe = new Stripe(k);\n'
+                  'const c = await stripe.customers.retrieve(id);\n'
+                  'return c.iin;\n')
+        verdict, reason, _, sites = verify_source(
+            source, "app.ts", finding(), STRIPE)
+        self.assertEqual(CONFIRMED, verdict, reason)
+        self.assertIn("came from", " ".join(sites[0].chain))
+
+    def test_a_traced_read_stands_ALONE_when_the_path_does_not_match(self):
+        """The case where tracing is the only route left.
+
+        The value demonstrably came from this vendor and the changed field is
+        read off it. That is dependence end to end, and it does not need the
+        path matcher to agree -- which matters, because the path here belongs
+        to a different resource than the SDK chain names. Written this way on
+        purpose: with the call and the finding on the same resource, route 2
+        also succeeds and the two are indistinguishable.
+        """
+        source = ('import Stripe from "stripe";\n'
+                  'const stripe = new Stripe(k);\n'
+                  'const c = await stripe.customers.retrieve(id);\n'
+                  'return c.iin;\n')
+        elsewhere = finding(path="/v1/issuing/cards", method="post")
+        verdict, reason, _, _ = verify_source(
+            source, "app.ts", elsewhere, STRIPE)
+        self.assertEqual(CONFIRMED, verdict, reason)
+
     def test_javascript_this_cannot_read_is_unproven_not_clean(self):
         """An unterminated string means the tokeniser stopped early. A file
         read halfway is not a file that was checked."""
