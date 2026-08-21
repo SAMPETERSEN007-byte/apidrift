@@ -1082,6 +1082,60 @@ MUTATIONS = [
         ["test_a_json_array_is_a_parse_error_not_a_crash",
          "test_a_yaml_scalar_is_a_parse_error_not_a_crash"],
     ),
+    # ---------------------------------------------------------------------
+    # The JavaScript/TypeScript reader. Its failure mode is not missing a
+    # construct -- it is INVENTING a call site, so every needle here is about
+    # reading something wrongly rather than not reading it.
+    # ---------------------------------------------------------------------
+    (
+        "a slash after a value is read as a regex again",
+        "apidrift/js.py",
+        "        if last_significant.kind in (NUMBER, STRING, TEMPLATE, REGEX):\n            return False",
+        "        if False:\n            return False",
+        ["test_division_is_not_a_regex"],
+    ),
+    (
+        "a slash after an operator stops being a regex",
+        "apidrift/js.py",
+        "        return last_significant.text not in _VALUE_ENDERS",
+        "        return False",
+        ["test_a_regex_literal_is_not_division"],
+    ),
+    (
+        "an unterminated string is guessed at instead of reported",
+        "apidrift/js.py",
+        "            raise UnreadableSource(f\"unterminated string at line {line}\")\n        chunks.append(char)",
+        "            return index + 1, line, \"\".join(chunks)\n        chunks.append(char)",
+        ["test_an_unterminated_string_is_reported_not_guessed"],
+    ),
+    (
+        "import.meta is treated as an import declaration again",
+        "apidrift/js.py",
+        "            if following in (\".\", \"(\"):\n                continue",
+        "            if False:\n                continue",
+        ["test_import_meta_is_not_an_import_declaration"],
+    ),
+    (
+        "object keys are read at the wrong nesting depth",
+        "apidrift/js.py",
+        "        elif depth == key_depth and tokens[position].kind in (NAME, STRING, KEYWORD):",
+        "        elif depth == 1 and tokens[position].kind in (NAME, STRING, KEYWORD):",
+        ["test_object_argument_keys_are_what_the_caller_SENDS"],
+    ),
+    (
+        "await hides the variable a call is bound to",
+        "apidrift/js.py",
+        "    while position >= 0 and tokens[position].kind == KEYWORD \\\n            and tokens[position].text == \"await\":\n        position -= 1",
+        "    pass",
+        ["test_an_awaited_call_is_still_bound_to_its_variable"],
+    ),
+    (
+        "a segment of a call chain is recorded as a property read",
+        "apidrift/js.py",
+        "                    is_call = True\n                    break",
+        "                    break",
+        ["test_a_call_is_not_also_recorded_as_a_read"],
+    ),
 ]
 
 
