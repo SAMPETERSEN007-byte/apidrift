@@ -1053,6 +1053,27 @@ MUTATIONS = [
         "            for node in (doc,):",
         ["test_a_host_move_on_one_operation_is_confirmed"],
     ),
+    (
+        "the checker asks only whether the PATH survives",
+        "tests/measure_precision.py",
+        "        was, now = verbs(old, wanted), verbs(new, wanted)",
+        "        was, now = ({finding['method'].lower()} if wanted in [__import__('re').sub(r'\\{[^}]*\\}', '{}', p) for p in (old.get('paths') or {})] else set()), ({finding['method'].lower()} if wanted in [__import__('re').sub(r'\\{[^}]*\\}', '{}', p) for p in (new.get('paths') or {})] else set())",
+        ["test_removing_one_VERB_from_a_live_path_is_confirmed"],
+    ),
+    (
+        "the checker stops normalising path parameter names",
+        "tests/measure_precision.py",
+        "                if erased.sub(\"{}\", str(path)) != wanted or not isinstance(item, dict):",
+        "                if str(path) != wanted or not isinstance(item, dict):",
+        ["test_a_path_parameter_rename_is_not_a_removal"],
+    ),
+    (
+        "the checker refutes instead of abstaining on an absent old path",
+        "tests/measure_precision.py",
+        "        if not was:\n            return UNDECIDABLE, f\"`{finding['path']}` is absent from the old spec too\"",
+        "        if False:\n            return UNDECIDABLE, \"\"",
+        ["test_a_path_absent_from_the_OLD_spec_is_undecidable"],
+    ),
 ]
 
 

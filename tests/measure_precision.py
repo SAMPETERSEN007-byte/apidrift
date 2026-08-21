@@ -347,12 +347,41 @@ def check(finding: Dict[str, Any], old: Dict[str, Any], new: Dict[str, Any],
                          f"new_path in new={new_path in new_paths}")
 
     if kind == "endpoint_removed":
-        path = finding["path"]
-        in_old = path in (old.get("paths") or {})
-        in_new = path in (new.get("paths") or {})
-        if in_old and not in_new:
-            return CONFIRMED, "path present at old, absent at new"
-        return REFUTED, f"path old={in_old} new={in_new}"
+        # An endpoint is a METHOD at a PATH, and this asked only about the
+        # path. Removing `GET /emails` while `POST /emails` stays is a total
+        # break for every reader of that collection, and it read as "path
+        # present in both" and was refuted. Caught by injecting exactly that
+        # into Resend's real spec: the engine found it, this refuted it, and
+        # the engine was right.
+        #
+        # A path parameter's NAME never reaches the wire, so the comparison is
+        # made on the normalised template -- otherwise a vendor renaming
+        # `{Sid}` to `{id}` looks like a removal plus an addition. That
+        # normalisation is written here rather than imported, for the same
+        # reason as everywhere else in this file.
+        erased = re.compile(r"\{[^}]*\}")
+
+        def verbs(doc, wanted):
+            found = set()
+            for path, item in (doc.get("paths") or {}).items():
+                if erased.sub("{}", str(path)) != wanted or not isinstance(item, dict):
+                    continue
+                found |= {m for m in ("get", "post", "put", "patch", "delete",
+                                      "options", "head", "trace")
+                          if isinstance(item.get(m), dict)}
+            return found
+
+        method = finding["method"].lower()
+        wanted = erased.sub("{}", finding["path"])
+        was, now = verbs(old, wanted), verbs(new, wanted)
+        if not was:
+            return UNDECIDABLE, f"`{finding['path']}` is absent from the old spec too"
+        if method in was and method not in now:
+            others = ", ".join(sorted(now)) or "nothing"
+            return CONFIRMED, (f"`{method.upper()} {finding['path']}` present at "
+                               f"old, absent at new ({others} remain there)")
+        return REFUTED, (f"`{method.upper()}` old={method in was} "
+                         f"new={method in now}")
 
     if kind == "security_requirement_added":
         op_old = find_operation(old, finding["op_key"])

@@ -146,6 +146,56 @@ class TestResponseFieldRemoved(unittest.TestCase):
         self.assertEqual(CONFIRMED, verdict, why)
 
 
+class TestEndpointRemoved(unittest.TestCase):
+    """An endpoint is a METHOD at a PATH, and the checker asked only about the
+    path.
+
+    Found by injecting a removal of `GET /emails` into Resend's real spec while
+    `POST /emails` stayed. The engine reported it, this refuted it as "path
+    present in both", and the engine was right -- every reader of that
+    collection breaks. The five refutations of this kind in the corpus were
+    never the engine's five.
+    """
+
+    def _doc(self, verbs, path="/emails"):
+        item = {v: {"responses": resp({"type": "object"})} for v in verbs}
+        return doc({}, {path: item})
+
+    def test_removing_one_VERB_from_a_live_path_is_confirmed(self):
+        verdict, why = check(
+            finding("endpoint_removed", path="/emails", method="GET",
+                    op_key="GET /emails"),
+            self._doc(["get", "post"]), self._doc(["post"]), [], [])
+        self.assertEqual(CONFIRMED, verdict, why)
+        self.assertIn("post remain", why)
+
+    def test_a_verb_that_is_still_there_is_refuted(self):
+        verdict, why = check(
+            finding("endpoint_removed", path="/emails", method="GET",
+                    op_key="GET /emails"),
+            self._doc(["get", "post"]), self._doc(["get"]), [], [])
+        self.assertEqual(REFUTED, verdict, why)
+
+    def test_a_path_parameter_rename_is_not_a_removal(self):
+        """`{Sid}` -> `{id}` produces byte-identical URLs, so the normalised
+        template is what gets compared."""
+        verdict, why = check(
+            finding("endpoint_removed", path="/emails/{Sid}", method="GET",
+                    op_key="GET /emails/{Sid}"),
+            self._doc(["get"], "/emails/{Sid}"),
+            self._doc(["get"], "/emails/{id}"), [], [])
+        self.assertEqual(REFUTED, verdict, why)
+
+    def test_a_path_absent_from_the_OLD_spec_is_undecidable(self):
+        """Not refuted. Nothing about the old document supports either verdict,
+        and saying "not a break" would be an answer this cannot justify."""
+        verdict, why = check(
+            finding("endpoint_removed", path="/ghost", method="GET",
+                    op_key="GET /ghost"),
+            self._doc(["get"]), self._doc(["get"]), [], [])
+        self.assertEqual(UNDECIDABLE, verdict, why)
+
+
 class TestParamTypeChanged(unittest.TestCase):
     def _docs(self, old_schema, new_schema, where="path"):
         def one(schema):
