@@ -119,6 +119,51 @@ def reaches_through_sdk(source: str, vendor: Vendor) -> bool:
     return False
 
 
+def pinned_sdk_version(root: Path, vendor: Vendor) -> str:
+    """The SDK release this repo declares for `vendor`, if it declares one.
+
+    "You are pinned" is not actionable; "you are pinned to `stripe@^17.4.0`" is,
+    because that is the number a reader can look up and the number that changes
+    on the day the break arrives. Read from the manifests a checkout actually
+    carries -- `package.json`, `requirements.txt`, `pyproject.toml` -- never
+    from `node_modules`, which is usually absent.
+
+    Deliberately reports the DECLARED range verbatim rather than resolving it.
+    Resolving `^17.4.0` to the release that would install today is a claim about
+    a registry this tool cannot see, and a wrong version number here would be
+    worse than none: it is the input to the only question that matters for a
+    dated-version vendor, which is what changed BETWEEN two API versions.
+    """
+    packages = set(_SDK_PACKAGES.get(vendor.key, ())) | {vendor.key}
+    for name in ("package.json", "requirements.txt", "pyproject.toml",
+                 "Pipfile", "setup.py"):
+        path = root / name
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if name == "package.json":
+            try:
+                doc = json.loads(text)
+            except ValueError:
+                continue
+            for section in ("dependencies", "devDependencies",
+                            "peerDependencies", "optionalDependencies"):
+                for pkg, spec in (doc.get(section) or {}).items():
+                    if pkg in packages:
+                        return f"{pkg}@{spec}"
+            continue
+        for line in text.splitlines():
+            stripped = line.strip().strip('"\'')
+            for pkg in packages:
+                if re.match(rf"^{re.escape(pkg)}\s*(==|>=|~=|\^|=|,|\[)", stripped) \
+                        or re.match(rf"^{re.escape(pkg)}$", stripped):
+                    return stripped.rstrip(",").strip()
+    return ""
+
+
 def _is_incidental(rel_path: str) -> bool:
     lowered = "/" + rel_path.lower()
     return any(marker in lowered for marker in _TEST_MARKERS)
@@ -215,6 +260,9 @@ class ScanResult:
     # does not describe what these files receive. Reported, never counted as
     # clean and never counted as broken -- see `Vendor.versioned`.
     pinned: Dict[str, List[str]] = field(default_factory=dict)
+    # {vendor_key: "stripe@^17.4.0"} — the SDK release the repo DECLARES, read
+    # from its manifests. The number a reader can act on.
+    pinned_versions: Dict[str, str] = field(default_factory=dict)
 
     @property
     def unmeasured_files(self) -> int:
@@ -249,6 +297,7 @@ class ScanResult:
             "unmeasured": self.unmeasured,
             "short_history": self.short_history,
             "pinned": self.pinned,
+            "pinned_versions": self.pinned_versions,
             "pinned_files": self.pinned_files,
             "unmeasured_files": self.unmeasured_files,
             "impacts": [i.as_dict() for i in self.impacts],
@@ -472,6 +521,9 @@ def scan_repo(
                       if reaches_through_sdk(source, vendor)]
             if pinned:
                 result.pinned[key] = sorted(pinned)
+                declared = pinned_sdk_version(root, vendor)
+                if declared:
+                    result.pinned_versions[key] = declared
                 provable = [(rel, src) for rel, src in files
                             if rel not in set(pinned)]
 
@@ -795,7 +847,9 @@ def _pinned_lines(result: ScanResult) -> List[str]:
         vendor = get(key)
         shown = ", ".join(files[:3])
         more = f" and {len(files) - 3} more" if len(files) > 3 else ""
-        out.append(f"  {vendor.name}: {len(files)} file(s) — {shown}{more}")
+        declared = result.pinned_versions.get(key)
+        at = f" [{declared}]" if declared else ""
+        out.append(f"  {vendor.name}{at}: {len(files)} file(s) — {shown}{more}")
     out.append("  This vendor serves dated API versions and its SDK sends the "
                "one it shipped with,")
     out.append("  so drift at HEAD does not describe what these files receive. "

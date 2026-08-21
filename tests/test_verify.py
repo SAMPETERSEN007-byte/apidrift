@@ -1173,3 +1173,34 @@ class TestAMemberChainNeedsProvenance(unittest.TestCase):
         source = "collaborators.append(x)\n"
         self.assertEqual([], find_sdk_calls(ast.parse(source), ["collaborators"],
                                             source.splitlines()))
+
+
+class TestTheReachCacheIsKeyedOnContent(unittest.TestCase):
+    """A memo keyed on `id()` hands one finding another finding's answer.
+
+    CPython reuses the address of a collected object. The first version of this
+    cache was keyed on `id(finding)` and the langfuse control began reporting
+    "never calls an operation that carries it" for a finding whose operation
+    list was fine — it had inherited a dead object's.
+
+    Asserted on the KEY, not on a forced collision. Address reuse is real but
+    not reliably reproducible: the same mutation failed the suite once and
+    passed it the next run, which makes a collision test a coin flip and a
+    coin flip is not a gate.
+    """
+
+    def test_the_memo_is_keyed_on_the_operation_list_not_an_address(self):
+        from apidrift.js_dependence import _PATHS_CACHE, _change_operation_paths
+        ops = ("GET /v1/invoices/{invoice}", "POST /v1/invoices")
+        _change_operation_paths(finding(ops=ops))
+        self.assertIn(ops, _PATHS_CACHE)
+        self.assertFalse([k for k in _PATHS_CACHE if isinstance(k, int)],
+                         "an integer key is an address, and addresses are reused")
+
+    def test_the_cache_returns_the_same_answer_for_the_same_content(self):
+        from apidrift.js_dependence import _change_operation_paths
+        a = finding(ops=("GET /v1/charges", "POST /v1/charges"))
+        b = finding(ops=("GET /v1/charges", "POST /v1/charges"))
+        self.assertEqual(_change_operation_paths(a), _change_operation_paths(b))
+        self.assertEqual(["/v1/charges", "/v1/charges"],
+                         _change_operation_paths(a))

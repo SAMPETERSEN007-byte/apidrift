@@ -2001,6 +2001,29 @@ MUTATIONS = [
         ["test_a_test_file_impact_is_split_out_of_the_exit_status"],
     ),
 
+    (
+        "the pin stops naming the release, so the report is not actionable",
+        "apidrift/scan.py",
+        "                declared = pinned_sdk_version(root, vendor)",
+        "                declared = \"\"",
+        ["test_the_pin_names_the_declared_release"],
+    ),
+    (
+        "any package whose name merely starts with the SDK's counts",
+        "apidrift/scan.py",
+        "                    if pkg in packages:",
+        "                    if any(pkg.startswith(p) for p in packages):",
+        ["test_a_similarly_named_package_is_not_the_sdk"],
+    ),
+
+    (
+        "the reach memo goes back to an id() key, so findings share answers",
+        "apidrift/js_dependence.py",
+        "    key = tuple(finding.affected_ops or ())\n    cached = _PATHS_CACHE.get(key)",
+        "    key = id(finding)\n    cached = _PATHS_CACHE.get(key)",
+        ["test_the_memo_is_keyed_on_the_operation_list_not_an_address"],
+    ),
+
 ]
 
 

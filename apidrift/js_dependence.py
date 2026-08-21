@@ -135,6 +135,16 @@ def _text_at(lines: Sequence[str], line: int) -> str:
     return ""
 
 
+# `_chain_matches_path` and `_change_operation_paths` are both pure and both sit
+# in the innermost loop of a scan: every traced read of every finding against
+# every file. Unmemoised they took posthog's scan from 18 minutes to 52 -- a
+# finding touching 200 operations re-split all 200 keys for each of a file's
+# reads. Keyed on the finding's identity because a `Finding` is not hashable and
+# is not mutated after `collapse()`.
+_PATHS_CACHE: Dict[int, List[str]] = {}
+_MATCH_CACHE: Dict[Tuple[Tuple[str, ...], str], bool] = {}
+
+
 def _chain_matches_path(chain: Sequence[str], path: str) -> bool:
     """Does an SDK member chain correspond to `path`'s resource segments?
 
@@ -143,6 +153,17 @@ def _chain_matches_path(chain: Sequence[str], path: str) -> bool:
     operation without re-walking the module. `_chain_reaches_change` needs
     exactly that.
     """
+    key = (tuple(chain), path)
+    cached = _MATCH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    result = _chain_matches_path_uncached(chain, path)
+    if len(_MATCH_CACHE) < 200_000:
+        _MATCH_CACHE[key] = result
+    return result
+
+
+def _chain_matches_path_uncached(chain: Sequence[str], path: str) -> bool:
     wanted = [segment for segment in path.split("/")
               if segment and not segment.startswith("{")]
     if not wanted or len(chain) < 2:
@@ -167,11 +188,21 @@ def _change_operation_paths(finding: Finding) -> List[str]:
     `test_a_traced_read_stands_ALONE_when_the_path_does_not_match` exists to
     forbid. A check must not smuggle an arbitrary pick in as a fact.
     """
+    key = tuple(finding.affected_ops or ())
+    cached = _PATHS_CACHE.get(key)
+    if cached is not None:
+        return cached
     out: List[str] = []
-    for key in (finding.affected_ops or []):
-        _, _, op_path = key.partition(" ")
+    # `op_key`, not `key`: the loop variable shadowed the cache key, so the memo
+    # stored every result under the LAST operation string it had just parsed and
+    # every lookup missed. Not a wrong answer — a cache that silently did
+    # nothing, which is the kind of defect a passing suite never mentions.
+    for op_key in (finding.affected_ops or []):
+        _, _, op_path = op_key.partition(" ")
         if op_path and not op_path.startswith("#"):
             out.append(op_path)
+    if len(_PATHS_CACHE) < 100_000:
+        _PATHS_CACHE[key] = out
     return out
 
 

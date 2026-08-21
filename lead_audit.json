@@ -58,20 +58,21 @@
   },
   "scan_standing": {
     "_comment": "The scan is a different vantage point from the leads and needs its own record. An Impact is a claim about a REPO; a finding is a claim about a SPEC diff. They are measured separately.",
-    "measured": "2026-08-20",
-    "corpus": "22 public repositories that genuinely call these five vendors, full checkouts",
+    "measured": "2026-08-21",
+    "corpus": "22 public repositories that genuinely call these vendors, full checkouts, scanned at a 1095-day window. The previous corpus was the same repositories at 90 days, which is why it found nothing: the code was written years before the window opened.",
     "impacts_found": 0,
     "false_positives_found_and_fixed": 4,
     "note": "All four initial impacts were refuted by hand against the source and the raw spec, and all four classes are now gated: a read proving a request-side change (phasehq/console), a keyword argument on the repo's OWN constructor counted as a request body (phasehq/console), and two of the same in autoevals/agentops. Zero impacts across 22 repos is a MEASUREMENT, not an absence \u2014 the Plaid fixture control still fires at the right line with exit 1.",
     "known_blind_spots": [
-      "Dependence is provable in Python only. Callers in other languages are now COUNTED and reported as UNMEASURED rather than silently passing as clean \u2014 a TypeScript-only repo calling a deleted Plaid endpoint previously reported 'clean, exit 0'.",
-      "API version pinning is not modelled at all. A caller pinned to an older Stripe/Plaid version is not affected by a change to the latest, and nothing in the engine looks for a pin.",
-      "The relocation suppressor consults a field map flattened at MAX_DEPTH=2, so it cannot see a name nested deeper and abstains silently rather than marking the finding unchecked.",
-      "The spec cache is not fetched by default, so a scan can be run against a stale clone.",
-      "_Assignments is one flat module-level dict, so def-use tracing is scope-blind and flow-insensitive across function boundaries."
+      "API version pinning is now MODELLED for stripe/plaid/klaviyo/square, but only as an abstention. The tool cannot read which version an SDK release actually sends, so it reports UNMEASURED rather than diffing between the old SDK's version and the new one -- which is the diff a caller actually meets, on the day they upgrade.",
+      "The relocation suppressor consults a field map flattened at MAX_DEPTH=2 and abstains silently rather than marking the finding unchecked.",
+      "The spec cache is not fetched by default; a scan can run against a stale clone. `--fetch` is opt-in.",
+      "`_Assignments` is one flat module-level dict, so def-use tracing is scope-blind and flow-insensitive across function boundaries.",
+      "`--days` defaults to 90, which is the wrong default for the question. It has NOT been changed, because a longer default multiplies the population and the population is not yet audited clean.",
+      "Every language other than Python and JavaScript/TypeScript is counted and reported as UNMEASURED, never passed as clean."
     ],
     "pr_enabled": false,
-    "pr_blocker": "No write path exists and none should be added before a fourth adversarial audit samples IMPACTS from scan.py against real repos. Opening a pull request into someone else's repository is a larger outward-facing act than sending an email, and gate.sh already refuses to let the email ship.",
+    "pr_blocker": "The fourth adversarial audit RAN on 2026-08-21 and found nothing to open a pull request about: 74 impacts sampled, 0 real. Five classes are now closed and the population must be re-audited before this flips -- a SMALLER population is not a MEASURED one. A fifth audit must sample the impacts that survive the fixes, and it must include the raw-HTTP callers specifically, because pinning removed every SDK caller of the biggest vendor from the judgeable population and nobody has yet checked what is left.",
     "vendor_coverage": {
       "measured": "2026-08-20",
       "note": "tools/vendor_check.py could not import until this session -- it was moved into tools/ and its sys.path and cache paths still pointed at the repo root, so every run died on line 12. The '20/22 working' number came from a copy that no longer exists.",
@@ -140,7 +141,83 @@
         "`_leaf_of` and `_named_identifier` disagreeing about what a finding names, so the scan prefilter demanded a SCHEMA name appear in source",
         "a conflict resolution that kept a CONTROLS registry entry while dropping the function it names"
       ]
-    }
+    },
+    "window_note": "\ud83d\udea8 `--days 90` is the wrong default for the question `scan` asks. Integration code is written once and left; the caller's question is 'what has moved since we wrote this', not 'what moved this quarter'. 90 days: 0 impacts across 22 repos. 1095 days: 414. The zero was a window artefact and was read as precision for a whole day.",
+    "audits": [
+      {
+        "date": "2026-08-21",
+        "run": "wf_ffc26e20-6f4",
+        "what": "Fourth adversarial audit, and the FIRST ever aimed at scan.py IMPACTS rather than leads -- the thing `pr_blocker` demanded.",
+        "population": 295,
+        "sampled": 74,
+        "method": "Stratified over every (kind, vendor) pair, max 3 per repo per stratum. Thirteen independent skeptics, ~6 impacts each, instructed to refute by default and to produce BOTH the production line whose behaviour changes and the raw-spec fact that makes it so. Every claim that survived went to two more refuters with different lenses (the code path, the spec document). Auditors read the raw documents through tools/spec_snapshot.py, which parses nothing and decides nothing.",
+        "real": 0,
+        "false": 66,
+        "test_only": 8,
+        "undecidable": 0,
+        "impact_precision": "0/66 on independently decidable impacts",
+        "note": "The findings engine measured 100% in the same run. An IMPACT is a claim about a REPO and a FINDING is a claim about a SPEC DIFF; nothing had ever measured the first one, and it was 0%.",
+        "mechanisms": {
+          "read_at_wrong_position": 21,
+          "request_field_type_widened": 6,
+          "read_on_wrong_object": 4,
+          "identifier_name_collision": 3,
+          "test_file_string_literal": 3,
+          "local_method_call_not_api_operation": 3,
+          "wrong_schema_object": 3,
+          "call_site_is_not_an_api_call": 3,
+          "api_version_pinned": 3,
+          "local_function_not_vendor_call": 2,
+          "field_still_present_in_new_spec": 2,
+          "field_still_present_in_oneof_arm": 2,
+          "security_only_documented": 2,
+          "schema_renamed_not_removed": 2,
+          "cited_line_is_test_file": 1,
+          "response_type_widened": 1,
+          "operation_still_exists": 1,
+          "enum_value_not_used_by_caller": 1,
+          "request_body_alternative_added": 1,
+          "cited_line_is_test_fixture": 1,
+          "wrong_operation_attributed": 1,
+          "string_literal_matched_as_operation": 1,
+          "-": 1,
+          "nullable_rewritten_as_anyof_null": 1,
+          "request_write_matched_to_response_schema": 1,
+          "type_refactored_to_ref_same_shape": 1,
+          "test_file_cited": 1,
+          "ref_extraction_not_a_type_change": 1,
+          "spec_documented_preexisting_auth": 1
+        }
+      }
+    ],
+    "impacts_found_note": "0 SURVIVING an adversarial audit -- not 0 emitted. The engine emitted 295 at a three-year window and the audit refuted every sampled one.",
+    "false_positive_classes_closed_2026_08_21": {
+      "read_at_wrong_position": "21/74. A read matched on its LEAF WORD with nothing checking that it sat where the subject says. `subscription.currency` proved `<deleted_discount>.coupon.currency`. Closed by dependence.read_sits_where_subject_says (position) AND js_dependence._chain_reaches_change (reach) -- two questions, both needed: `subscription.discount.customer` passes reach and dies on position.",
+      "member_chain_without_provenance": "~13/74 across identifier_name_collision, local_function_not_vendor_call, local_method_call_not_api_operation, call_site_is_not_an_api_call, string_literal_matched_as_operation. `find_sdk_calls` accepted any chain whose spelling started with an idiom: a local list's `.append`, a dict's `.get`, the `secrets` stdlib module. Closed by requiring call_reaches_vendor on the chain's root, which is the gate JavaScript always had.",
+      "api_version_pinned": "3/74 sampled and structurally much larger. A dated-version vendor does not break a caller on an older version -- that is what the version is for. Closed by Vendor.versioned + ScanResult.pinned: SDK callers of stripe/plaid/klaviyo/square are UNMEASURED, raw-HTTP callers are still judged.",
+      "nullable_rewritten_as_anyof_null": "OpenAPI 3.1 deleted `nullable`. Two OpenAI fields alone were 75 of the 295. Closed by loader._nullable_wrapper_payload in the schema view.",
+      "security_only_documented": "23 in the population. A document with no `securitySchemes` at all has no vocabulary for auth and its silence is undocumented, not unauthenticated. Closed by counting the old document's schemes and abstaining at zero.",
+      "cited_line_is_a_test_file": "8/74. Split into ScanResult.incidental and out of the exit status. Reported, never counted."
+    },
+    "open_after_2026_08_21": {
+      "request_field_type_widened": "6/74 and unfixed. `messages[]: object -> oneOf[...]`, `temperature: number -> anyOf[number, null]`. A request position that gains alternatives still accepts everything it accepted before. Same family as the response-side union-arm class already left open on purpose: the only rule that decides it is 'does every alternative still accept this', which is the question the CHECKER asks, and building it twice is how this project shipped the same defect six times.",
+      "type_refactored_to_ref_same_shape": "`CreateChatCompletionRequest.model: anyOf -> ->ModelIdsShared` where ModelIdsShared IS that anyOf. Extraction is notation. 32 in the population. The inlining direction is already closed (533babd); this is the same rule with the arrow reversed.",
+      "schema_renamed_not_removed": "2/74.",
+      "field_still_present_in_oneof_arm": "2/74, the union-arm class again."
+    },
+    "population_after_the_fixes": {
+      "measured": "2026-08-21",
+      "corpus": "the same 22 repositories, same 1095-day window",
+      "before": 414,
+      "after": 65,
+      "note": "A SMALLER population is not a MEASURED one. These 65 have NOT been audited; the 74-impact sample that produced 0/66 was drawn from the 295 that stood after position and reach, and every class closed since removes members of it.",
+      "what_dominates_what_is_left": {
+        "openai_request_widening": "22 of 65. `CreateChatCompletionRequest.model: anyOf -> ->ModelIdsShared` and `messages[]: object -> oneOf`. A request position that gains alternatives still accepts everything it accepted before, and `model`'s union carries a bare `{type: string}` arm on BOTH sides, so nothing was ever narrowed.",
+        "github_response_union_widening": "22 of 65. `integration.owner` and `commit.author` went from `anyOf: [null, simple-user]` to `oneOf: [simple-user, enterprise]` / `[simple-user, empty-object]`. Checked against the raw document rather than assumed: these are NOT notation, a reader really can now receive an arm it did not expect. The class stays open and stays the CHECKER's question.",
+        "pinned": "281 files across the corpus reach a dated-version vendor through its SDK and are reported UNMEASURED rather than judged. That is a large share of the code that used to produce impacts."
+      }
+    },
+    "performance": "posthog, the largest repo in the corpus, takes 16m39s at a 1095-day window. That is not a CI gate anybody keeps. Unfixed and unmeasured beyond this one number."
   },
   "findings_defect_found_and_fixed_5": {
     "what": "A schema NAME never reaches the wire. `schema_removed` was 1007 of the 2766 breaking findings across all 21 vendors -- 36% of the population -- and the precision checker confirmed 1007 of 1007.",

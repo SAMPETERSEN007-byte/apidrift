@@ -518,6 +518,16 @@ class TestPinnedAndIncidentalEndToEnd(unittest.TestCase):
         self.assertEqual("src/app.py", result.impacts[0].file)
         self.assertEqual({}, result.pinned)
 
+    def test_the_pin_names_the_declared_release(self):
+        """The end-to-end half: the release reaches the REPORT, not just the
+        helper. A number computed and not printed is a number nobody acts on."""
+        result = self._scan({"src/app.py": self.SDK,
+                             "requirements.txt": "fakevendor==3.2.1\n"})
+        self.assertEqual("fakevendor==3.2.1",
+                         result.pinned_versions.get(self._key))
+        from apidrift.scan import to_text
+        self.assertIn("fakevendor==3.2.1", to_text(result))
+
     def test_a_pinned_sdk_caller_is_unmeasured_not_broken(self):
         result = self._scan({"src/app.py": self.SDK})
         self.assertEqual([], result.impacts,
@@ -561,3 +571,50 @@ class TestWhichVendorsServeDatedVersions(unittest.TestCase):
         for key in ("github", "openai", "twilio", "discord", "sentry"):
             self.assertFalse(VENDORS[key].versioned,
                              f"{key} does not serve dated API versions")
+
+
+class TestThePinReportsWhichRelease(unittest.TestCase):
+    """"You are pinned" is not actionable; "pinned to stripe@^17.4.0" is.
+
+    That number is the input to the only question that matters for a
+    dated-version vendor — what changed BETWEEN two API versions — and it is
+    the number that changes on the day the break actually arrives.
+    """
+
+    def _root(self, files):
+        import tempfile
+        from pathlib import Path as _P
+        root = _P(tempfile.mkdtemp(prefix="apidrift-pinver-"))
+        for name, text in files.items():
+            (root / name).write_text(text)
+        return root
+
+    def test_package_json_dependency(self):
+        import json as _json
+        from apidrift.scan import pinned_sdk_version
+        from apidrift.vendors import get
+        root = self._root({"package.json": _json.dumps(
+            {"dependencies": {"next": "15", "stripe": "^17.4.0"}})})
+        self.assertEqual("stripe@^17.4.0", pinned_sdk_version(root, get("stripe")))
+
+    def test_requirements_txt(self):
+        from apidrift.scan import pinned_sdk_version
+        from apidrift.vendors import get
+        root = self._root({"requirements.txt": "django==5.0\nstripe==11.6.0\n"})
+        self.assertEqual("stripe==11.6.0", pinned_sdk_version(root, get("stripe")))
+
+    def test_a_repo_declaring_nothing_says_nothing(self):
+        """No version is better than a wrong one: the range is reported
+        verbatim, never resolved against a registry this tool cannot see."""
+        from apidrift.scan import pinned_sdk_version
+        from apidrift.vendors import get
+        root = self._root({"package.json": '{"dependencies": {"next": "15"}}'})
+        self.assertEqual("", pinned_sdk_version(root, get("stripe")))
+
+    def test_a_similarly_named_package_is_not_the_sdk(self):
+        import json as _json
+        from apidrift.scan import pinned_sdk_version
+        from apidrift.vendors import get
+        root = self._root({"package.json": _json.dumps(
+            {"dependencies": {"stripe-terminal-react": "1.0.0"}})})
+        self.assertEqual("", pinned_sdk_version(root, get("stripe")))

@@ -16,9 +16,14 @@ Two vantage points, and the difference is the whole product:
   decide findings nobody had checked; see defects 5 and 6 below.
 - `apidrift scan PATH` (the CI gate) — which of those changes break code in a
   repository you have a checkout of. A claim about a **repo**. Dependence is
-  proven in Python AND TypeScript/JavaScript. Zero impacts across four real
-  third-party products (9,240 files, `tools/corpus_scan.py`), which is a
-  measurement held to a hand-verified baseline, not an absence.
+  proven in Python AND TypeScript/JavaScript.
+  🚨 **The "zero impacts" this line used to boast was a WINDOW ARTEFACT.**
+  `--days` defaults to 90 and integration code is written once and left; at a
+  1095-day window the same 22 repositories produced **414 impacts**. A fourth
+  adversarial audit sampled 74 of them and **0 were real** — 66 false, 8 in
+  test files. See "The fourth audit" below. Impact precision was 0% while
+  finding precision was 100%, because nothing had ever measured the difference
+  between a claim about a SPEC and a claim about a REPO.
 
 Three adversarial audits refuted 9, 9 and 10 of 10 cold leads. The engine was
 never the problem; the vantage point was. Proving `card.iin` is read off a
@@ -42,12 +47,17 @@ layers, each asking a question none of the others asks:
 
 | # | Layer | Question | Baseline (2026-08-21) |
 |---|-------|----------|----------------------|
-| 1 | unit tests | does the code do what it says? | 436 tests |
-| 2 | mutation testing | do the tests fail when the code is wrong? | 238/238 killed |
+| 1 | unit tests | does the code do what it says? | 478 tests |
+| 2 | mutation testing | do the tests fail when the code is wrong? | 259/259 killed |
 | 3 | end-to-end | does the pipeline still produce output? | `out/report.md` |
-| 4 | precision audit | are the FINDINGS real, per the RAW specs? | 46/46 breaking, 68/68 potentially |
+| 4 | precision audit | are the FINDINGS real, per the RAW specs? | 32/32 breaking, 63/63 potentially |
 | 5 | lead standing | are the LEADS real, per the last audit? | 0/10 — NOT sendable |
-| 6 | recall controls | can the instrument still FIRE at all? | 36 fired, 0 missed |
+| 6 | recall controls | can the instrument still FIRE at all? | 36 fired, 0 missed; scan FIRED/PINNED |
+
+🚨 **Nothing in these six layers measures an IMPACT.** Layer 4 audits findings
+against the raw spec and layer 6 proves the scanner can fire on a fixture. The
+claim `scan` actually ships — "this change lands on THIS line of YOUR repo" —
+was unmeasured until 2026-08-21, and when it was measured it was 0%.
 
 🚨 **3 runs before 4 because 4 audits the file 3 writes.** Ordered the other way
 the audit read the PREVIOUS run's findings, so after an engine change the first
@@ -370,6 +380,59 @@ source in front of them.
 
 ---
 
+## The fourth audit — 2026-08-21, and the first ever aimed at IMPACTS
+
+Three audits had attacked LEADS. `pr_blocker` had demanded a fourth that
+sampled IMPACTS from `scan.py` against real repositories. It ran
+(`wf_ffc26e20-6f4`): 22 repos at 1095 days → 295 impacts → 74 sampled,
+stratified over every `(kind, vendor)` pair, thirteen independent skeptics with
+two more refuting anything that survived.
+
+**74 audited. 0 REAL. 66 FALSE. 8 TEST_ONLY. 0 UNDECIDABLE.**
+
+Five classes closed, each with its own question and its own two-way mutation.
+
+| Class | n/74 | What it looked like | Gate |
+|---|---:|---|---|
+| **a read is a POSITION, not a word** | 21 | `subscription.currency` returned as a read of `<deleted_discount>.coupon.currency` | `read_sits_where_subject_says` (the subject's wire ancestry must appear, in order, ahead of the leaf) **and** `_chain_reaches_change` (the traced call must reach an operation the change touches) |
+| **a member chain needs provenance** | ~13 | `collaborators.append(info)` on a local list reported as "the SDK form of" `GET /projects/{id}/collaborators`; `secrets.token_urlsafe(32)` reported as GitHub's secret endpoints | `find_sdk_calls` requires `call_reaches_vendor` on the chain's root — the gate JS always had |
+| **a dated API version is not HEAD** | 3 | langfuse reading `subscription.current_period_start` on `stripe-node@17.4.0`, which sends `2024-11-20.acacia` | `Vendor.versioned` + `ScanResult.pinned`; SDK callers UNMEASURED, raw-HTTP callers still judged |
+| **`nullable` vs `anyOf: [T, null]`** | 1 | OpenAI's 3.0→3.1 migration; two fields alone were 75 of the 295 | `loader._nullable_wrapper_payload` in the schema view |
+| **a spec that documented no auth** | 2 | OpenAI's 2023 doc declared no `securitySchemes`; the 2026 one does | count the old document's schemes, abstain at zero |
+
+Test-file impacts are split into `ScanResult.incidental` and out of the exit
+status entirely — reported, never counted.
+
+🚨 **The audit refuted my own best finding, and it was right.** The langfuse
+`current_period_start` impact re-derives perfectly against the raw Stripe spec
+and is still not a break, because the SDK pins the version. A correct spec fact
+is not a correct claim about a repository. That is the whole lesson of this
+audit in one line.
+
+🚨 **Both new controls had been built on the bug they were meant to catch.**
+`scan_control` wrote `record.card_issuer_decline` for a subject of
+`<radar.payment_evaluation>.insights.card_issuer_decline` — not a read of that
+field at all — and it passed for exactly as long as the prover shared the
+mistake. It also accepted ANY breaking impact on the fixture file, so the
+TypeScript half reported FIRED on a fixture whose read was in the wrong place,
+carried by an unrelated finding.
+
+🚨 **Teaching the engine 3.1's dialect made layer 4 DROP to 79.4%**, because the
+checker's own nullability resolver knew two spellings of three, and REFUTED six
+more properties it could not locate (`CreateResponse` →
+`CreateModelResponseProperties` → `ModelResponseProperties` is two `allOf` arms
+deep and it followed one). A property you cannot locate is UNDECIDABLE. Fixed in
+the checker's own walker, from the raw document: 63/63.
+
+### The window is the wrong default and has NOT been changed
+
+`--days 90` on code written years ago is why this tool found nothing for a day
+and read it as precision. 90 days → 0 impacts across 22 repos; 1095 days → 414.
+The default is still 90 **on purpose**: a longer window multiplies a population
+that is not yet audited clean. Change it after a fifth audit, not before.
+
+---
+
 ## `pr_enabled: false`
 
 Recorded in `lead_audit.json` → `scan_standing`. **There is no write path in
@@ -378,10 +441,14 @@ IMPACTS from `scan.py` against real repositories.
 
 Opening a pull request into someone else's repository is a larger outward-facing
 act than sending an email, and `gate.sh` already refuses to let the email ship.
-The `schema_removed` blocker fix **is implemented** in `dependence.py` — a proof
-now requires a read of one of the deleted schema's own field names, and generic
-names cannot carry it — but it is **NOT YET AUDITED**, so `lead_precision` and
-`sendable` stay where they are.
+
+🚨 **The fourth audit has now RUN, and it is the reason to keep this false, not
+the reason to flip it.** It found nothing to open a PR about: 74 impacts
+sampled, 0 real. Five classes are closed since, and a SMALLER population is not
+a MEASURED one. A fifth audit must sample what survives the fixes — and it must
+include raw-HTTP callers specifically, because pinning removed every SDK caller
+of the biggest vendor from the judgeable population and nobody has checked what
+is left.
 
 Do not add a PR path, an auto-commit, or an email send. Do not flip
 `sendable`. Those are Sam's calls after an audit, not a coding decision.
